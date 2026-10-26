@@ -1,0 +1,45 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo
+# Keep Cargo.lock for deterministic builds of cdylib
+
+# Visual Studio / MSVC artifacts
+.vs/
+*.user
+*.suo
+*.sln.docstates
+Debug/
+Release/
+x64/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.idb
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Windows OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# MMD temporary files
+*.pmm.bak
+*.emm.bak
+
+# Reference & 3rd-party dev packages
+ref-code/
+mmdplugin_dev_ver0.41_x64/
+
+# Runtime logs
+*.log
