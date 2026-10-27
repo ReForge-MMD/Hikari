@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::ptr::null_mut;
-use hikari::d3d11::D3D11Context;
-use hikari::effect::HikariEffect;
+use hikari_core::d3d11::D3D11Context;
+use hikari_core::effect::HikariEffect;
 use windows::Win32::Foundation::S_OK;
 
 #[test]

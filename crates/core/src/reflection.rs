@@ -60,7 +60,17 @@ struct D3D11_SHADER_DESC {
     pub TempArrayCount: u32,
     pub DefCount: u32,
     pub DclCount: u32,
-    pub NonFloatInstructionCount: u32,
+    pub TextureNormalInstructions: u32,
+    pub TextureLoadInstructions: u32,
+    pub TextureCompInstructions: u32,
+    pub TextureBiasInstructions: u32,
+    pub TextureGradientInstructions: u32,
+    pub FloatInstructionCount: u32,
+    pub IntInstructionCount: u32,
+    pub UintInstructionCount: u32,
+    pub StaticFlowControlCount: u32,
+    pub DynamicFlowControlCount: u32,
+    pub MacroInstructionCount: u32,
     pub ArrayInstructionCount: u32,
     pub CutInstructionCount: u32,
     pub EmitInstructionCount: u32,
@@ -194,6 +204,7 @@ impl ShaderReflectionData {
     /// Inspects compiled bytecode and returns full reflection metadata.
     pub fn reflect(bytecode: &[u8]) -> Result<Self, String> {
         let reflect_fn = get_d3dreflect().ok_or_else(|| "d3dcompiler_47.dll not found".to_string())?;
+        crate::log_msg(&format!("D3DReflect start ({} bytes)", bytecode.len()));
 
         let mut reflector: *mut c_void = null_mut();
         let hr = unsafe {
@@ -208,6 +219,7 @@ impl ShaderReflectionData {
         if hr.is_err() || reflector.is_null() {
             return Err(format!("D3DReflect failed with HRESULT: {:?}", hr));
         }
+        crate::log_msg("D3DReflect returned a shader reflection interface");
 
         let mut out = Self::default();
 
@@ -231,12 +243,17 @@ impl ShaderReflectionData {
 
             let mut shader_desc: D3D11_SHADER_DESC = std::mem::zeroed();
             if get_desc_fn(reflector, &mut shader_desc).is_ok() {
-                // Thread group size for Compute Shaders
-                let mut gx = 0u32;
-                let mut gy = 0u32;
-                let mut gz = 0u32;
-                get_thread_group_size(reflector, &mut gx, &mut gy, &mut gz);
-                out.thread_group_size = [gx, gy, gz];
+                crate::log_msg(&format!(
+                    "Shader reflection desc: version=0x{:08X}, cbuffers={}, resources={}",
+                    shader_desc.Version, shader_desc.ConstantBuffers, shader_desc.BoundResources
+                ));
+                if shader_desc.Version >> 16 == 5 {
+                    let mut gx = 0u32;
+                    let mut gy = 0u32;
+                    let mut gz = 0u32;
+                    get_thread_group_size(reflector, &mut gx, &mut gy, &mut gz);
+                    out.thread_group_size = [gx, gy, gz];
+                }
 
                 let mut cb_slot_map: HashMap<String, u32> = HashMap::new();
 
@@ -361,6 +378,10 @@ impl ShaderReflectionData {
             release_fn(reflector);
         }
 
+        crate::log_msg(&format!(
+            "D3DReflect complete: {} constant buffers, {} resources",
+            out.cbuffers.len(), out.resources.len()
+        ));
         Ok(out)
     }
 

@@ -1,4 +1,7 @@
-use hikari::shader::{compile_hlsl, parse_techniques};
+use std::ptr::null_mut;
+use hikari_core::d3d11::D3D11Context;
+use hikari_core::effect::HikariEffect;
+use hikari_core::shader::{compile_hlsl, parse_techniques};
 
 #[test]
 fn test_compile_compute_shader_sm5() {
@@ -124,8 +127,8 @@ technique ComputeFilter {
 
 #[test]
 fn test_hikari_effect_sm5_pipeline() {
-    use hikari::d3d11::D3D11Context;
-    use hikari::effect::HikariEffect;
+    use hikari_core::d3d11::D3D11Context;
+    use hikari_core::effect::HikariEffect;
     use windows::Win32::Foundation::HWND;
     use std::ptr::null_mut;
 
@@ -171,6 +174,32 @@ fn test_hikari_effect_sm5_pipeline() {
         assert!(p0.vs_bytecode.is_some());
         assert!(!p0.vs_bytecode.as_ref().unwrap().is_empty());
         // Clean up
+        drop(Box::from_raw(eff_ptr));
+    }
+}
+
+#[test]
+fn test_compile_model_fx_file() {
+    let ctx = D3D11Context::new(windows::Win32::Foundation::HWND(null_mut()), 0, 0)
+        .expect("Failed to create D3D11Context");
+    let fx_path = if std::path::Path::new("test_model.fx").exists() {
+        "test_model.fx"
+    } else {
+        "../../test_model.fx"
+    };
+    let fx_content = std::fs::read_to_string(fx_path)
+        .expect("Failed to read test_model.fx");
+
+    let eff_ptr = HikariEffect::new(&fx_content, Some("test_model.fx"), &ctx)
+        .expect("HikariEffect::new should compile test_model.fx cleanly");
+    assert!(!eff_ptr.is_null());
+    unsafe {
+        let eff = &*eff_ptr;
+        assert_eq!(eff.techniques.len(), 4, "Should have MainTec, MainTecSS, EdgeTec, ShadowTec");
+        // Verify parameters
+        assert!(eff.param_by_semantic.contains_key("WORLDVIEWPROJECTION"));
+        assert!(eff.param_by_semantic.contains_key("WORLD"));
+        assert!(eff.param_by_semantic.contains_key("MATERIALTEXTURE"));
         drop(Box::from_raw(eff_ptr));
     }
 }

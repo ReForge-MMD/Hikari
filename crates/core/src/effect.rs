@@ -2,11 +2,12 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
+use std::collections::HashSet;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows::core::{BOOL, GUID, HRESULT};
-use windows::Win32::Foundation::S_OK;
+use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Buffer, ID3D11ComputeShader, ID3D11Device, ID3D11DeviceContext,
     ID3D11DomainShader, ID3D11GeometryShader, ID3D11HullShader, ID3D11PixelShader,
@@ -25,14 +26,20 @@ pub const HANDLE_PARAM_BASE: usize     = 0x30000;
 pub const HANDLE_ANNO_BASE: usize      = 0x40000;
 
 /// Internal compiled stages for a single pass.
+#[derive(Clone)]
 pub struct CompiledPass {
     pub vs: Option<ID3D11VertexShader>,
     pub vs_bytecode: Option<Vec<u8>>,
     pub ps: Option<ID3D11PixelShader>,
+    pub ps_bytecode: Option<Vec<u8>>,
     pub cs: Option<ID3D11ComputeShader>,
+    pub cs_bytecode: Option<Vec<u8>>,
     pub gs: Option<ID3D11GeometryShader>,
+    pub gs_bytecode: Option<Vec<u8>>,
     pub hs: Option<ID3D11HullShader>,
+    pub hs_bytecode: Option<Vec<u8>>,
     pub ds: Option<ID3D11DomainShader>,
+    pub ds_bytecode: Option<Vec<u8>>,
     pub blend_preset: BlendPreset,
     pub depth_preset: DepthPreset,
     pub raster_preset: RasterizerPreset,
@@ -42,12 +49,32 @@ pub struct CompiledPass {
 #[derive(Clone)]
 pub struct ActivePassInfo {
     pub vs_bytecode: Vec<u8>,
+    pub vs: Option<ID3D11VertexShader>,
+    pub ps: Option<ID3D11PixelShader>,
+    pub constant_buffer: Option<ID3D11Buffer>,
     pub blend_preset: BlendPreset,
     pub depth_preset: DepthPreset,
     pub raster_preset: RasterizerPreset,
 }
 
 pub static ACTIVE_EFFECT_PASS: Mutex<Option<ActivePassInfo>> = Mutex::new(None);
+static WVP_VALUE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Logs the first calls to an unimplemented stub so the caller can be
+/// identified from hikari.log. Returns E_NOTIMPL.
+fn unimplemented_stub(name: &'static str) -> HRESULT {
+    static LOGGED_NAMES: std::sync::LazyLock<Mutex<HashSet<&'static str>>> = std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+    let first = match LOGGED_NAMES.lock() {        Ok(mut set) => set.insert(name),
+        Err(_) => false,
+    };
+    if first {
+        crate::log_msg(&format!(
+            "ID3DXEffect::{} called - the stub returns E_NOTIMPL (0x80004001)",
+            name
+        ));
+    }
+    E_NOTIMPL
+}
 
 /// Represents an annotation parsed from `< string Name = "Value"; >`.
 #[derive(Clone, Debug)]
@@ -63,6 +90,8 @@ pub struct EffectAnnotation {
 pub struct EffectParameter {
     pub name: String,
     pub semantic: String,
+    pub hlsl_type: String,
+    pub row_major: bool,
     pub c_name: CString,
     pub c_semantic: CString,
     pub offset: usize,
@@ -71,6 +100,7 @@ pub struct EffectParameter {
 }
 
 /// Synthetic ID3DXEffect implementation in Rust.
+#[repr(C)]
 pub struct HikariEffect {
     pub vtbl: *const ID3DXEffectVtbl,
     pub ref_count: AtomicU32,
@@ -103,6 +133,11 @@ impl HikariEffect {
         d3d11: &D3D11Context,
     ) -> Result<*mut HikariEffect, String> {
         let techniques = parse_techniques(source);
+        crate::log_msg(&format!(
+            "Parsed {} techniques from {}",
+            techniques.len(),
+            source_name.unwrap_or("<memory>")
+        ));
         let mut compiled_techniques = Vec::new();
 
         let mut name_to_texture_slot = HashMap::new();
@@ -115,10 +150,15 @@ impl HikariEffect {
                     vs: None,
                     vs_bytecode: None,
                     ps: None,
+                    ps_bytecode: None,
                     cs: None,
+                    cs_bytecode: None,
                     gs: None,
+                    gs_bytecode: None,
                     hs: None,
+                    hs_bytecode: None,
                     ds: None,
+                    ds_bytecode: None,
                     blend_preset: pass.blend_preset.clone(),
                     depth_preset: pass.depth_preset.clone(),
                     raster_preset: pass.raster_preset.clone(),
@@ -127,12 +167,15 @@ impl HikariEffect {
 
                 // Compile Vertex Shader
                 if let Some((entry, target)) = &pass.vs_entry {
+                    crate::log_msg(&format!("Compiling vertex shader {entry} ({target})"));
                     let bytecode = compile_hlsl(source, entry, target, source_name, &[])?;
+                    crate::log_msg(&format!("Compiled vertex shader {entry} ({} bytes)", bytecode.len()));
                     let mut vs = None;
                     unsafe {
                         d3d11.device.CreateVertexShader(&bytecode, None, Some(&mut vs))
                             .map_err(|e| format!("CreateVertexShader error: {e}"))?;
                     }
+                    crate::log_msg(&format!("Created D3D11 vertex shader {entry}"));
                     if let Ok(refl) = ShaderReflectionData::reflect(&bytecode) {
                         for res in refl.resources {
                             if res.resource_type == crate::reflection::ReflectedResourceType::Texture {
@@ -146,12 +189,15 @@ impl HikariEffect {
 
                 // Compile Pixel Shader
                 if let Some((entry, target)) = &pass.ps_entry {
+                    crate::log_msg(&format!("Compiling pixel shader {entry} ({target})"));
                     let bytecode = compile_hlsl(source, entry, target, source_name, &[])?;
+                    crate::log_msg(&format!("Compiled pixel shader {entry} ({} bytes)", bytecode.len()));
                     let mut ps = None;
                     unsafe {
                         d3d11.device.CreatePixelShader(&bytecode, None, Some(&mut ps))
                             .map_err(|e| format!("CreatePixelShader error: {e}"))?;
                     }
+                    crate::log_msg(&format!("Created D3D11 pixel shader {entry}"));
                     if let Ok(refl) = ShaderReflectionData::reflect(&bytecode) {
                         for res in refl.resources {
                             if res.resource_type == crate::reflection::ReflectedResourceType::Texture {
@@ -160,6 +206,7 @@ impl HikariEffect {
                         }
                     }
                     cp.ps = ps;
+                    cp.ps_bytecode = Some(bytecode);
                 }
 
                 // Compile Compute Shader
@@ -176,6 +223,7 @@ impl HikariEffect {
                         }
                     }
                     cp.cs = cs;
+                    cp.cs_bytecode = Some(bytecode);
                 }
 
                 // Compile Geometry Shader
@@ -187,6 +235,7 @@ impl HikariEffect {
                             .map_err(|e| format!("CreateGeometryShader error: {e}"))?;
                     }
                     cp.gs = gs;
+                    cp.gs_bytecode = Some(bytecode);
                 }
 
                 // Compile Hull Shader
@@ -198,6 +247,7 @@ impl HikariEffect {
                             .map_err(|e| format!("CreateHullShader error: {e}"))?;
                     }
                     cp.hs = hs;
+                    cp.hs_bytecode = Some(bytecode);
                 }
 
                 // Compile Domain Shader
@@ -209,6 +259,7 @@ impl HikariEffect {
                             .map_err(|e| format!("CreateDomainShader error: {e}"))?;
                     }
                     cp.ds = ds;
+                    cp.ds_bytecode = Some(bytecode);
                 }
 
                 compiled_passes.push(cp);
@@ -261,6 +312,7 @@ impl HikariEffect {
 
         // 2. Global variables and annotations
         let var_semantics = crate::shader::parse_variable_semantics(source);
+        let var_types = crate::shader::parse_variable_types(source);
         let global_vars = crate::shader::parse_global_variables(source);
         let mut parameters = Vec::new();
         let mut param_by_name = HashMap::new();
@@ -291,10 +343,13 @@ impl HikariEffect {
 
             let c_name = CString::new(g.name.as_str()).unwrap_or_default();
             let c_semantic = CString::new(semantic.as_str()).unwrap_or_default();
+            let (hlsl_type, row_major) = var_types.get(&lower).cloned().unwrap_or_default();
             let p_idx = parameters.len();
             parameters.push(EffectParameter {
                 name: g.name.clone(),
                 semantic: semantic.clone(),
+                hlsl_type,
+                row_major,
                 c_name,
                 c_semantic,
                 offset: next_cb_offset,
@@ -335,9 +390,12 @@ impl HikariEffect {
                                     let semantic = sem_opt.unwrap_or_default();
                                     let c_name = CString::new(var_name.as_str()).unwrap_or_default();
                                     let c_sem = CString::new(semantic.as_str()).unwrap_or_default();
+                                    let (hlsl_type, row_major) = var_types.get(&lower).cloned().unwrap_or_default();
                                     parameters.push(EffectParameter {
                                         name: var_name.clone(),
                                         semantic: semantic.clone(),
+                                        hlsl_type,
+                                        row_major,
                                         c_name,
                                         c_semantic: c_sem,
                                         offset,
@@ -401,9 +459,12 @@ impl HikariEffect {
                     let p_idx = parameters.len();
                     let c_name = CString::new(lower.as_str()).unwrap_or_default();
                     let c_sem = CString::new(sem).unwrap_or_default();
+                    let (hlsl_type, row_major) = var_types.get(&lower).cloned().unwrap_or_default();
                     parameters.push(EffectParameter {
                         name: lower.clone(),
                         semantic: sem.to_string(),
+                        hlsl_type,
+                        row_major,
                         c_name,
                         c_semantic: c_sem,
                         offset: next_cb_offset,
@@ -448,32 +509,32 @@ impl HikariEffect {
             GetValue: effect_get_value,
             SetBool: effect_set_bool,
             GetBool: effect_get_bool,
-            SetBoolArray: effect_dummy_setboolarray,
-            GetBoolArray: effect_dummy_getboolarray,
+            SetBoolArray: effect_set_bool_array,
+            GetBoolArray: effect_get_bool_array,
             SetInt: effect_set_int,
             GetInt: effect_get_int,
-            SetIntArray: effect_dummy_setintarray,
-            GetIntArray: effect_dummy_getintarray,
+            SetIntArray: effect_set_int_array,
+            GetIntArray: effect_get_int_array,
             SetFloat: effect_set_float,
             GetFloat: effect_get_float,
-            SetFloatArray: effect_dummy_setfloatarray,
-            GetFloatArray: effect_dummy_getfloatarray,
+            SetFloatArray: effect_set_float_array,
+            GetFloatArray: effect_get_float_array,
             SetVector: effect_set_vector,
             GetVector: effect_get_vector,
-            SetVectorArray: effect_dummy_setvectorarray,
-            GetVectorArray: effect_dummy_getvectorarray,
+            SetVectorArray: effect_set_vector_array,
+            GetVectorArray: effect_get_vector_array,
             SetMatrix: effect_set_matrix,
             GetMatrix: effect_get_matrix,
-            SetMatrixArray: effect_dummy_setmatrixarray,
-            GetMatrixArray: effect_dummy_getmatrixarray,
-            SetMatrixPointerArray: effect_dummy_setmatrixptrarray,
-            GetMatrixPointerArray: effect_dummy_getmatrixptrarray,
-            SetMatrixTranspose: effect_dummy_setmatrixtranspose,
-            GetMatrixTranspose: effect_dummy_getmatrixtranspose,
-            SetMatrixTransposeArray: effect_dummy_setmatrixtransposearray,
-            GetMatrixTransposeArray: effect_dummy_getmatrixtransposearray,
-            SetMatrixTransposePointerArray: effect_dummy_setmatrixtransposeptrarray,
-            GetMatrixTransposePointerArray: effect_dummy_getmatrixtransposeptrarray,
+            SetMatrixArray: effect_set_matrix_array,
+            GetMatrixArray: effect_get_matrix_array,
+            SetMatrixPointerArray: effect_set_matrix_pointer_array,
+            GetMatrixPointerArray: effect_get_matrix_pointer_array,
+            SetMatrixTranspose: effect_set_matrix_transpose,
+            GetMatrixTranspose: effect_get_matrix_transpose,
+            SetMatrixTransposeArray: effect_set_matrix_transpose_array,
+            GetMatrixTransposeArray: effect_get_matrix_transpose_array,
+            SetMatrixTransposePointerArray: effect_set_matrix_transpose_pointer_array,
+            GetMatrixTransposePointerArray: effect_get_matrix_transpose_pointer_array,
             SetString: effect_dummy_setstring,
             GetString: effect_get_string,
             SetTexture: effect_set_texture,
@@ -502,7 +563,7 @@ impl HikariEffect {
             EndParameterBlock: effect_dummy_handle_block,
             ApplyParameterBlock: effect_dummy_apply_block,
             DeleteParameterBlock: effect_dummy_apply_block,
-            CloneEffect: effect_dummy_cloneeffect,
+            CloneEffect: effect_clone_effect,
             SetRawValue: effect_set_raw_value,
         };
 
@@ -557,8 +618,55 @@ impl HikariEffect {
     }
 }
 
+pub unsafe fn is_hikari_effect(this: *mut c_void) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let effect = &*(this as *const HikariEffect);
+    !effect.vtbl.is_null() && ((*effect.vtbl).GetDesc as usize) == (effect_get_desc as usize)
+}
+
+pub unsafe fn disassemble_hikari_effect(this: *mut c_void) -> Result<Vec<u8>, String> {
+    if !is_hikari_effect(this) {
+        return Err("not a Hikari effect".to_string());
+    }
+    let effect = &*(this as *const HikariEffect);
+    let mut output = String::from("//listing of all techniques and passes with embedded asm listings\n\n");
+    let stages: [(&str, fn(&CompiledPass) -> Option<&[u8]>); 6] = [
+        ("vertexshader", |pass| pass.vs_bytecode.as_deref()),
+        ("pixelshader", |pass| pass.ps_bytecode.as_deref()),
+        ("geometryshader", |pass| pass.gs_bytecode.as_deref()),
+        ("hullshader", |pass| pass.hs_bytecode.as_deref()),
+        ("domainshader", |pass| pass.ds_bytecode.as_deref()),
+        ("computeshader", |pass| pass.cs_bytecode.as_deref()),
+    ];
+
+    for (tech_index, passes) in effect.compiled_techniques.iter().enumerate() {
+        output.push_str(&format!("technique {}\n{{\n", effect.technique_c_names[tech_index].to_string_lossy()));
+        for (pass_index, pass) in passes.iter().enumerate() {
+            output.push_str(&format!("    pass {}\n    {{\n", effect.pass_c_names[tech_index][pass_index].to_string_lossy()));
+            for (stage_name, get_bytecode) in stages {
+                if let Some(bytecode) = get_bytecode(pass) {
+                    let assembly = crate::shader::disassemble_dxbc(bytecode)?;
+                    output.push_str(&format!("        {stage_name} =\n            asm {{\n"));
+                    for line in String::from_utf8_lossy(&assembly).lines() {
+                        output.push_str("                ");
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                    output.push_str("            };\n\n");
+                }
+            }
+            output.push_str("    }\n\n");
+        }
+        output.push_str("}\n\n");
+    }
+    Ok(output.into_bytes())
+}
+
 // COM vtable implementations
-unsafe extern "system" fn effect_query_interface(this: *mut c_void, _riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+unsafe extern "system" fn effect_query_interface(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    crate::log_msg(&format!("ID3DXEffect::QueryInterface(this={:p}, riid={:p})", this, riid));
     if ppv.is_null() {
         return windows::core::HRESULT(-2147467261);
     }
@@ -583,6 +691,7 @@ unsafe extern "system" fn effect_release(this: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn effect_get_desc(this: *mut c_void, pDesc: *mut D3DXEFFECT_DESC) -> HRESULT {
+    crate::log_msg("ID3DXEffect::GetDesc");
     if pDesc.is_null() {
         return windows::core::HRESULT(-2147467261);
     }
@@ -595,6 +704,7 @@ unsafe extern "system" fn effect_get_desc(this: *mut c_void, pDesc: *mut D3DXEFF
 }
 
 unsafe extern "system" fn effect_get_technique_desc(this: *mut c_void, hTechnique: D3DXHANDLE, pDesc: *mut D3DXTECHNIQUE_DESC) -> HRESULT {
+    crate::log_msg(&format!("ID3DXEffect::GetTechniqueDesc(handle={:p})", hTechnique));
     if pDesc.is_null() {
         return windows::core::HRESULT(-2147467261);
     }
@@ -620,6 +730,7 @@ unsafe extern "system" fn effect_get_technique_desc(this: *mut c_void, hTechniqu
 }
 
 unsafe extern "system" fn effect_get_pass_desc(this: *mut c_void, hPass: D3DXHANDLE, pDesc: *mut D3DXPASS_DESC) -> HRESULT {
+    crate::log_msg(&format!("ID3DXEffect::GetPassDesc(handle={:p})", hPass));
     if pDesc.is_null() {
         return windows::core::HRESULT(-2147467261);
     }
@@ -637,15 +748,50 @@ unsafe extern "system" fn effect_get_pass_desc(this: *mut c_void, hPass: D3DXHAN
     if t_idx < eff.techniques.len() && p_idx < eff.techniques[t_idx].passes.len() {
         (*pDesc).Name = eff.pass_c_names[t_idx][p_idx].as_ptr();
         (*pDesc).Annotations = eff.pass_annotations[t_idx][p_idx].len() as u32;
-        (*pDesc).pVertexShaderFunction = null();
-        (*pDesc).pPixelShaderFunction = null();
+        // The DXBC SM 5.0 bytecode must NOT reach the native D3D9 pipeline
+        // (MME validates it as D3D9 shader tokens and the real device faults).
+        // Hand MME a valid D3D9-shaped stub pair instead so its validation and
+        // shader-creation path succeed without touching Hikari's DX11 draw.
+        let (vs, ps) = d3d9_stub_bytecode();
+        (*pDesc).pVertexShaderFunction = vs.as_ptr() as *const u32;
+        (*pDesc).pPixelShaderFunction = ps.as_ptr() as *const u32;
         S_OK
     } else {
         windows::core::HRESULT(-2147467259)
     }
 }
 
+fn d3d9_stub_bytecode() -> (&'static Vec<u8>, &'static Vec<u8>) {
+    static STUBS: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    STUBS.get_or_init(|| {
+        // ...
+        let vs_source = "
+float4 main(float4 pos : POSITION) : POSITION {
+    return pos;
+}
+";
+        let ps_source = "
+float4 main() : COLOR {
+    return float4(1.0f, 0.0f, 0.0f, 1.0f);
+}
+";
+        let vs = crate::shader::compile_hlsl(vs_source, "main", "vs_2_0", None, &[])
+            .unwrap_or_default();
+        let ps = crate::shader::compile_hlsl(ps_source, "main", "ps_2_0", None, &[])
+            .unwrap_or_default();
+        crate::log_msg(&format!(
+            "d3d9 stub bytecode compiled: vs={} bytes, ps={} bytes",
+            vs.len(),
+            ps.len()
+        ));
+        (vs, ps)
+    });
+    let stubs = STUBS.get().unwrap();
+    (&stubs.0, &stubs.1)
+}
+
 unsafe extern "system" fn effect_get_parameter_desc(this: *mut c_void, hParameter: D3DXHANDLE, pDesc: *mut D3DXPARAMETER_DESC) -> HRESULT {
+    crate::log_msg(&format!("ID3DXEffect::GetParameterDesc(handle={:p})", hParameter));
     if pDesc.is_null() {
         return windows::core::HRESULT(-2147467261);
     }
@@ -678,19 +824,66 @@ unsafe extern "system" fn effect_get_parameter_desc(this: *mut c_void, hParamete
 
     if idx < eff.parameters.len() {
         let p = &eff.parameters[idx];
+        let (class, ty, rows, columns) = parameter_type_shape(p);
+        crate::log_msg(&format!(
+            "Parameter desc {} semantic={} hlsl={} size={} => class={} type={} rows={} cols={}",
+            p.name, p.semantic, p.hlsl_type, p.size, class, ty, rows, columns
+        ));
         (*pDesc).Name = p.c_name.as_ptr();
         (*pDesc).Semantic = p.c_semantic.as_ptr();
-        (*pDesc).Class = 0;
-        (*pDesc).Type = 3; // Float
-        (*pDesc).Rows = 1;
-        (*pDesc).Columns = 1;
+        (*pDesc).Class = class;
+        (*pDesc).Type = ty;
+        (*pDesc).Rows = rows;
+        (*pDesc).Columns = columns;
         (*pDesc).Elements = 0;
         (*pDesc).Annotations = p.annotation_indices.len() as u32;
         (*pDesc).StructMembers = 0;
-        (*pDesc).Bytes = p.size as u32;
+        (*pDesc).Flags = 0;
+        (*pDesc).Bytes = if class == 4 { 0 } else { p.size as u32 };
         S_OK
     } else {
         windows::core::HRESULT(-2147467259)
+    }
+}
+
+fn parameter_type_shape(parameter: &EffectParameter) -> (u32, u32, u32, u32) {
+    // D3DXPARAMETER_CLASS: scalar=0, vector=1, matrix rows=2,
+    // matrix columns=3, object=4. D3DXPARAMETER_TYPE: bool=1, int=2,
+    // float=3, texture2D=7, texture3D=8, textureCube=9.
+    let ty = parameter.hlsl_type.to_ascii_lowercase();
+    if ty.is_empty() {
+        return if parameter.size >= 64 {
+            (3, 3, 4, 4)
+        } else if parameter.size >= 16 {
+            (1, 3, 1, 4)
+        } else {
+            (0, 3, 1, 1)
+        };
+    }
+    if ty.starts_with("texture") {
+        let texture_type = if ty.contains("cube") { 9 } else if ty.contains("3d") { 8 } else { 7 };
+        // MME validates texture semantics with Rows * Columns == 0.
+        return (4, texture_type, 0, 0);
+    }
+    let base = ty.trim_end_matches(|c: char| c.is_ascii_digit());
+    let scalar_type = match base {
+        "bool" => 1,
+        "int" | "uint" => 2,
+        _ => 3,
+    };
+    if let Some((rows, columns)) = ty.split_once('x') {
+        let row_digits: String = rows.chars().filter(|c| c.is_ascii_digit()).collect();
+        let rows = row_digits.parse().unwrap_or(4);
+        let columns = columns.parse().unwrap_or(4);
+        return (if parameter.row_major { 2 } else { 3 }, scalar_type, rows, columns);
+    }
+    let columns = base.len().checked_sub(base.trim_end_matches(|c: char| c.is_ascii_digit()).len())
+        .and_then(|_| ty.chars().last()?.to_digit(10))
+        .unwrap_or(if parameter.size >= 16 { 4 } else { 1 });
+    if columns > 1 {
+        (1, scalar_type, 1, columns)
+    } else {
+        (0, scalar_type, 1, 1)
     }
 }
 unsafe extern "system" fn effect_get_parameter(this: *mut c_void, _hParameter: D3DXHANDLE, Index: u32) -> D3DXHANDLE {
@@ -703,6 +896,8 @@ unsafe extern "system" fn effect_get_parameter(this: *mut c_void, _hParameter: D
 }
 
 unsafe extern "system" fn effect_get_parameter_by_name(this: *mut c_void, _hParameter: D3DXHANDLE, pName: *const i8) -> D3DXHANDLE {
+    let name = if pName.is_null() { "<null>".to_string() } else { CStr::from_ptr(pName).to_string_lossy().into_owned() };
+    crate::log_msg(&format!("ID3DXEffect::GetParameterByName({name})"));
     if pName.is_null() {
         return null();
     }
@@ -716,6 +911,8 @@ unsafe extern "system" fn effect_get_parameter_by_name(this: *mut c_void, _hPara
 }
 
 unsafe extern "system" fn effect_get_parameter_by_semantic(this: *mut c_void, _hParameter: D3DXHANDLE, pSemantic: *const i8) -> D3DXHANDLE {
+    let semantic = if pSemantic.is_null() { "<null>".to_string() } else { CStr::from_ptr(pSemantic).to_string_lossy().into_owned() };
+    crate::log_msg(&format!("ID3DXEffect::GetParameterBySemantic({semantic})"));
     if pSemantic.is_null() {
         return null();
     }
@@ -745,6 +942,8 @@ unsafe extern "system" fn effect_get_technique(this: *mut c_void, Index: u32) ->
 }
 
 unsafe extern "system" fn effect_get_technique_by_name(this: *mut c_void, pName: *const i8) -> D3DXHANDLE {
+    let name = if pName.is_null() { "<null>".to_string() } else { CStr::from_ptr(pName).to_string_lossy().into_owned() };
+    crate::log_msg(&format!("ID3DXEffect::GetTechniqueByName({name})"));
     if pName.is_null() {
         return null();
     }
@@ -775,6 +974,8 @@ unsafe extern "system" fn effect_get_pass(this: *mut c_void, hTechnique: D3DXHAN
 }
 
 unsafe extern "system" fn effect_get_pass_by_name(this: *mut c_void, hTechnique: D3DXHANDLE, pName: *const i8) -> D3DXHANDLE {
+    let name = if pName.is_null() { "<null>".to_string() } else { CStr::from_ptr(pName).to_string_lossy().into_owned() };
+    crate::log_msg(&format!("ID3DXEffect::GetPassByName({name})"));
     if pName.is_null() {
         return null();
     }
@@ -879,6 +1080,7 @@ unsafe extern "system" fn effect_get_string(this: *mut c_void, hParam: D3DXHANDL
 }
 
 unsafe extern "system" fn effect_set_technique(this: *mut c_void, hTechnique: D3DXHANDLE) -> HRESULT {
+    crate::log_msg(&format!("ID3DXEffect::SetTechnique(handle={:p})", hTechnique));
     let eff = &mut *(this as *mut HikariEffect);
     let h = hTechnique as usize;
     let idx = if h >= HANDLE_TECHNIQUE_BASE && h < HANDLE_PASS_BASE {
@@ -981,6 +1183,263 @@ unsafe extern "system" fn effect_get_matrix(this: *mut c_void, hParameter: D3DXH
     effect_get_value(this, hParameter, pMatrix as *mut c_void, std::mem::size_of::<D3DXMATRIX>() as u32)
 }
 
+/// Resolves a D3DXHANDLE to a parameter index, mirroring the setter logic.
+unsafe fn resolve_parameter_index(effect: &HikariEffect, hParameter: D3DXHANDLE) -> Option<usize> {
+    let h = hParameter as usize;
+    if h >= HANDLE_PARAM_BASE && h < HANDLE_ANNO_BASE && (h - HANDLE_PARAM_BASE) < effect.parameters.len() {
+        Some(h - HANDLE_PARAM_BASE)
+    } else if h > 0 && h <= effect.parameters.len() {
+        Some(h - 1)
+    } else {
+        None
+    }
+}
+
+/// Copies a parameter-sized value into the constant buffer staging area.
+unsafe fn set_param_block(this: *mut c_void, hParameter: D3DXHANDLE, src: *const c_void, bytes: usize) -> HRESULT {
+    if src.is_null() || bytes == 0 {
+        return S_OK;
+    }
+    let eff = &mut *(this as *mut HikariEffect);
+    let Some(idx) = resolve_parameter_index(eff, hParameter) else {
+        return S_OK;
+    };
+    let param = &eff.parameters[idx];
+    let copy_len = bytes.min(param.size);
+    if param.offset + copy_len <= eff.constant_data.len() {
+        std::ptr::copy_nonoverlapping(
+            src as *const u8,
+            eff.constant_data.as_mut_ptr().add(param.offset),
+            copy_len,
+        );
+        eff.constant_dirty = true;
+    }
+    S_OK
+}
+
+unsafe fn get_param_block(this: *mut c_void, hParameter: D3DXHANDLE, dst: *mut c_void, bytes: usize) -> HRESULT {
+    if dst.is_null() || bytes == 0 {
+        return E_POINTER;
+    }
+    let eff = &*(this as *mut HikariEffect);
+    let Some(idx) = resolve_parameter_index(eff, hParameter) else {
+        return E_FAIL;
+    };
+    let param = &eff.parameters[idx];
+    let copy_len = bytes.min(param.size);
+    if param.offset + copy_len <= eff.constant_data.len() {
+        std::ptr::copy_nonoverlapping(
+            eff.constant_data.as_ptr().add(param.offset),
+            dst as *mut u8,
+            copy_len,
+        );
+        return S_OK;
+    }
+    E_FAIL
+}
+
+/// Writes one transposed matrix into the constant buffer.
+unsafe fn set_matrix_transposed(this: *mut c_void, hParameter: D3DXHANDLE, pMatrix: *const D3DXMATRIX) -> HRESULT {
+    if pMatrix.is_null() {
+        return S_OK;
+    }
+    let mut transposed = *pMatrix;
+    for row in 0..4 {
+        for col in 0..4 {
+            transposed.m[row][col] = (*pMatrix).m[col][row];
+        }
+    }
+    set_param_block(this, hParameter, &transposed as *const _ as *const c_void, 64)
+}
+
+unsafe extern "system" fn effect_set_float_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *const f32, Count: u32) -> HRESULT {
+    set_param_block(this, hParameter, pData as *const c_void, (Count as usize).saturating_mul(4))
+}
+
+unsafe extern "system" fn effect_get_float_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *mut f32, Count: u32) -> HRESULT {
+    get_param_block(this, hParameter, pData as *mut c_void, (Count as usize).saturating_mul(4))
+}
+
+unsafe extern "system" fn effect_set_int_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *const i32, Count: u32) -> HRESULT {
+    set_param_block(this, hParameter, pData as *const c_void, (Count as usize).saturating_mul(4))
+}
+
+unsafe extern "system" fn effect_get_int_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *mut i32, Count: u32) -> HRESULT {
+    get_param_block(this, hParameter, pData as *mut c_void, (Count as usize).saturating_mul(4))
+}
+
+unsafe extern "system" fn effect_set_bool_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *const BOOL, Count: u32) -> HRESULT {
+    if pData.is_null() || Count == 0 {
+        return S_OK;
+    }
+    // BOOL (c int) is stored as its 0/1 integer value.
+    let values: Vec<i32> = std::slice::from_raw_parts(pData, Count as usize)
+        .iter()
+        .map(|b| b.as_bool() as i32)
+        .collect();
+    set_param_block(this, hParameter, values.as_ptr() as *const c_void, values.len() * 4)
+}
+
+unsafe extern "system" fn effect_get_bool_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *mut BOOL, Count: u32) -> HRESULT {
+    get_param_block(this, hParameter, pData as *mut c_void, (Count as usize).saturating_mul(4))
+}
+
+unsafe extern "system" fn effect_set_vector_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *const D3DXVECTOR4, Count: u32) -> HRESULT {
+    set_param_block(this, hParameter, pData as *const c_void, (Count as usize).saturating_mul(std::mem::size_of::<D3DXVECTOR4>()))
+}
+
+unsafe extern "system" fn effect_get_vector_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *mut D3DXVECTOR4, Count: u32) -> HRESULT {
+    get_param_block(this, hParameter, pData as *mut c_void, (Count as usize).saturating_mul(std::mem::size_of::<D3DXVECTOR4>()))
+}
+
+unsafe extern "system" fn effect_set_matrix_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *const D3DXMATRIX, Count: u32) -> HRESULT {
+    set_param_block(this, hParameter, pData as *const c_void, (Count as usize).saturating_mul(64))
+}
+
+unsafe extern "system" fn effect_get_matrix_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *mut D3DXMATRIX, Count: u32) -> HRESULT {
+    get_param_block(this, hParameter, pData as *mut c_void, (Count as usize).saturating_mul(64))
+}
+
+unsafe extern "system" fn effect_set_matrix_pointer_array(this: *mut c_void, hParameter: D3DXHANDLE, ppData: *const *const D3DXMATRIX, Count: u32) -> HRESULT {
+    if ppData.is_null() || Count == 0 {
+        return S_OK;
+    }
+    let eff = &mut *(this as *mut HikariEffect);
+    let Some(idx) = resolve_parameter_index(eff, hParameter) else {
+        return S_OK;
+    };
+    for i in 0..(Count as usize).min(eff.parameters[idx].size / 64) {
+        let mat = std::slice::from_raw_parts(ppData, i + 1)[i];
+        if mat.is_null() {
+            continue;
+        }
+        let src = *mat;
+        if eff.parameters[idx].offset + (i + 1) * 64 <= eff.constant_data.len() {
+            std::ptr::copy_nonoverlapping(
+                &src as *const _ as *const u8,
+                eff.constant_data.as_mut_ptr().add(eff.parameters[idx].offset + i * 64),
+                64,
+            );
+        }
+    }
+    eff.constant_dirty = true;
+    S_OK
+}
+
+unsafe extern "system" fn effect_get_matrix_pointer_array(this: *mut c_void, hParameter: D3DXHANDLE, ppData: *mut *mut D3DXMATRIX, Count: u32) -> HRESULT {
+    if ppData.is_null() || Count == 0 {
+        return E_POINTER;
+    }
+    let eff = &*(this as *mut HikariEffect);
+    let Some(idx) = resolve_parameter_index(eff, hParameter) else {
+        return E_FAIL;
+    };
+    for (i, dst) in std::slice::from_raw_parts_mut(ppData, Count as usize).iter().enumerate().take(eff.parameters[idx].size / 64) {
+        if dst.is_null() {
+            continue;
+        }
+        let mat = *dst;
+        if eff.parameters[idx].offset + (i + 1) * 64 <= eff.constant_data.len() {
+            std::ptr::copy_nonoverlapping(
+                eff.constant_data.as_ptr().add(eff.parameters[idx].offset + i * 64),
+                mat as *mut u8,
+                64,
+            );
+        }
+    }
+    S_OK
+}
+
+unsafe extern "system" fn effect_set_matrix_transpose(this: *mut c_void, hParameter: D3DXHANDLE, pMatrix: *const D3DXMATRIX) -> HRESULT {
+    set_matrix_transposed(this, hParameter, pMatrix)
+}
+
+unsafe extern "system" fn effect_get_matrix_transpose(this: *mut c_void, hParameter: D3DXHANDLE, pMatrix: *mut D3DXMATRIX) -> HRESULT {
+    if pMatrix.is_null() {
+        return E_POINTER;
+    }
+    let hr = get_param_block(this, hParameter, pMatrix as *mut c_void, 64);
+    if hr.is_ok() {
+        let mut transposed = *pMatrix;
+        for row in 0..4 {
+            for col in 0..4 {
+                transposed.m[row][col] = (*pMatrix).m[col][row];
+            }
+        }
+        *pMatrix = transposed;
+    }
+    hr
+}
+
+unsafe extern "system" fn effect_set_matrix_transpose_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *const D3DXMATRIX, Count: u32) -> HRESULT {
+    if pData.is_null() || Count == 0 {
+        return S_OK;
+    }
+    let eff = &mut *(this as *mut HikariEffect);
+    let Some(idx) = resolve_parameter_index(eff, hParameter) else {
+        return S_OK;
+    };
+    let matrices = std::slice::from_raw_parts(pData, Count as usize);
+    let slots = (eff.parameters[idx].size / 64).min(matrices.len());
+    for (i, mat) in matrices.iter().take(slots).enumerate() {
+        let mut transposed = *mat;
+        for row in 0..4 {
+            for col in 0..4 {
+                transposed.m[row][col] = (*mat).m[col][row];
+            }
+        }
+        if eff.parameters[idx].offset + (i + 1) * 64 <= eff.constant_data.len() {
+            std::ptr::copy_nonoverlapping(
+                &transposed as *const _ as *const u8,
+                eff.constant_data.as_mut_ptr().add(eff.parameters[idx].offset + i * 64),
+                64,
+            );
+        }
+    }
+    eff.constant_dirty = true;
+    S_OK
+}
+
+unsafe extern "system" fn effect_get_matrix_transpose_array(this: *mut c_void, hParameter: D3DXHANDLE, pData: *mut D3DXMATRIX, Count: u32) -> HRESULT {
+    let hr = effect_get_matrix_array(this, hParameter, pData, Count);
+    if hr.is_ok() && !pData.is_null() {
+        for mat in std::slice::from_raw_parts_mut(pData, Count as usize) {
+            let mut transposed = *mat;
+            for row in 0..4 {
+                for col in 0..4 {
+                    transposed.m[row][col] = mat.m[col][row];
+                }
+            }
+            *mat = transposed;
+        }
+    }
+    hr
+}
+
+unsafe extern "system" fn effect_set_matrix_transpose_pointer_array(this: *mut c_void, hParameter: D3DXHANDLE, ppData: *const *const D3DXMATRIX, Count: u32) -> HRESULT {
+    effect_set_matrix_pointer_array(this, hParameter, ppData, Count)
+}
+
+unsafe extern "system" fn effect_get_matrix_transpose_pointer_array(this: *mut c_void, hParameter: D3DXHANDLE, ppData: *mut *mut D3DXMATRIX, Count: u32) -> HRESULT {
+    let hr = effect_get_matrix_pointer_array(this, hParameter, ppData, Count);
+    if hr.is_ok() && !ppData.is_null() {
+        for dst in std::slice::from_raw_parts_mut(ppData, Count as usize) {
+            if dst.is_null() {
+                continue;
+            }
+            let mat = *dst;
+            let mut transposed = *mat;
+            for row in 0..4 {
+                for col in 0..4 {
+                    transposed.m[row][col] = (*mat).m[col][row];
+                }
+            }
+            *mat = transposed;
+        }
+    }
+    hr
+}
+
 unsafe extern "system" fn effect_set_vector(this: *mut c_void, hParameter: D3DXHANDLE, pVector: *const D3DXVECTOR4) -> HRESULT {
     effect_set_value(this, hParameter, pVector as *const c_void, std::mem::size_of::<D3DXVECTOR4>() as u32)
 }
@@ -1051,7 +1510,17 @@ unsafe extern "system" fn effect_set_raw_value(this: *mut c_void, hParameter: D3
 
 // Pass Execution & Pipeline Binding
 unsafe extern "system" fn effect_begin(this: *mut c_void, pPasses: *mut u32, _Flags: u32) -> HRESULT {
+    static BEGIN_LOG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = BEGIN_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let eff = &*(this as *mut HikariEffect);
+    if count <= 5 || count % 300 == 0 {
+        crate::log_msg(&format!(
+            "ID3DXEffect::Begin call #{} (technique={}, passes={})",
+            count,
+            eff.active_tech_idx,
+            eff.techniques.get(eff.active_tech_idx).map(|t| t.passes.len()).unwrap_or(0)
+        ));
+    }
     if !pPasses.is_null() {
         if eff.active_tech_idx < eff.techniques.len() {
             *pPasses = eff.techniques[eff.active_tech_idx].passes.len() as u32;
@@ -1063,12 +1532,37 @@ unsafe extern "system" fn effect_begin(this: *mut c_void, pPasses: *mut u32, _Fl
 }
 
 unsafe extern "system" fn effect_begin_pass(this: *mut c_void, Pass: u32) -> HRESULT {
+    static BEGIN_PASS_LOG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call_no = BEGIN_PASS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if call_no <= 5 || call_no % 300 == 0 {
+        crate::log_msg(&format!("ID3DXEffect::BeginPass call #{} (pass={Pass})", call_no));
+    }
     crate::vtable::DX11_FRAME_RENDERED.store(true, std::sync::atomic::Ordering::Release);
     let eff = &mut *(this as *mut HikariEffect);
     eff.active_pass_idx = Pass as usize;
 
     // Update dirty constant buffers before executing pass
     eff.update_gpu_constants();
+
+    if !WVP_VALUE_LOGGED.swap(true, Ordering::Relaxed) {
+        if let Some(parameter) = eff.parameters.iter().find(|p| p.semantic.eq_ignore_ascii_case("WORLDVIEWPROJECTION")) {
+            let mut matrix = [0.0f32; 16];
+            if parameter.offset + 64 <= eff.constant_data.len() {
+                std::ptr::copy_nonoverlapping(
+                    eff.constant_data.as_ptr().add(parameter.offset),
+                    matrix.as_mut_ptr() as *mut u8,
+                    64,
+                );
+            }
+            crate::log_msg(&format!(
+                "WORLDVIEWPROJECTION at BeginPass: offset={}, rows={:?}",
+                parameter.offset,
+                matrix.chunks_exact(4).collect::<Vec<_>>()
+            ));
+        } else {
+            crate::log_msg("No WORLDVIEWPROJECTION parameter found at BeginPass");
+        }
+    }
 
     if eff.active_tech_idx < eff.compiled_techniques.len() {
         let tech = &eff.compiled_techniques[eff.active_tech_idx];
@@ -1078,6 +1572,9 @@ unsafe extern "system" fn effect_begin_pass(this: *mut c_void, Pass: u32) -> HRE
             if let Some(ref bc) = pass.vs_bytecode {
                 *ACTIVE_EFFECT_PASS.lock().unwrap() = Some(ActivePassInfo {
                     vs_bytecode: bc.clone(),
+                    vs: pass.vs.clone(),
+                    ps: pass.ps.clone(),
+                    constant_buffer: eff.constant_buffer.clone(),
                     blend_preset: pass.blend_preset.clone(),
                     depth_preset: pass.depth_preset.clone(),
                     raster_preset: pass.raster_preset.clone(),
@@ -1168,10 +1665,86 @@ unsafe extern "system" fn effect_end(_this: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn effect_get_device(_this: *mut c_void, ppDevice: *mut *mut c_void) -> HRESULT {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        crate::log_msg("ID3DXEffect::GetDevice returns a null device (S_OK) - MME may dereference it");
+    }
     if !ppDevice.is_null() {
         *ppDevice = null_mut();
     }
     S_OK
+}
+
+/// Creates a full copy of the compiled HikariEffect: same virtual table and
+/// compiled pipelines, a separate constant buffer and copied constant data.
+unsafe fn clone_hikari_effect(source: *mut HikariEffect) -> Result<*mut HikariEffect, String> {
+    let effect = &*source;
+    let cb_size = effect.constant_data.len();
+    let mut constant_buffer: Option<ID3D11Buffer> = None;
+    effect
+        .device
+        .CreateBuffer(
+            &windows::Win32::Graphics::Direct3D11::D3D11_BUFFER_DESC {
+                ByteWidth: (((cb_size + 15) / 16) * 16) as u32,
+                Usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE_DYNAMIC,
+                BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: 0x00010000, // D3D11_CPU_ACCESS_WRITE
+                ..Default::default()
+            },
+            None,
+            Some(&mut constant_buffer),
+        )
+        .map_err(|e| format!("CreateBuffer failed: {e}"))?;
+
+    let cloned = Box::new(HikariEffect {
+        vtbl: effect.vtbl,
+        ref_count: AtomicU32::new(1),
+        techniques: effect.techniques.clone(),
+        compiled_techniques: effect.compiled_techniques.clone(),
+        active_tech_idx: effect.active_tech_idx,
+        active_pass_idx: effect.active_pass_idx,
+        technique_c_names: effect.technique_c_names.clone(),
+        pass_c_names: effect.pass_c_names.clone(),
+        technique_annotations: effect.technique_annotations.clone(),
+        pass_annotations: effect.pass_annotations.clone(),
+        annotations: effect.annotations.clone(),
+        parameters: effect.parameters.clone(),
+        param_by_name: effect.param_by_name.clone(),
+        param_by_semantic: effect.param_by_semantic.clone(),
+        name_to_texture_slot: effect.name_to_texture_slot.clone(),
+        bound_texture_srvs: effect.bound_texture_srvs.clone(),
+        constant_buffer,
+        constant_data: effect.constant_data.clone(),
+        constant_dirty: true,
+        device: effect.device.clone(),
+        context: effect.context.clone(),
+    });
+    Ok(Box::into_raw(cloned))
+}
+
+unsafe extern "system" fn effect_clone_effect(this: *mut c_void, _pDevice: *mut c_void, ppEffect: *mut *mut c_void) -> HRESULT {
+    crate::log_msg(&format!("ID3DXEffect::CloneEffect(this={:p})", this));
+    if ppEffect.is_null() {
+        return E_POINTER;
+    }
+    let cloned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        clone_hikari_effect(this as *mut HikariEffect)
+    }));
+    match cloned {
+        Ok(Ok(ptr)) => {
+            crate::log_msg(&format!("Cloned HikariEffect {:p} -> {:p}", this, ptr));
+            *ppEffect = ptr as *mut c_void;
+            S_OK
+        }
+        Ok(Err(error)) => {
+            crate::log_msg(&format!("HikariEffect clone failed: {error}"));
+            E_FAIL
+        }
+        Err(_) => {
+            crate::log_msg("HikariEffect clone panicked");
+            E_FAIL
+        }
+    }
 }
 
 // Typed stubs for unused ID3DXEffect methods
@@ -1184,37 +1757,12 @@ unsafe extern "system" fn effect_dummy_handle_name(_this: *mut c_void, _hObject:
 unsafe extern "system" fn effect_dummy_handle_block(_this: *mut c_void) -> D3DXHANDLE { null() }
 unsafe extern "system" fn effect_dummy_apply_block(_this: *mut c_void, _hBlock: D3DXHANDLE) -> HRESULT { S_OK }
 unsafe extern "system" fn effect_dummy_setstatemanager(_this: *mut c_void, _pManager: *mut c_void) -> HRESULT { S_OK }
-unsafe extern "system" fn effect_dummy_getstatemanager(_this: *mut c_void, _ppManager: *mut *mut c_void) -> HRESULT { windows::core::HRESULT(-2147467263) }
+unsafe extern "system" fn effect_dummy_getstatemanager(_this: *mut c_void, _ppManager: *mut *mut c_void) -> HRESULT { unimplemented_stub("GetStateManager") }
 unsafe extern "system" fn effect_dummy_setarrayrange(_this: *mut c_void, _hParam: D3DXHANDLE, _uStart: u32, _uEnd: u32) -> HRESULT { S_OK }
 unsafe extern "system" fn effect_dummy_setstring(_this: *mut c_void, _hParam: D3DXHANDLE, _pStr: *const i8) -> HRESULT { S_OK }
 
-unsafe extern "system" fn effect_dummy_getvalue(_this: *mut c_void, _hParam: D3DXHANDLE, _pData: *mut c_void, _Bytes: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getbool(_this: *mut c_void, _hParam: D3DXHANDLE, _pb: *mut BOOL) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setboolarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pb: *const BOOL, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getboolarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pb: *mut BOOL, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getint(_this: *mut c_void, _hParam: D3DXHANDLE, _pn: *mut i32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setintarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pn: *const i32, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getintarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pn: *mut i32, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getfloat(_this: *mut c_void, _hParam: D3DXHANDLE, _pf: *mut f32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setfloatarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pf: *const f32, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getfloatarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pf: *mut f32, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getvector(_this: *mut c_void, _hParam: D3DXHANDLE, _pVector: *mut D3DXVECTOR4) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setvectorarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pVector: *const D3DXVECTOR4, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getvectorarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pVector: *mut D3DXVECTOR4, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getmatrix(_this: *mut c_void, _hParam: D3DXHANDLE, _pMatrix: *mut D3DXMATRIX) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setmatrixarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pMatrix: *const D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getmatrixarray(_this: *mut c_void, _hParam: D3DXHANDLE, _pMatrix: *mut D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setmatrixptrarray(_this: *mut c_void, _hParam: D3DXHANDLE, _ppMatrix: *const *const D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getmatrixptrarray(_this: *mut c_void, _hParam: D3DXHANDLE, _ppMatrix: *mut *mut D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setmatrixtranspose(_this: *mut c_void, _hParam: D3DXHANDLE, _pMatrix: *const D3DXMATRIX) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getmatrixtranspose(_this: *mut c_void, _hParam: D3DXHANDLE, _pMatrix: *mut D3DXMATRIX) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setmatrixtransposearray(_this: *mut c_void, _hParam: D3DXHANDLE, _pMatrix: *const D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getmatrixtransposearray(_this: *mut c_void, _hParam: D3DXHANDLE, _pMatrix: *mut D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_setmatrixtransposeptrarray(_this: *mut c_void, _hParam: D3DXHANDLE, _ppMatrix: *const *const D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getmatrixtransposeptrarray(_this: *mut c_void, _hParam: D3DXHANDLE, _ppMatrix: *mut *mut D3DXMATRIX, _Count: u32) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getstring(_this: *mut c_void, _hParam: D3DXHANDLE, _ppString: *mut *const i8) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_gettexture(_this: *mut c_void, _hParam: D3DXHANDLE, _ppTexture: *mut *mut c_void) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getpixelshader(_this: *mut c_void, _hParam: D3DXHANDLE, _ppPShader: *mut *mut c_void) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getvertexshader(_this: *mut c_void, _hParam: D3DXHANDLE, _ppVShader: *mut *mut c_void) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_getpool(_this: *mut c_void, _ppPool: *mut *mut c_void) -> HRESULT { windows::core::HRESULT(-2147467263) }
-unsafe extern "system" fn effect_dummy_cloneeffect(_this: *mut c_void, _pDevice: *mut c_void, _ppEffect: *mut *mut c_void) -> HRESULT { windows::core::HRESULT(-2147467263) }
+unsafe extern "system" fn effect_dummy_gettexture(_this: *mut c_void, _hParam: D3DXHANDLE, _ppTexture: *mut *mut c_void) -> HRESULT { unimplemented_stub("GetTexture") }
+unsafe extern "system" fn effect_dummy_getpixelshader(_this: *mut c_void, _hParam: D3DXHANDLE, _ppPShader: *mut *mut c_void) -> HRESULT { unimplemented_stub("GetPixelShader") }
+unsafe extern "system" fn effect_dummy_getvertexshader(_this: *mut c_void, _hParam: D3DXHANDLE, _ppVShader: *mut *mut c_void) -> HRESULT { unimplemented_stub("GetVertexShader") }
+unsafe extern "system" fn effect_dummy_getpool(_this: *mut c_void, _ppPool: *mut *mut c_void) -> HRESULT { unimplemented_stub("GetPool") }
+

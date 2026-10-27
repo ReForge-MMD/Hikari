@@ -1,5 +1,5 @@
-use hikari::d3d11::D3D11Context;
-use hikari::targets::RenderTargetManager;
+use hikari_core::d3d11::D3D11Context;
+use hikari_core::targets::RenderTargetManager;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dxgi::Common::*;
 

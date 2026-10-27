@@ -1,5 +1,5 @@
-use hikari::d3d11::D3D11Context;
-use hikari::states::{BlendPreset, DepthPreset, RasterizerPreset, SamplerPreset, StateManager};
+use hikari_core::d3d11::D3D11Context;
+use hikari_core::states::{BlendPreset, DepthPreset, RasterizerPreset, SamplerPreset, StateManager};
 use windows::Win32::Foundation::HWND;
 
 #[test]

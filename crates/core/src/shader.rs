@@ -28,7 +28,42 @@ type PfnD3DCompile = unsafe extern "system" fn(
     ppErrorMsgs: *mut Option<ID3DBlob>,
 ) -> HRESULT;
 
+type PfnD3DDisassemble = unsafe extern "system" fn(
+    pSrcData: *const c_void,
+    SrcDataSize: usize,
+    Flags: u32,
+    szComments: *const i8,
+    ppDisassembly: *mut Option<ID3DBlob>,
+) -> HRESULT;
+
 static COMPILER_FN: OnceLock<Option<PfnD3DCompile>> = OnceLock::new();
+static DISASSEMBLER_FN: OnceLock<Option<PfnD3DDisassemble>> = OnceLock::new();
+
+pub fn disassemble_dxbc(bytecode: &[u8]) -> Result<Vec<u8>, String> {
+    let disassemble = (*DISASSEMBLER_FN.get_or_init(|| unsafe {
+        let name: Vec<u16> = "d3dcompiler_47.dll\0".encode_utf16().collect();
+        let module = LoadLibraryW(windows::core::PCWSTR(name.as_ptr())).unwrap_or(HMODULE(null_mut()));
+        if module.0.is_null() {
+            return None;
+        }
+        GetProcAddress(module, windows::core::s!("D3DDisassemble"))
+            .map(|proc| std::mem::transmute::<_, PfnD3DDisassemble>(proc))
+    }))
+    .ok_or_else(|| "D3DDisassemble is unavailable".to_string())?;
+
+    let mut blob: Option<ID3DBlob> = None;
+    let hr = unsafe {
+        disassemble(bytecode.as_ptr() as *const c_void, bytecode.len(), 0, null(), &mut blob)
+    };
+    if hr.is_err() {
+        return Err(format!("D3DDisassemble failed: 0x{:08X}", hr.0));
+    }
+    let blob = blob.ok_or_else(|| "D3DDisassemble returned no output".to_string())?;
+    unsafe {
+        let ptr = blob.GetBufferPointer() as *const u8;
+        Ok(std::slice::from_raw_parts(ptr, blob.GetBufferSize()).to_vec())
+    }
+}
 
 fn get_d3dcompile() -> Option<PfnD3DCompile> {
     *COMPILER_FN.get_or_init(|| {
@@ -277,6 +312,29 @@ pub fn parse_variable_semantics(source: &str) -> HashMap<String, String> {
     map
 }
 
+/// Extracts basic HLSL variable types and matrix packing from declarations.
+pub fn parse_variable_types(source: &str) -> HashMap<String, (String, bool)> {
+    let mut map = HashMap::new();
+    for line in source.lines() {
+        let line = line.split("//").next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let declaration = line.split([':', '<', ';', '=']).next().unwrap_or("").trim();
+        let parts: Vec<&str> = declaration.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let name = parts[parts.len() - 1].trim_end_matches('*');
+        let ty = parts[parts.len() - 2];
+        if name.is_empty() || ty.is_empty() || name == "{" || name == "}" {
+            continue;
+        }
+        map.insert(name.to_lowercase(), (ty.to_string(), parts[..parts.len() - 2].contains(&"row_major")));
+    }
+    map
+}
+
 
 /// Metadata about a variable located inside a cbuffer.
 #[derive(Debug, Clone)]
@@ -303,11 +361,16 @@ pub fn compile_hlsl(
     source_name: Option<&str>,
     defines: &[(&str, &str)],
 ) -> Result<Vec<u8>, String> {
+    // Legacy D3D9 profiles (vs_2_0..ps_3_0) are compiled as-is: Hikari
+    // sometimes hands D3D9-shaped stub bytecode to the native MME/D3D9
+    // pipeline, and rewriting it to SM5 recreates the DXBC-in-D3D9 crash.
+    let compile_target = target.to_string();
+
     let compile_fn = get_d3dcompile().ok_or_else(|| "d3dcompiler_47.dll not found on system".to_string())?;
 
     let c_source = source.as_bytes();
     let c_entry = CString::new(entry_point).map_err(|e| e.to_string())?;
-    let c_target = CString::new(target).map_err(|e| e.to_string())?;
+    let c_target = CString::new(compile_target.as_str()).map_err(|e| e.to_string())?;
     let c_source_name = CString::new(source_name.unwrap_or("hikari_shader.hlsl"))
         .unwrap_or_else(|_| CString::new("hikari_shader.hlsl").unwrap());
 
@@ -366,16 +429,17 @@ pub fn compile_hlsl(
     };
 
     if hr.is_err() {
-        if let Some(errors) = error_blob {
+        let compiler_error = if let Some(errors) = error_blob {
             unsafe {
                 let ptr = errors.GetBufferPointer() as *const u8;
                 let len = errors.GetBufferSize();
                 let slice = std::slice::from_raw_parts(ptr, len);
-                let err_msg = String::from_utf8_lossy(slice).to_string();
-                return Err(err_msg);
+                String::from_utf8_lossy(slice).trim_end_matches('\0').to_string()
             }
-        }
-        return Err(format!("D3DCompile failed with HRESULT: 0x{:08X}", hr.0));
+        } else {
+            format!("D3DCompile failed with HRESULT: 0x{:08X}", hr.0)
+        };
+        return Err(compiler_error);
     }
 
     let blob = code_blob.ok_or_else(|| "D3DCompile returned no bytecode".to_string())?;
@@ -618,22 +682,7 @@ fn parse_shader_stage(line: &str, default_profile: &str) -> Option<(String, Stri
             || tok.starts_with("hs_")
             || tok.starts_with("ds_")
         {
-            // Upgrade legacy SM3/SM4 profile to SM5
-            profile = if tok.starts_with("vs_") {
-                "vs_5_0".to_string()
-            } else if tok.starts_with("ps_") {
-                "ps_5_0".to_string()
-            } else if tok.starts_with("cs_") {
-                "cs_5_0".to_string()
-            } else if tok.starts_with("gs_") {
-                "gs_5_0".to_string()
-            } else if tok.starts_with("hs_") {
-                "hs_5_0".to_string()
-            } else if tok.starts_with("ds_") {
-                "ds_5_0".to_string()
-            } else {
-                tok.to_string()
-            };
+            profile = tok.to_string();
 
             if i + 1 < tokens.len() {
                 entry = tokens[i + 1].trim_matches(',').to_string();

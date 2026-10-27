@@ -1,5 +1,5 @@
-use hikari::d3d11::D3D11Context;
-use hikari::shader::compile_hlsl;
+use hikari_core::d3d11::D3D11Context;
+use hikari_core::shader::compile_hlsl;
 use windows::Win32::Foundation::HWND;
 
 #[test]

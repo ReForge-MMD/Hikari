@@ -1,5 +1,5 @@
-use hikari::reflection::{ReflectedResourceType, ShaderReflectionData};
-use hikari::shader::compile_hlsl;
+use hikari_core::reflection::{ReflectedResourceType, ShaderReflectionData};
+use hikari_core::shader::compile_hlsl;
 
 #[test]
 fn test_shader_reflection_cbuffers_and_resources() {

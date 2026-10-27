@@ -1,0 +1,15 @@
+[package]
+name = "hikari-effects"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "HikariEffects"
+crate-type = ["cdylib"]
+
+[dependencies]
+hikari-core = { path = "../core" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
