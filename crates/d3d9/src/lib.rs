@@ -372,6 +372,15 @@ unsafe fn generate_trampolines() -> [usize; 119] {
         addrs[n] = t;
     }
 
+    extern "system" {
+        fn FlushInstructionCache(
+            hprocess: windows::Win32::Foundation::HANDLE,
+            baseaddress: *const c_void,
+            size: usize,
+        ) -> windows::core::BOOL;
+    }
+    let _ = FlushInstructionCache(windows::Win32::System::Threading::GetCurrentProcess(), mem, total);
+
     addrs
 }
 
@@ -385,21 +394,27 @@ fn build_proxy_vtbl() -> [usize; 119] {
     let mut slots = trampolines;
 
     // Override intercepted slots with typed Rust stubs.
-    slots[0]   = proxy_QueryInterface       as usize;
-    slots[1]   = proxy_AddRef               as usize;
-    slots[2]   = proxy_Release              as usize;
-    slots[17]  = proxy_Present              as usize;
-    slots[37]  = proxy_SetRenderTarget      as usize;
-    slots[41]  = proxy_BeginScene           as usize;
-    slots[42]  = proxy_EndScene             as usize;
-    slots[43]  = proxy_Clear                as usize;
-    slots[47]  = proxy_SetViewport          as usize;
-    slots[65]  = proxy_SetTexture           as usize;
-    slots[81]  = proxy_DrawPrimitive        as usize;
-    slots[82]  = proxy_DrawIndexedPrimitive as usize;
-    slots[83]  = proxy_DrawPrimitiveUP      as usize;
-    slots[100] = proxy_SetStreamSource      as usize;
-    slots[104] = proxy_SetIndices           as usize;
+    slots[0]   = proxy_QueryInterface        as usize;
+    slots[1]   = proxy_AddRef                as usize;
+    slots[2]   = proxy_Release               as usize;
+    slots[17]  = proxy_Present               as usize;
+    slots[37]  = proxy_SetRenderTarget       as usize;
+    slots[41]  = proxy_BeginScene            as usize;
+    slots[42]  = proxy_EndScene              as usize;
+    slots[43]  = proxy_Clear                 as usize;
+    slots[47]  = proxy_SetViewport           as usize;
+    slots[57]  = proxy_SetRenderState        as usize;
+    slots[65]  = proxy_SetTexture            as usize;
+    slots[67]  = proxy_SetTextureStageState  as usize;
+    slots[69]  = proxy_SetSamplerState       as usize;
+    slots[81]  = proxy_DrawPrimitive         as usize;
+    slots[82]  = proxy_DrawIndexedPrimitive  as usize;
+    slots[83]  = proxy_DrawPrimitiveUP       as usize;
+    slots[89]  = proxy_SetFVF                as usize;
+    slots[92]  = proxy_SetVertexShader       as usize;
+    slots[100] = proxy_SetStreamSource       as usize;
+    slots[104] = proxy_SetIndices            as usize;
+    slots[107] = proxy_SetPixelShader        as usize;
 
     slots
 }
@@ -500,15 +515,177 @@ unsafe extern "system" fn proxy_SetViewport(this: *mut c_void, p_viewport: *cons
     f(real_dev(this), p_viewport)
 }
 
+unsafe extern "system" fn proxy_SetRenderState(
+    this: *mut c_void,
+    state: u32,
+    value: u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[57]);
+    f(real_dev(this), state, value)
+}
+
+unsafe extern "system" fn proxy_SetTextureStageState(
+    this: *mut c_void,
+    stage: u32,
+    state: u32,
+    value: u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[67]);
+    if stage == 0 && (state == 1 || state == 4) {
+        static TSS_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = TSS_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 30 {
+            hikari_core::log_msg(&format!(
+                "[SetTextureStageState #{n}] stage={stage} state={state} value={value}"
+            ));
+        }
+    }
+    f(real_dev(this), stage, state, value)
+}
+
+unsafe extern "system" fn proxy_SetSamplerState(
+    this: *mut c_void,
+    sampler: u32,
+    state: u32,
+    value: u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[69]);
+    f(real_dev(this), sampler, state, value)
+}
+
+static DRAW_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+unsafe fn log_d3d9_draw_state(dev: *mut c_void, call_name: &str, prim_type: u32, count: u32) {
+    let n = DRAW_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 40 || n % 1000 == 0 {
+        let mut ps: *mut c_void = std::ptr::null_mut();
+        let mut vs: *mut c_void = std::ptr::null_mut();
+        let mut tex0: *mut c_void = std::ptr::null_mut();
+        let mut fvf: u32 = 0;
+        let mut colorop: u32 = 0;
+        let mut alphaop: u32 = 0;
+        let mut blend_en: u32 = 0;
+
+        type PfnGetShader = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+        type PfnGetTex = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
+        type PfnGetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, *mut u32) -> HRESULT;
+        type PfnGetRS = unsafe extern "system" fn(*mut c_void, u32, *mut u32) -> HRESULT;
+        type PfnGetFVF = unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT;
+        type PfnRelease = unsafe extern "system" fn(*mut c_void) -> u32;
+
+        let get_ps: PfnGetShader = std::mem::transmute(REAL_DEV_VTBL[108]);
+        let get_vs: PfnGetShader = std::mem::transmute(REAL_DEV_VTBL[93]);
+        let get_tex: PfnGetTex = std::mem::transmute(REAL_DEV_VTBL[64]);
+        let get_tss: PfnGetTSS = std::mem::transmute(REAL_DEV_VTBL[66]);
+        let get_rs: PfnGetRS = std::mem::transmute(REAL_DEV_VTBL[58]);
+        let get_fvf: PfnGetFVF = std::mem::transmute(REAL_DEV_VTBL[90]);
+
+        let _ = get_ps(dev, &mut ps);
+        let _ = get_vs(dev, &mut vs);
+        let _ = get_tex(dev, 0, &mut tex0);
+        let _ = get_tss(dev, 0, 1 /* COLOROP */, &mut colorop);
+        let _ = get_tss(dev, 0, 4 /* ALPHAOP */, &mut alphaop);
+        let _ = get_rs(dev, 27 /* ALPHABLENDENABLE */, &mut blend_en);
+        let _ = get_fvf(dev, &mut fvf);
+
+        hikari_core::log_msg(&format!(
+            "[{call_name} #{n}] type={prim_type} prims={count} fvf=0x{fvf:X} ps={ps:p} vs={vs:p} tex0={tex0:p} colorop={colorop} alphaop={alphaop} blend={blend_en}"
+        ));
+
+        let release = |p: *mut c_void| {
+            if !p.is_null() {
+                let v = *(p as *const *const usize);
+                let rel: PfnRelease = std::mem::transmute(*v.add(2));
+                rel(p);
+            }
+        };
+        release(ps);
+        release(vs);
+        release(tex0);
+    }
+}
+
+/// Ensures stage 0 colorop/alphaop are active (MODULATE) when drawing fixed-function with a texture bound.
+/// In D3D9, if COLOROP is D3DTOP_DISABLE (1) on stage 0, all stage outputs (including cascade stages)
+/// are completely disabled and the rasterizer emits only untextured vertex diffuse color.
+unsafe fn ensure_fixed_function_stage0(dev: *mut c_void) {
+    type PfnGetShader = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    type PfnGetTex = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
+    type PfnGetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, *mut u32) -> HRESULT;
+    type PfnSetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
+    type PfnRelease = unsafe extern "system" fn(*mut c_void) -> u32;
+
+    let get_ps: PfnGetShader = std::mem::transmute(REAL_DEV_VTBL[108]);
+    let mut ps: *mut c_void = std::ptr::null_mut();
+    let _ = get_ps(dev, &mut ps);
+
+    if ps.is_null() {
+        let get_tex: PfnGetTex = std::mem::transmute(REAL_DEV_VTBL[64]);
+        let mut tex0: *mut c_void = std::ptr::null_mut();
+        let _ = get_tex(dev, 0, &mut tex0);
+
+        if !tex0.is_null() {
+            let get_tss: PfnGetTSS = std::mem::transmute(REAL_DEV_VTBL[66]);
+            let set_tss: PfnSetTSS = std::mem::transmute(REAL_DEV_VTBL[67]);
+
+            let mut colorop = 0u32;
+            let mut alphaop = 0u32;
+            let _ = get_tss(dev, 0, 1 /* D3DTSS_COLOROP */, &mut colorop);
+            let _ = get_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, &mut alphaop);
+
+            if colorop == 1 /* D3DTOP_DISABLE */ || alphaop == 1 /* D3DTOP_DISABLE */ {
+                // Restore standard fixed-function stage 0 modulation
+                let _ = set_tss(dev, 0, 1 /* D3DTSS_COLOROP */, 4 /* D3DTOP_MODULATE */);
+                let _ = set_tss(dev, 0, 2 /* D3DTSS_COLORARG1 */, 2 /* D3DTA_TEXTURE */);
+                let _ = set_tss(dev, 0, 3 /* D3DTSS_COLORARG2 */, 0 /* D3DTA_DIFFUSE */);
+                let _ = set_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, 4 /* D3DTOP_MODULATE */);
+                let _ = set_tss(dev, 0, 5 /* D3DTSS_ALPHAARG1 */, 2 /* D3DTA_TEXTURE */);
+                let _ = set_tss(dev, 0, 6 /* D3DTSS_ALPHAARG2 */, 0 /* D3DTA_DIFFUSE */);
+
+                static RESTORE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = RESTORE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 10 {
+                    hikari_core::log_msg(&format!(
+                        "[FixedFunction] Restored stage 0 COLOROP/ALPHAOP from ({colorop}, {alphaop}) to MODULATE for tex0={tex0:p}"
+                    ));
+                }
+            }
+
+            let v = *(tex0 as *const *const usize);
+            let rel: PfnRelease = std::mem::transmute(*v.add(2));
+            rel(tex0);
+        }
+    } else {
+        let v = *(ps as *const *const usize);
+        let rel: PfnRelease = std::mem::transmute(*v.add(2));
+        rel(ps);
+    }
+}
+
 unsafe extern "system" fn proxy_SetTexture(
     this: *mut c_void,
     stage: u32,
     p_texture: *mut c_void,
 ) -> HRESULT {
     hikari_core::backend::on_set_texture(stage, p_texture as usize);
+    let dev = real_dev(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[65]);
-    f(real_dev(this), stage, p_texture)
+    let hr = f(dev, stage, p_texture);
+    if stage == 0 && !p_texture.is_null() {
+        ensure_fixed_function_stage0(dev);
+    }
+    static SET_TEX_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SET_TEX_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 40 || hr.0 != 0 {
+        hikari_core::log_msg(&format!(
+            "[SetTexture #{n}] stage={stage} tex={p_texture:p} hr=0x{:08X}", hr.0 as u32
+        ));
+    }
+    hr
 }
 
 unsafe extern "system" fn proxy_DrawPrimitive(
@@ -517,9 +694,12 @@ unsafe extern "system" fn proxy_DrawPrimitive(
     start_vertex: u32,
     prim_count: u32,
 ) -> HRESULT {
+    let dev = real_dev(this);
+    ensure_fixed_function_stage0(dev);
+    log_d3d9_draw_state(dev, "DrawPrimitive", prim_type, prim_count);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[81]);
-    f(real_dev(this), prim_type, start_vertex, prim_count)
+    f(dev, prim_type, start_vertex, prim_count)
 }
 
 unsafe extern "system" fn proxy_DrawIndexedPrimitive(
@@ -531,16 +711,19 @@ unsafe extern "system" fn proxy_DrawIndexedPrimitive(
     start_index: u32,
     prim_count: u32,
 ) -> HRESULT {
+    let dev = real_dev(this);
     if hikari_core::backend::should_render_dx11() {
         let rendered = hikari_core::backend::on_draw_indexed_primitive_dx11(
-            real_dev(this), prim_type, base_vertex_index,
+            dev, prim_type, base_vertex_index,
             min_vertex_index, num_vertices, start_index, prim_count,
         );
         if rendered { return S_OK; }
     }
+    ensure_fixed_function_stage0(dev);
+    log_d3d9_draw_state(dev, "DrawIndexedPrimitive_D3D9", prim_type, prim_count);
     type F = unsafe extern "system" fn(*mut c_void, u32, i32, u32, u32, u32, u32) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[82]);
-    f(real_dev(this), prim_type, base_vertex_index, min_vertex_index, num_vertices, start_index, prim_count)
+    f(dev, prim_type, base_vertex_index, min_vertex_index, num_vertices, start_index, prim_count)
 }
 
 unsafe extern "system" fn proxy_DrawPrimitiveUP(
@@ -550,9 +733,29 @@ unsafe extern "system" fn proxy_DrawPrimitiveUP(
     p_vertex_stream_zero_data: *const c_void,
     vertex_stream_zero_stride: u32,
 ) -> HRESULT {
+    let dev = real_dev(this);
+    ensure_fixed_function_stage0(dev);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, *const c_void, u32) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[83]);
-    f(real_dev(this), prim_type, prim_count, p_vertex_stream_zero_data, vertex_stream_zero_stride)
+    f(dev, prim_type, prim_count, p_vertex_stream_zero_data, vertex_stream_zero_stride)
+}
+
+unsafe extern "system" fn proxy_SetFVF(
+    this: *mut c_void,
+    fvf: u32,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, u32) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[89]);
+    f(real_dev(this), fvf)
+}
+
+unsafe extern "system" fn proxy_SetVertexShader(
+    this: *mut c_void,
+    p_shader: *mut c_void,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[92]);
+    f(real_dev(this), p_shader)
 }
 
 unsafe extern "system" fn proxy_SetStreamSource(
@@ -574,3 +777,13 @@ unsafe extern "system" fn proxy_SetIndices(this: *mut c_void, p_index_data: *mut
     let f: F = std::mem::transmute(REAL_DEV_VTBL[104]);
     f(real_dev(this), p_index_data)
 }
+
+unsafe extern "system" fn proxy_SetPixelShader(
+    this: *mut c_void,
+    p_shader: *mut c_void,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[107]);
+    f(real_dev(this), p_shader)
+}
+

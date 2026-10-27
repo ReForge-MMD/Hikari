@@ -1,4 +1,4 @@
-use hikari::d3d11::D3D11Context;
+use hikari_core::d3d11::D3D11Context;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 
@@ -27,3 +27,46 @@ fn test_create_headless_d3d11_context() {
     assert!(srv.is_some(), "Texture should have SRV");
     assert!(uav.is_some(), "Texture should have UAV");
 }
+
+#[test]
+fn test_verify_d3d9_vtable_layout() {
+    use windows::Win32::Graphics::Direct3D9::IDirect3DDevice9_Vtbl;
+    let size = std::mem::size_of::<IDirect3DDevice9_Vtbl>();
+    let slot_count = size / std::mem::size_of::<usize>();
+    assert_eq!(slot_count, 119);
+
+    macro_rules! check_slot {
+        ($field:ident, $expected:expr) => {
+            let offset = std::mem::offset_of!(IDirect3DDevice9_Vtbl, $field) / std::mem::size_of::<usize>();
+            assert_eq!(offset, $expected, "Field {} at slot {} expected {}", stringify!($field), offset, $expected);
+        };
+    }
+
+    check_slot!(base__, 0);
+    check_slot!(Present, 17);
+    check_slot!(SetRenderTarget, 37);
+    check_slot!(BeginScene, 41);
+    check_slot!(EndScene, 42);
+    check_slot!(Clear, 43);
+    check_slot!(SetViewport, 47);
+    check_slot!(SetRenderState, 57);
+    check_slot!(GetRenderState, 58);
+    check_slot!(GetTexture, 64);
+    check_slot!(SetTexture, 65);
+    check_slot!(GetTextureStageState, 66);
+    check_slot!(SetTextureStageState, 67);
+    check_slot!(GetSamplerState, 68);
+    check_slot!(SetSamplerState, 69);
+    check_slot!(DrawPrimitive, 81);
+    check_slot!(DrawIndexedPrimitive, 82);
+    check_slot!(DrawPrimitiveUP, 83);
+    check_slot!(SetFVF, 89);
+    check_slot!(GetFVF, 90);
+    check_slot!(SetVertexShader, 92);
+    check_slot!(GetVertexShader, 93);
+    check_slot!(SetStreamSource, 100);
+    check_slot!(SetIndices, 104);
+    check_slot!(SetPixelShader, 107);
+    check_slot!(GetPixelShader, 108);
+}
+
