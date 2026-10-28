@@ -167,27 +167,52 @@ pub unsafe extern "system" fn PSGPSampleTexture() -> i32 { 0 }
 
 #[no_mangle]
 pub unsafe extern "system" fn Direct3DCreate9Ex(sdk_version: u32, pp: *mut *mut c_void) -> HRESULT {
-    type Pfn = unsafe extern "system" fn(u32, *mut *mut c_void) -> HRESULT;
-    static FUNC: OnceLock<Option<Pfn>> = OnceLock::new();
-    let f = FUNC.get_or_init(|| {
-        let p = get_real_proc(b"Direct3DCreate9Ex\0");
-        if p.is_null() { None } else { Some(std::mem::transmute(p)) }
-    });
-    if let Some(f) = f { f(sdk_version, pp) } else { HRESULT(-1) }
+    hikari_core::log_msg(&format!("[d3d9] Direct3DCreate9Ex called directly (SDKVersion={})", sdk_version));
+    let proc_ex = get_real_proc(b"Direct3DCreate9Ex\0");
+    if proc_ex.is_null() {
+        return HRESULT(-1);
+    }
+    type PfnDirect3DCreate9Ex = unsafe extern "system" fn(u32, *mut *mut c_void) -> HRESULT;
+    let create_ex: PfnDirect3DCreate9Ex = std::mem::transmute(proc_ex);
+    let hr = create_ex(sdk_version, pp);
+    if hr == S_OK && !pp.is_null() && !(*pp).is_null() {
+        IS_D3D9EX.store(true, std::sync::atomic::Ordering::SeqCst);
+        hook_d3d9_interface(*pp, 21);
+    }
+    hr
 }
 
 // ---------------------------------------------------------------------------
-// IDirect3D9 vtable hooking — safe: IDirect3D9's vtable is a shared static
+// IDirect3D9 / IDirect3D9Ex vtable hooking — safe: IDirect3D9's vtable is a shared static
 // in d3d9.dll's .rdata section (not per-instance heap allocated).
 // ---------------------------------------------------------------------------
 
-static mut D3D9_ORIGINAL_VTBL: [usize; 17] = [0; 17];
-static mut D3D9_HOOKED_VTBL: [usize; 17] = [0; 17];
+static mut D3D9_ORIGINAL_VTBL: [usize; 21] = [0; 21];
+static mut D3D9_HOOKED_VTBL: [usize; 21] = [0; 21];
 static D3D9_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IS_D3D9EX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[no_mangle]
 pub unsafe extern "system" fn Direct3DCreate9(sdk_version: u32) -> *mut c_void {
     hikari_core::log_msg(&format!("[d3d9] Direct3DCreate9 called (SDKVersion={})", sdk_version));
+
+    // Upgrade to Direct3D9Ex for zero-copy GPU shared surfaces:
+    let proc_ex = get_real_proc(b"Direct3DCreate9Ex\0");
+    if !proc_ex.is_null() {
+        type PfnDirect3DCreate9Ex = unsafe extern "system" fn(u32, *mut *mut c_void) -> HRESULT;
+        let create_ex: PfnDirect3DCreate9Ex = std::mem::transmute(proc_ex);
+        let mut p_d3d9ex: *mut c_void = std::ptr::null_mut();
+        let hr = create_ex(sdk_version, &mut p_d3d9ex);
+        if hr == S_OK && !p_d3d9ex.is_null() {
+            hikari_core::log_msg(&format!("[d3d9] Direct3DCreate9Ex upgraded successfully: {:p}", p_d3d9ex));
+            IS_D3D9EX.store(true, std::sync::atomic::Ordering::SeqCst);
+            hook_d3d9_interface(p_d3d9ex, 21);
+            return p_d3d9ex;
+        } else {
+            hikari_core::log_msg(&format!("[d3d9] Direct3DCreate9Ex call failed: hr=0x{:08X}", hr.0 as u32));
+        }
+    }
+
     let proc = get_real_proc(b"Direct3DCreate9\0");
     if proc.is_null() {
         hikari_core::log_msg("[d3d9] ERROR: Direct3DCreate9 not found in System32\\d3d9.dll");
@@ -200,19 +225,24 @@ pub unsafe extern "system" fn Direct3DCreate9(sdk_version: u32) -> *mut c_void {
         return std::ptr::null_mut();
     }
     hikari_core::log_msg(&format!("[d3d9] Real IDirect3D9 instance created: {:p}", p_d3d9));
-    hook_d3d9_interface(p_d3d9);
+    IS_D3D9EX.store(false, std::sync::atomic::Ordering::SeqCst);
+    hook_d3d9_interface(p_d3d9, 17);
     p_d3d9
 }
 
-unsafe fn hook_d3d9_interface(p_d3d9: *mut c_void) {
+unsafe fn hook_d3d9_interface(p_d3d9: *mut c_void, slot_count: usize) {
     let vtbl_ptr = *(p_d3d9 as *mut *mut usize);
     if !D3D9_HOOKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        D3D9_ORIGINAL_VTBL.copy_from_slice(std::slice::from_raw_parts(vtbl_ptr, 17));
-        D3D9_HOOKED_VTBL.copy_from_slice(&D3D9_ORIGINAL_VTBL);
+        let count = slot_count.min(21);
+        D3D9_ORIGINAL_VTBL[..count].copy_from_slice(std::slice::from_raw_parts(vtbl_ptr, count));
+        D3D9_HOOKED_VTBL[..count].copy_from_slice(&D3D9_ORIGINAL_VTBL[..count]);
         D3D9_HOOKED_VTBL[16] = hook_CreateDevice as usize;
     }
     *(p_d3d9 as *mut *const usize) = D3D9_HOOKED_VTBL.as_ptr();
-    hikari_core::log_msg("[d3d9] IDirect3D9 vtable slot 16 (CreateDevice) hooked");
+    hikari_core::log_msg(&format!(
+        "[d3d9] IDirect3D9{} vtable slot 16 (CreateDevice) hooked",
+        if IS_D3D9EX.load(std::sync::atomic::Ordering::Relaxed) { "Ex" } else { "" }
+    ));
 }
 
 type PfnCreateDevice = unsafe extern "system" fn(
@@ -222,6 +252,17 @@ type PfnCreateDevice = unsafe extern "system" fn(
     h_focus_window: HWND,
     behavior_flags: u32,
     p_presentation_parameters: *mut c_void,
+    pp_returned_device_interface: *mut *mut c_void,
+) -> HRESULT;
+
+type PfnCreateDeviceEx = unsafe extern "system" fn(
+    this: *mut c_void,
+    adapter: u32,
+    device_type: u32,
+    h_focus_window: HWND,
+    behavior_flags: u32,
+    p_presentation_parameters: *mut c_void,
+    p_fullscreen_display_mode: *mut c_void,
     pp_returned_device_interface: *mut *mut c_void,
 ) -> HRESULT;
 
@@ -239,16 +280,49 @@ unsafe extern "system" fn hook_CreateDevice(
         h_focus_window.0, behavior_flags
     ));
 
-    let orig: PfnCreateDevice = std::mem::transmute(D3D9_ORIGINAL_VTBL[16]);
-    let hr = orig(
-        this, adapter, device_type, h_focus_window, behavior_flags,
-        p_presentation_parameters, pp_returned_device_interface,
-    );
+    let is_ex = IS_D3D9EX.load(std::sync::atomic::Ordering::SeqCst);
+    let mut hr = S_OK;
+    let mut created_ex = false;
 
-    hikari_core::log_msg(&format!("[d3d9] CreateDevice hr=0x{:08X}", hr.0 as u32));
+    if is_ex {
+        let orig_ex: PfnCreateDeviceEx = std::mem::transmute(D3D9_ORIGINAL_VTBL[20]);
+        hr = orig_ex(
+            this,
+            adapter,
+            device_type,
+            h_focus_window,
+            behavior_flags,
+            p_presentation_parameters,
+            std::ptr::null_mut(),
+            pp_returned_device_interface,
+        );
+        hikari_core::log_msg(&format!("[d3d9] CreateDeviceEx hr=0x{:08X}", hr.0 as u32));
+        if hr == S_OK {
+            created_ex = true;
+        } else {
+            hikari_core::log_msg(&format!(
+                "[d3d9] CreateDeviceEx failed (0x{:08X}), falling back to standard CreateDevice",
+                hr.0 as u32
+            ));
+        }
+    }
+
+    if !created_ex {
+        let orig: PfnCreateDevice = std::mem::transmute(D3D9_ORIGINAL_VTBL[16]);
+        hr = orig(
+            this, adapter, device_type, h_focus_window, behavior_flags,
+            p_presentation_parameters, pp_returned_device_interface,
+        );
+        hikari_core::log_msg(&format!("[d3d9] CreateDevice hr=0x{:08X}", hr.0 as u32));
+    }
+
     if hr == S_OK && !pp_returned_device_interface.is_null() && !(*pp_returned_device_interface).is_null() {
         let real_device = *pp_returned_device_interface;
-        hikari_core::log_msg(&format!("[d3d9] Real IDirect3DDevice9 at {:p}", real_device));
+        hikari_core::log_msg(&format!(
+            "[d3d9] Real IDirect3DDevice9{} at {:p}",
+            if created_ex { "Ex" } else { "" },
+            real_device
+        ));
         // Capture the real device vtable ONCE — never write into the real device object.
         ProxyDevice9::capture_real_vtbl(real_device);
         // Initialize DX11 backend with the real device pointer (before proxy substitution).
@@ -412,6 +486,12 @@ fn build_proxy_vtbl() -> [usize; 119] {
     slots[2]   = proxy_Release               as usize;
     slots[16]  = proxy_Reset                 as usize;
     slots[17]  = proxy_Present               as usize;
+    slots[23]  = proxy_CreateTexture         as usize;
+    slots[24]  = proxy_CreateVolumeTexture   as usize;
+    slots[25]  = proxy_CreateCubeTexture     as usize;
+    slots[26]  = proxy_CreateVertexBuffer    as usize;
+    slots[27]  = proxy_CreateIndexBuffer     as usize;
+    slots[36]  = proxy_CreateOffscreenPlainSurface as usize;
     slots[37]  = proxy_SetRenderTarget       as usize;
     slots[41]  = proxy_BeginScene            as usize;
     slots[42]  = proxy_EndScene              as usize;
@@ -449,8 +529,20 @@ unsafe extern "system" fn proxy_QueryInterface(
 
     const IID_IUNKNOWN: windows::core::GUID = windows::core::GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
     const IID_IDIRECT3DDEVICE9: windows::core::GUID = windows::core::GUID::from_u128(0xd0223b96_bf7a_43fd_92bd_a43b0d82b9eb);
+    const IID_IDIRECT3DDEVICE9EX: windows::core::GUID = windows::core::GUID::from_u128(0xb18b10ce_2649_405a_870f_95f777d4313a);
 
     let guid = *riid;
+    static QI_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = QI_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 20 {
+        hikari_core::log_msg(&format!("[QueryInterface #{n}] riid={guid:?}"));
+    }
+
+    if guid == IID_IDIRECT3DDEVICE9EX {
+        hikari_core::log_msg("[QueryInterface] Hiding IDirect3DDevice9Ex (returning E_NOINTERFACE to protect proxy)");
+        return windows::Win32::Foundation::E_NOINTERFACE;
+    }
+
     if guid == IID_IDIRECT3DDEVICE9 || guid == IID_IUNKNOWN {
         proxy_AddRef(this);
         *ppv = this;
@@ -514,6 +606,167 @@ unsafe extern "system" fn proxy_Present(
     type F = unsafe extern "system" fn(*mut c_void, *const c_void, *const c_void, HWND, *const c_void) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[17]);
     f(real_dev(this), p_source_rect, p_dest_rect, h_dest_window_override, p_dirty_region)
+}
+
+unsafe extern "system" fn proxy_CreateTexture(
+    this: *mut c_void,
+    width: u32,
+    height: u32,
+    levels: u32,
+    mut usage: u32,
+    format: u32,
+    mut pool: u32,
+    pp_texture: *mut *mut c_void,
+    p_shared_handle: *mut windows::Win32::Foundation::HANDLE,
+) -> HRESULT {
+    let orig_pool = pool;
+    if pool == 1 /* D3DPOOL_MANAGED */ {
+        pool = 0; /* D3DPOOL_DEFAULT */
+        usage |= 0x200; /* D3DUSAGE_DYNAMIC */
+    }
+    type F = unsafe extern "system" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, *mut *mut c_void, *mut windows::Win32::Foundation::HANDLE,
+    ) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[23]);
+    let hr = f(real_dev(this), width, height, levels, usage, format, pool, pp_texture, p_shared_handle);
+    static LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 30 || hr.0 != 0 {
+        hikari_core::log_msg(&format!(
+            "[CreateTexture #{n}] {width}x{height} lvls={levels} use=0x{usage:X} fmt={format} pool={pool} (orig={orig_pool}) hr=0x{:08X}",
+            hr.0 as u32
+        ));
+    }
+    hr
+}
+
+unsafe extern "system" fn proxy_CreateVolumeTexture(
+    this: *mut c_void,
+    width: u32,
+    height: u32,
+    depth: u32,
+    levels: u32,
+    mut usage: u32,
+    format: u32,
+    mut pool: u32,
+    pp_volume_texture: *mut *mut c_void,
+    p_shared_handle: *mut windows::Win32::Foundation::HANDLE,
+) -> HRESULT {
+    if pool == 1 /* D3DPOOL_MANAGED */ {
+        pool = 0; /* D3DPOOL_DEFAULT */
+        usage |= 0x200; /* D3DUSAGE_DYNAMIC */
+    }
+    type F = unsafe extern "system" fn(
+        *mut c_void, u32, u32, u32, u32, u32, u32, u32, *mut *mut c_void, *mut windows::Win32::Foundation::HANDLE,
+    ) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[24]);
+    f(real_dev(this), width, height, depth, levels, usage, format, pool, pp_volume_texture, p_shared_handle)
+}
+
+unsafe extern "system" fn proxy_CreateCubeTexture(
+    this: *mut c_void,
+    edge_length: u32,
+    levels: u32,
+    mut usage: u32,
+    format: u32,
+    mut pool: u32,
+    pp_cube_texture: *mut *mut c_void,
+    p_shared_handle: *mut windows::Win32::Foundation::HANDLE,
+) -> HRESULT {
+    if pool == 1 /* D3DPOOL_MANAGED */ {
+        pool = 0; /* D3DPOOL_DEFAULT */
+        usage |= 0x200; /* D3DUSAGE_DYNAMIC */
+    }
+    type F = unsafe extern "system" fn(
+        *mut c_void, u32, u32, u32, u32, u32, *mut *mut c_void, *mut windows::Win32::Foundation::HANDLE,
+    ) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[25]);
+    f(real_dev(this), edge_length, levels, usage, format, pool, pp_cube_texture, p_shared_handle)
+}
+
+unsafe extern "system" fn proxy_CreateVertexBuffer(
+    this: *mut c_void,
+    length: u32,
+    mut usage: u32,
+    fvf: u32,
+    mut pool: u32,
+    pp_vertex_buffer: *mut *mut c_void,
+    p_shared_handle: *mut windows::Win32::Foundation::HANDLE,
+) -> HRESULT {
+    let orig_pool = pool;
+    if pool == 1 /* D3DPOOL_MANAGED */ {
+        pool = 0; /* D3DPOOL_DEFAULT */
+        usage |= 0x200; /* D3DUSAGE_DYNAMIC */
+    }
+    type F = unsafe extern "system" fn(
+        *mut c_void, u32, u32, u32, u32, *mut *mut c_void, *mut windows::Win32::Foundation::HANDLE,
+    ) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[26]);
+    let hr = f(real_dev(this), length, usage, fvf, pool, pp_vertex_buffer, p_shared_handle);
+    static LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 30 || hr.0 != 0 {
+        hikari_core::log_msg(&format!(
+            "[CreateVertexBuffer #{n}] len={length} use=0x{usage:X} fvf=0x{fvf:X} pool={pool} (orig={orig_pool}) hr=0x{:08X}",
+            hr.0 as u32
+        ));
+    }
+    hr
+}
+
+unsafe extern "system" fn proxy_CreateIndexBuffer(
+    this: *mut c_void,
+    length: u32,
+    mut usage: u32,
+    format: u32,
+    mut pool: u32,
+    pp_index_buffer: *mut *mut c_void,
+    p_shared_handle: *mut windows::Win32::Foundation::HANDLE,
+) -> HRESULT {
+    let orig_pool = pool;
+    if pool == 1 /* D3DPOOL_MANAGED */ {
+        pool = 0; /* D3DPOOL_DEFAULT */
+        usage |= 0x200; /* D3DUSAGE_DYNAMIC */
+    }
+    type F = unsafe extern "system" fn(
+        *mut c_void, u32, u32, u32, u32, *mut *mut c_void, *mut windows::Win32::Foundation::HANDLE,
+    ) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[27]);
+    let hr = f(real_dev(this), length, usage, format, pool, pp_index_buffer, p_shared_handle);
+    static LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 30 || hr.0 != 0 {
+        hikari_core::log_msg(&format!(
+            "[CreateIndexBuffer #{n}] len={length} use=0x{usage:X} fmt={format} pool={pool} (orig={orig_pool}) hr=0x{:08X}",
+            hr.0 as u32
+        ));
+    }
+    hr
+}
+
+unsafe extern "system" fn proxy_CreateOffscreenPlainSurface(
+    this: *mut c_void,
+    width: u32,
+    height: u32,
+    format: u32,
+    mut pool: u32,
+    pp_surface: *mut *mut c_void,
+    p_shared_handle: *mut windows::Win32::Foundation::HANDLE,
+) -> HRESULT {
+    let orig_pool = pool;
+    if pool == 1 /* D3DPOOL_MANAGED */ {
+        pool = 0; /* D3DPOOL_DEFAULT */
+    }
+    type F = unsafe extern "system" fn(
+        *mut c_void, u32, u32, u32, u32, *mut *mut c_void, *mut windows::Win32::Foundation::HANDLE,
+    ) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[36]);
+    let hr = f(real_dev(this), width, height, format, pool, pp_surface, p_shared_handle);
+    hikari_core::log_msg(&format!(
+        "[CreateOffscreenPlainSurface] {width}x{height} fmt={format} pool={pool} (orig={orig_pool}) hr=0x{:08X}",
+        hr.0 as u32
+    ));
+    hr
 }
 
 unsafe extern "system" fn proxy_SetRenderTarget(
