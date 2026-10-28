@@ -32,8 +32,20 @@ unsafe impl Sync for TexPair {}
 
 pub static TEX_PAIR: Mutex<Option<TexPair>> = Mutex::new(None);
 
+pub struct SharedBridge {
+    pub d3d9_tex: Direct3D9::IDirect3DTexture9,
+    pub shared_handle: windows::Win32::Foundation::HANDLE,
+    pub size: (u32, u32),
+}
+
+unsafe impl Send for SharedBridge {}
+unsafe impl Sync for SharedBridge {}
+
+pub static SHARED_BRIDGE: Mutex<Option<SharedBridge>> = Mutex::new(None);
+
 pub fn release_d3d9_resources() {
     crate::log_msg("[vtable] release_d3d9_resources: dropping D3D9 default-pool surfaces");
+    *SHARED_BRIDGE.lock().unwrap() = None;
     *TEX_PAIR.lock().unwrap() = None;
     *BOUND_VB.lock().unwrap() = None;
     *BOUND_IB.lock().unwrap() = None;
@@ -41,6 +53,7 @@ pub fn release_d3d9_resources() {
     if let Ok(mut guard) = GLOBAL_D3D11.lock() {
         if let Some(ref mut ctx) = *guard {
             ctx.texture_cache.clear();
+            ctx.shared_target_tex = None;
         }
     }
 }
@@ -135,93 +148,160 @@ unsafe extern "system" fn hook_end_scene(this: *mut c_void) -> HRESULT {
         ctx.recreate_composite(w, h).map_err(|e| format!("recreate composite failed: {e}"))?;
         log_wheel("targets_ready", String::new());
 
-        // Static reusable D3D9 textures: the system-memory staging texture the
-        // DX11 model layer is copied into, and the DEFAULT-pool texture the
-        // native device samples for the overlay quad.
-        let rebuild = {
-            let slot = TEX_PAIR.lock().unwrap();
-            match slot.as_ref() {
-                Some(pair) => pair.size != (w, h) || pair.format != desc.Format,
-                None => true,
-            }
-        };
-        if rebuild {
-            log_wheel("create_sys_tex", format!("{}x{} fmt=0x{:X} sysmem", w, h, desc.Format.0));
-            let mut sys_tex: Option<Direct3D9::IDirect3DTexture9> = None;
-            Direct3D9::IDirect3DDevice9::CreateTexture(
-                &device, w, h, 1, 0, desc.Format, Direct3D9::D3DPOOL_SYSTEMMEM,
-                &mut sys_tex, std::ptr::null_mut(),
-            ).map_err(|e| format!("CreateTexture(sys) failed: {e}"))?;
-            let sys_tex = sys_tex.ok_or("CreateTexture returned none")?;
-            let mut gpu_tex: Option<Direct3D9::IDirect3DTexture9> = None;
-            Direct3D9::IDirect3DDevice9::CreateTexture(
-                &device, w, h, 1, 0, desc.Format, Direct3D9::D3DPOOL_DEFAULT,
-                &mut gpu_tex, std::ptr::null_mut(),
-            ).map_err(|e| format!("CreateTexture(gpu) failed: {e}"))?;
-            let gpu_tex = gpu_tex.ok_or("CreateTexture returned none")?;
-            log_wheel("textures_created", format!("sys={:p} gpu={:p}", sys_tex.as_raw(), gpu_tex.as_raw()));
-            *TEX_PAIR.lock().unwrap() = Some(TexPair {
-                sys_tex,
-                gpu_tex: Some(gpu_tex),
-                format: desc.Format,
-                size: (w, h),
-            });
-            log_wheel("texpair_commit", String::new());
-        }
-        let (sys_tex, gpu_tex) = {
-            let slot = TEX_PAIR.lock().unwrap();
-            match slot.as_ref() {
-                Some(pair) => {
-                    let gpu = pair.gpu_tex.clone().ok_or("gpu texture missing".to_string())?;
-                    Ok((pair.sys_tex.clone(), gpu))
-                }
-                None => Err("texture pair missing".to_string()),
-            }
-        }?;
-        log_wheel("texpair_fetch", String::new());
-
-    // 1. Read back the DX11 model layer (transparent background, model
-    //    pixels opaque). D9TEX=0 disables the whole D3D9 back-buffer interop
-    //    (no CreateTexture/UpdateSurface/native quad) to isolate crash
-    //    sources; only the DX11-side readback runs.
-    let use_d3d9 = std::env::var("HIKARI_D9TEX").ok().as_deref() != Some("0");
-    if !use_d3d9 {
-        let bytes = ctx.readback_model_layer()
-            .map_err(|e| format!("model layer readback failed: {e}"))?;
-        log_wheel("d9tex_disabled", format!("readback ok ({} bytes, no D3D9 calls)", bytes.len()));
-        return Ok(());
-    }
-    let bytes = ctx.readback_model_layer()
-        .map_err(|e| format!("model layer readback failed: {e}"))?;
-    log_wheel("model_readback", format!("{} bytes", bytes.len()));
-
-        // 2. Copy into the D3D9 system-memory texture.
-        write_system_texture(&sys_tex, w, h, &bytes)?;
-        log_wheel("write_result", String::new());
-
-        // 3. UpdateSurface into the DEFAULT-pool sampling texture.
-        let sys_surface = Direct3D9::IDirect3DTexture9::GetSurfaceLevel(&sys_tex, 0)
-            .map_err(|e| format!("GetSurfaceLevel(sys) failed: {e}"))?;
-        let gpu_surface = Direct3D9::IDirect3DTexture9::GetSurfaceLevel(&gpu_tex, 0)
-            .map_err(|e| format!("GetSurfaceLevel(gpu) failed: {e}"))?;
-        Direct3D9::IDirect3DDevice9::UpdateSurface(
-            &device, &sys_surface, std::ptr::null(), &gpu_surface, std::ptr::null(),
-        ).map_err(|e| format!("UpdateSurface failed: {}", e.code()))?;
-        log_wheel("update_surface", String::new());
-
-        // 4. Draw the model layer over the native backbuffer with the real
-        //    D3D9 device, straight alpha blending, before its own EndScene.
-        //    Toggle with HIKARI_NATIVE_QUAD=0 to isolate the crash source.
         let draw_quad = std::env::var("HIKARI_NATIVE_QUAD").ok().as_deref() != Some("0");
-        if draw_quad {
-            draw_model_layer_d3d9(&device, &gpu_tex, w, h)
-                .map_err(|e| e)?;
+
+        // 1. Zero-Copy DXGI Shared Handle Composite (GPU-to-GPU, Direct3D 9Ex <-> D3D11)
+        let mut zero_copy_rendered = false;
+        {
+            let mut bridge_slot = SHARED_BRIDGE.lock().unwrap();
+            let needs_bridge_rebuild = match bridge_slot.as_ref() {
+                Some(b) => b.size != (w, h),
+                None => true,
+            };
+
+            if needs_bridge_rebuild {
+                let mut shared_handle = windows::Win32::Foundation::HANDLE::default();
+                let mut d3d9_shared_tex: Option<Direct3D9::IDirect3DTexture9> = None;
+                let hr = Direct3D9::IDirect3DDevice9::CreateTexture(
+                    &device,
+                    w,
+                    h,
+                    1,
+                    Direct3D9::D3DUSAGE_RENDERTARGET as u32,
+                    Direct3D9::D3DFMT_A8R8G8B8,
+                    Direct3D9::D3DPOOL_DEFAULT,
+                    &mut d3d9_shared_tex,
+                    &mut shared_handle,
+                );
+                crate::log_msg(&format!(
+                    "[vtable] CreateTexture(shared) {}x{} hr=0x{:08X}, handle={:?}",
+                    w, h, hr.as_ref().err().map_or(0, |e| e.code().0 as u32), shared_handle.0
+                ));
+                if hr.is_ok() && !shared_handle.0.is_null() {
+                    if let Some(tex) = d3d9_shared_tex {
+                        if let Err(e) = ctx.open_shared_d3d9_resource(shared_handle) {
+                            crate::log_msg(&format!("[vtable] open_shared_d3d9_resource failed: {:?}", e));
+                        } else {
+                            *bridge_slot = Some(SharedBridge {
+                                d3d9_tex: tex,
+                                shared_handle,
+                                size: (w, h),
+                            });
+                            crate::log_msg(&format!(
+                                "[vtable] Zero-Copy DXGI Shared Texture bound: {}x{}, handle={:?}",
+                                w, h, shared_handle.0
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if let Some(ref b) = *bridge_slot {
+                if let Some(ref d3d11_shared) = ctx.shared_target_tex {
+                    if let Some(ref model_tex) = ctx.model_tex {
+                        // Direct GPU-to-GPU copy from D3D11 model layer to shared D3D9 texture
+                        ctx.context.CopyResource(d3d11_shared, model_tex);
+                        ctx.context.Flush();
+                        log_wheel("gpu_shared_copy", format!("zero-copy GPU blit {w}x{h}"));
+
+                        if draw_quad {
+                            draw_model_layer_d3d9(&device, &b.d3d9_tex, w, h)?;
+                        }
+                        log_wheel("native_quad_shared", if draw_quad { "drawn".to_string() } else { "skipped".to_string() });
+                        zero_copy_rendered = true;
+                    }
+                }
+            }
         }
-        log_wheel("native_quad", if draw_quad { "drawn".to_string() } else { "skipped (HIKARI_NATIVE_QUAD=0)".to_string() });
+
+        // 2. Fallback: CPU readback with D3DFMT_A8R8G8B8 if shared handle is not supported
+        if !zero_copy_rendered {
+            let rebuild = {
+                let slot = TEX_PAIR.lock().unwrap();
+                match slot.as_ref() {
+                    Some(pair) => pair.size != (w, h) || pair.format != Direct3D9::D3DFMT_A8R8G8B8,
+                    None => true,
+                }
+            };
+            if rebuild {
+                log_wheel("create_sys_tex", format!("{}x{} fmt=A8R8G8B8 sysmem", w, h));
+                let mut sys_tex: Option<Direct3D9::IDirect3DTexture9> = None;
+                Direct3D9::IDirect3DDevice9::CreateTexture(
+                    &device, w, h, 1, 0, Direct3D9::D3DFMT_A8R8G8B8, Direct3D9::D3DPOOL_SYSTEMMEM,
+                    &mut sys_tex, std::ptr::null_mut(),
+                ).map_err(|e| format!("CreateTexture(sys) failed: {e}"))?;
+                let sys_tex = sys_tex.ok_or("CreateTexture returned none")?;
+                let mut gpu_tex: Option<Direct3D9::IDirect3DTexture9> = None;
+                Direct3D9::IDirect3DDevice9::CreateTexture(
+                    &device, w, h, 1, 0, Direct3D9::D3DFMT_A8R8G8B8, Direct3D9::D3DPOOL_DEFAULT,
+                    &mut gpu_tex, std::ptr::null_mut(),
+                ).map_err(|e| format!("CreateTexture(gpu) failed: {e}"))?;
+                let gpu_tex = gpu_tex.ok_or("CreateTexture returned none")?;
+                log_wheel("textures_created", format!("sys={:p} gpu={:p}", sys_tex.as_raw(), gpu_tex.as_raw()));
+                *TEX_PAIR.lock().unwrap() = Some(TexPair {
+                    sys_tex,
+                    gpu_tex: Some(gpu_tex),
+                    format: Direct3D9::D3DFMT_A8R8G8B8,
+                    size: (w, h),
+                });
+                log_wheel("texpair_commit", String::new());
+            }
+            let (sys_tex, gpu_tex) = {
+                let slot = TEX_PAIR.lock().unwrap();
+                match slot.as_ref() {
+                    Some(pair) => {
+                        let gpu = pair.gpu_tex.clone().ok_or("gpu texture missing".to_string())?;
+                        Ok((pair.sys_tex.clone(), gpu))
+                    }
+                    None => Err("texture pair missing".to_string()),
+                }
+            }?;
+            log_wheel("texpair_fetch", String::new());
+
+            let use_d3d9 = std::env::var("HIKARI_D9TEX").ok().as_deref() != Some("0");
+            if !use_d3d9 {
+                let bytes = ctx.readback_model_layer()
+                    .map_err(|e| format!("model layer readback failed: {e}"))?;
+                log_wheel("d9tex_disabled", format!("readback ok ({} bytes, no D3D9 calls)", bytes.len()));
+                return Ok(());
+            }
+            let bytes = ctx.readback_model_layer()
+                .map_err(|e| format!("model layer readback failed: {e}"))?;
+            let mut non_zero_alpha = 0usize;
+            let mut max_a = 0u8;
+            let mut sample = [0u8; 4];
+            for p in bytes.chunks_exact(4) {
+                if p[3] > 0 {
+                    if non_zero_alpha == 0 { sample = [p[0], p[1], p[2], p[3]]; }
+                    non_zero_alpha += 1;
+                    if p[3] > max_a { max_a = p[3]; }
+                }
+            }
+            log_wheel("model_readback", format!("{} bytes, non_zero_a={}, max_a={}, sample_bgra={:?}", bytes.len(), non_zero_alpha, max_a, sample));
+
+            write_system_texture(&sys_tex, w, h, &bytes)?;
+            log_wheel("write_result", String::new());
+
+            let sys_surface = Direct3D9::IDirect3DTexture9::GetSurfaceLevel(&sys_tex, 0)
+                .map_err(|e| format!("GetSurfaceLevel(sys) failed: {e}"))?;
+            let gpu_surface = Direct3D9::IDirect3DTexture9::GetSurfaceLevel(&gpu_tex, 0)
+                .map_err(|e| format!("GetSurfaceLevel(gpu) failed: {e}"))?;
+            Direct3D9::IDirect3DDevice9::UpdateSurface(
+                &device, &sys_surface, std::ptr::null(), &gpu_surface, std::ptr::null(),
+            ).map_err(|e| format!("UpdateSurface failed: {}", e.code()))?;
+            log_wheel("update_surface", String::new());
+
+            if draw_quad {
+                draw_model_layer_d3d9(&device, &gpu_tex, w, h)
+                    .map_err(|e| e)?;
+            }
+            log_wheel("native_quad_fallback", if draw_quad { "drawn".to_string() } else { "skipped (HIKARI_NATIVE_QUAD=0)".to_string() });
+        }
 
         if !COMPOSITE_LOGGED.swap(true, Ordering::Relaxed) {
             crate::log_msg(&format!(
-                "Composite drawn into native backbuffer: {}x{}", w, h
+                "Composite drawn into native backbuffer: {}x{} (zero_copy={})",
+                w, h, zero_copy_rendered
             ));
         }
         Ok(())
@@ -438,27 +518,40 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     };
     if !raw_dev.is_null() {
         let dev = std::mem::ManuallyDrop::new(std::mem::transmute::<*mut c_void, Direct3D9::IDirect3DDevice9>(raw_dev));
-        let mut w_mat = [0.0f32; 16];
-        let mut v_mat = [0.0f32; 16];
-        let mut p_mat = [0.0f32; 16];
+        let id_mat = [
+            1.0f32, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let mut w_mat = id_mat;
+        let mut v_mat = id_mat;
+        let mut p_mat = id_mat;
 
-        if dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(256), w_mat.as_mut_ptr() as *mut _).is_ok() {
+        let hr_w = dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(256), w_mat.as_mut_ptr() as *mut _);
+        if hr_w.is_ok() {
             *crate::backend::CURRENT_WORLD_MATRIX.lock().unwrap() = w_mat;
         }
-        if dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(2), v_mat.as_mut_ptr() as *mut _).is_ok() {
+        let hr_v = dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(2), v_mat.as_mut_ptr() as *mut _);
+        if hr_v.is_ok() {
             *crate::backend::CURRENT_VIEW_MATRIX.lock().unwrap() = v_mat;
         }
-        if dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(3), p_mat.as_mut_ptr() as *mut _).is_ok() {
+        let hr_p = dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(3), p_mat.as_mut_ptr() as *mut _);
+        if hr_p.is_ok() {
             *crate::backend::CURRENT_PROJ_MATRIX.lock().unwrap() = p_mat;
         }
 
         static MATRIX_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !MATRIX_LOGGED.swap(true, Ordering::Relaxed) {
+            let w = *crate::backend::CURRENT_WORLD_MATRIX.lock().unwrap();
             let v = *crate::backend::CURRENT_VIEW_MATRIX.lock().unwrap();
             let p = *crate::backend::CURRENT_PROJ_MATRIX.lock().unwrap();
             crate::log_msg(&format!(
-                "Captured live camera from D3D9: View._11={:.3}, Proj._11={:.3}, Proj._33={:.3}",
-                v[0], p[0], p[10]
+                "Captured live D3D9 transforms: W_ok={} V_ok={} P_ok={} | W_trans=({:.2},{:.2},{:.2}) V_trans=({:.2},{:.2},{:.2}) P_diag=({:.3},{:.3},{:.3})",
+                hr_w.is_ok(), hr_v.is_ok(), hr_p.is_ok(),
+                w[12], w[13], w[14],
+                v[12], v[13], v[14],
+                p[0], p[5], p[10]
             ));
         }
     }
@@ -478,7 +571,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
                 DRAW_INDEXED_ACTIVE.fetch_add(1, Ordering::Relaxed);
                 if !PASS_STATE_LOG.swap(true, Ordering::Relaxed) {
                     crate::log_msg(&format!(
-                        "hook_draw_indexed_primitive: Model/Subset assigned effect is ACTIVE (obj={current_obj}, mat={current_mat}) - intercepting and drawing on DirectX 11"
+                        "hook_draw_indexed_primitive: Model/Subset assigned effect is ACTIVE (obj={current_obj}, mat={current_mat}, tech={current_tech}) - intercepting and drawing on DirectX 11"
                     ));
                 }
                 p
@@ -492,7 +585,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
                 if total % 300 == 0 {
                     let active = DRAW_INDEXED_ACTIVE.load(Ordering::Relaxed);
                     crate::log_msg(&format!(
-                        "DrawIndexedPrimitive heartbeat: total={total}, SM5-active={active}, obj={current_obj}, mat={current_mat}, the rest are passed through to the D3D9/MMDX11 path"
+                        "DrawIndexedPrimitive heartbeat: total={total}, SM5-active={active}, obj={current_obj}, mat={current_mat}, tech={current_tech}, the rest are passed through to the D3D9/MMDX11 path"
                     ));
                 }
                 return false;
@@ -694,13 +787,22 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     }
 
     if !DRAW_SUCCESS_LOGGED.swap(true, Ordering::Relaxed) {
+        let v0_str = if vb_bytes.len() >= 12 {
+            let x = f32::from_ne_bytes(vb_bytes[0..4].try_into().unwrap());
+            let y = f32::from_ne_bytes(vb_bytes[4..8].try_into().unwrap());
+            let z = f32::from_ne_bytes(vb_bytes[8..12].try_into().unwrap());
+            format!("({:.2}, {:.2}, {:.2})", x, y, z)
+        } else {
+            "none".to_string()
+        };
         crate::log_msg(&format!(
-            "D3D11 indexed shader draw submitted: prim_type={prim_type}, base_vertex={base_vertex_index}, min_vertex={min_vertex_index}, num_vertices={num_vertices}, start_index={start_index}, prim_count={prim_count}, stride={stride}, vertices={}, indices={index_count}, VB_bytes={}, IB_bytes={}, IB_32bit={is_32bit}, VS={}, PS={}",
+            "D3D11 indexed shader draw submitted: prim_type={prim_type}, base_vertex={base_vertex_index}, min_vertex={min_vertex_index}, num_vertices={num_vertices}, start_index={start_index}, prim_count={prim_count}, stride={stride}, vertices={}, indices={index_count}, VB_bytes={}, IB_bytes={}, IB_32bit={is_32bit}, VS={}, PS={}, V0={}",
             vb_bytes.len() / stride.max(1) as usize,
             vb_bytes.len(),
             ib_bytes.len(),
             pass_info.vs.is_some(),
             pass_info.ps.is_some(),
+            v0_str,
         ));
     }
 

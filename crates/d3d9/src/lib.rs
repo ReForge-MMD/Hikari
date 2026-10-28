@@ -238,11 +238,13 @@ unsafe extern "system" fn hook_CreateDevice(
         "[d3d9] IDirect3D9::CreateDevice called: hwnd={:?} flags=0x{:X}",
         h_focus_window.0, behavior_flags
     ));
+
     let orig: PfnCreateDevice = std::mem::transmute(D3D9_ORIGINAL_VTBL[16]);
     let hr = orig(
         this, adapter, device_type, h_focus_window, behavior_flags,
         p_presentation_parameters, pp_returned_device_interface,
     );
+
     hikari_core::log_msg(&format!("[d3d9] CreateDevice hr=0x{:08X}", hr.0 as u32));
     if hr == S_OK && !pp_returned_device_interface.is_null() && !(*pp_returned_device_interface).is_null() {
         let real_device = *pp_returned_device_interface;
@@ -753,7 +755,9 @@ unsafe extern "system" fn proxy_DrawIndexedPrimitive(
             dev, prim_type, base_vertex_index,
             min_vertex_index, num_vertices, start_index, prim_count,
         );
-        if rendered { return S_OK; }
+        if rendered && std::env::var("HIKARI_PASSTHROUGH_D3D9").ok().as_deref() != Some("1") {
+            return S_OK;
+        }
     }
     ensure_fixed_function_stage0(dev);
     log_d3d9_draw_state(dev, "DrawIndexedPrimitive_D3D9", prim_type, prim_count);

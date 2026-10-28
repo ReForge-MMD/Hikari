@@ -95,6 +95,7 @@ pub struct D3D11Context {
     pub model_rtv: Option<ID3D11RenderTargetView>,
     pub model_srv: Option<ID3D11ShaderResourceView>,
     pub model_depth: Option<ID3D11DepthStencilView>,
+    pub shared_target_tex: Option<ID3D11Texture2D>,
     pub composite_tex: Option<ID3D11Texture2D>,
     pub composite_rtv: Option<ID3D11RenderTargetView>,
     pub composite_staging: Option<ID3D11Texture2D>,
@@ -251,6 +252,7 @@ impl D3D11Context {
             model_rtv: None,
             model_srv: None,
             model_depth: None,
+            shared_target_tex: None,
             composite_tex: None,
             composite_rtv: None,
             composite_staging: None,
@@ -675,6 +677,22 @@ float4 BlitPS(VOut input) : SV_Target {
             self.context.Unmap(&staging, 0);
             Ok(out)
         }
+    }
+
+    /// Opens an external D3D9 / D3D9Ex shared texture handle for zero-copy GPU composite.
+    pub fn open_shared_d3d9_resource(&mut self, handle: windows::Win32::Foundation::HANDLE) -> Result<()> {
+        let mut res: Option<windows::Win32::Graphics::Direct3D11::ID3D11Resource> = None;
+        unsafe {
+            self.device.OpenSharedResource(handle, &mut res)?;
+        }
+        let res = res.ok_or_else(|| windows::core::Error::from(HRESULT(-1)))?;
+        let tex: ID3D11Texture2D = windows::core::Interface::cast(&res)?;
+        self.shared_target_tex = Some(tex);
+        crate::log_msg(&format!(
+            "[d3d11] Successfully opened DXGI shared D3D9 texture: handle={:?}",
+            handle.0
+        ));
+        Ok(())
     }
 
     /// Resizes swap chain and views on window resize.

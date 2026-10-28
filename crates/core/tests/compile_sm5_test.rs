@@ -200,6 +200,13 @@ fn test_compile_model_fx_file() {
         assert!(eff.param_by_semantic.contains_key("WORLDVIEWPROJECTION"));
         assert!(eff.param_by_semantic.contains_key("WORLD"));
         assert!(eff.param_by_semantic.contains_key("MATERIALTEXTURE"));
+
+        // Verify MMD ExpGetCurrentTechnic resolution
+        assert_eq!(eff.find_technique_for_pass(1), Some(0), "Tech 1 (Self-shadow OFF) -> MainTec");
+        assert_eq!(eff.find_technique_for_pass(2), Some(1), "Tech 2 (Self-shadow ON / Camera mode) -> MainTecSS");
+        assert_eq!(eff.find_technique_for_pass(4), Some(2), "Tech 4 (Edge) -> EdgeTec");
+        assert_eq!(eff.find_technique_for_pass(3), Some(3), "Tech 3 (Shadow) -> ShadowTec");
+        assert_eq!(eff.find_technique_for_pass(0), Some(0), "Tech 0 (Other) -> MainTec");
         drop(Box::from_raw(eff_ptr));
     }
 }
@@ -224,6 +231,12 @@ fn test_compile_red_model_fx_file() {
         assert!(eff.techniques.len() >= 2);
         assert!(eff.param_by_name.contains_key("redcolor"));
         assert!(eff.param_by_name.contains_key("redglow"));
+
+        // Verify MMD technique resolution for red_model.fx
+        assert_eq!(eff.find_technique_for_pass(1), Some(0), "Tech 1 -> MainTec");
+        assert_eq!(eff.find_technique_for_pass(2), Some(1), "Tech 2 (Camera mode) -> MainTecSS");
+        assert_eq!(eff.find_technique_for_pass(0), Some(0), "Tech 0 -> MainTec");
+        assert_eq!(eff.find_technique_for_pass(4), None, "Tech 4 (Edge absent) -> None (fallback to D3D9)");
         drop(Box::from_raw(eff_ptr));
     }
 }

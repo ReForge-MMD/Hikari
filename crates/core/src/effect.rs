@@ -739,15 +739,36 @@ impl HikariEffect {
             return;
         }
         if let Some(ref cb) = self.constant_buffer {
-            unsafe {
-                self.context.UpdateSubresource(
+            let mut mapped = windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE::default();
+            let hr = unsafe {
+                self.context.Map(
                     cb,
                     0,
-                    None,
-                    self.constant_data.as_ptr() as *const c_void,
+                    windows::Win32::Graphics::Direct3D11::D3D11_MAP_WRITE_DISCARD,
                     0,
-                    0,
-                );
+                    Some(&mut mapped),
+                )
+            };
+            if hr.is_ok() && !mapped.pData.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.constant_data.as_ptr(),
+                        mapped.pData as *mut u8,
+                        self.constant_data.len(),
+                    );
+                    self.context.Unmap(cb, 0);
+                }
+            } else {
+                unsafe {
+                    self.context.UpdateSubresource(
+                        cb,
+                        0,
+                        None,
+                        self.constant_data.as_ptr() as *const c_void,
+                        0,
+                        0,
+                    );
+                }
             }
         }
         self.constant_dirty = false;
@@ -869,11 +890,20 @@ impl HikariEffect {
     }
 
     pub fn find_technique_for_pass(&self, current_tech: i32) -> Option<usize> {
+        // MMD ExpGetCurrentTechnic values (from MMDExport.h):
+        // 0: Other (その他)
+        // 1: Normal rendering (Self-shadow OFF)
+        // 2: Normal rendering (Self-shadow ON - default in Camera mode)
+        // 3: Shadow (Non-self-shadow objects)
+        // 4: Edge (エッジ)
+        // 5: Z-buffer plot for self-shadow
         let pass_name = match current_tech {
             0 => "object",
-            1 => "object_ss",
-            2 => "edge",
+            1 => "object",
+            2 => "object_ss",
             3 => "shadow",
+            4 => "edge",
+            5 => "zplot",
             _ => "object",
         };
 
@@ -899,12 +929,17 @@ impl HikariEffect {
         }
 
         // 3. Fallbacks
-        if current_tech == 1 {
+        if current_tech == 2 {
             // Fallback object_ss to object
-            return self.find_technique_for_pass(0);
+            return self.find_technique_for_pass(1);
         }
 
-        if current_tech == 0 {
+        if current_tech == 5 {
+            // Fallback zplot to shadow pass if available
+            return self.find_technique_for_pass(3);
+        }
+
+        if current_tech == 1 || current_tech == 0 {
             // For standard object pass, fallback to active_tech_idx or first valid technique
             if self.active_tech_idx < self.compiled_techniques.len() && !self.compiled_techniques[self.active_tech_idx].is_empty() {
                 return Some(self.active_tech_idx);

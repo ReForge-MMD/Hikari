@@ -44,6 +44,9 @@ fn test_verify_d3d9_vtable_layout() {
 
     check_slot!(base__, 0);
     check_slot!(Present, 17);
+    check_slot!(CreateTexture, 23);
+    check_slot!(CreateVertexBuffer, 26);
+    check_slot!(CreateIndexBuffer, 27);
     check_slot!(SetRenderTarget, 37);
     check_slot!(BeginScene, 41);
     check_slot!(EndScene, 42);
