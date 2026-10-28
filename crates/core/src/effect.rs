@@ -51,6 +51,7 @@ pub struct ActivePassInfo {
     pub vs_bytecode: Vec<u8>,
     pub vs: Option<ID3D11VertexShader>,
     pub ps: Option<ID3D11PixelShader>,
+    pub gs: Option<ID3D11GeometryShader>,
     pub constant_buffer: Option<ID3D11Buffer>,
     pub blend_preset: BlendPreset,
     pub depth_preset: DepthPreset,
@@ -58,6 +59,10 @@ pub struct ActivePassInfo {
 }
 
 pub static ACTIVE_EFFECT_PASS: Mutex<Option<ActivePassInfo>> = Mutex::new(None);
+pub static EFFECTS_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static AUTO_RELOAD: AtomicBool = AtomicBool::new(true);
+pub static AUTO_SAVE_MAPPING: AtomicBool = AtomicBool::new(true);
+pub static SKIP_DEVICE_VALIDATION: AtomicBool = AtomicBool::new(true);
 static WVP_VALUE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Logs the first calls to an unimplemented stub so the caller can be
@@ -933,6 +938,7 @@ impl HikariEffect {
             vs_bytecode: bc.clone(),
             vs: pass.vs.clone(),
             ps: pass.ps.clone(),
+            gs: pass.gs.clone(),
             constant_buffer: self.constant_buffer.clone(),
             blend_preset: pass.blend_preset.clone(),
             depth_preset: pass.depth_preset.clone(),
@@ -1020,6 +1026,7 @@ impl HikariEffect {
             vs_bytecode: bc.clone(),
             vs: pass.vs.clone(),
             ps: pass.ps.clone(),
+            gs: pass.gs.clone(),
             constant_buffer: self.constant_buffer.clone(),
             blend_preset: pass.blend_preset.clone(),
             depth_preset: pass.depth_preset.clone(),
@@ -1190,12 +1197,70 @@ pub struct ModelAssignment {
 unsafe impl Send for ModelAssignment {}
 unsafe impl Sync for ModelAssignment {}
 
+#[derive(Clone, Debug)]
+pub struct OffscreenTabEntry {
+    pub name: String,
+    pub description: String,
+    pub default_effect_path: String,
+    pub default_effect: Option<*mut HikariEffect>,
+    pub default_rules: String,
+    pub is_offscreen: bool,
+    pub model_overrides: HashMap<usize, ModelSubsetAssignment>,
+    pub subset_overrides: HashMap<(usize, i32), ModelSubsetAssignment>,
+}
+
+unsafe impl Send for OffscreenTabEntry {}
+unsafe impl Sync for OffscreenTabEntry {}
+
+pub fn match_mme_pattern(pattern: &str, text: &str) -> bool {
+    let p = pattern.trim().to_lowercase();
+    let t = text.trim().to_lowercase();
+    if p == "*" {
+        return true;
+    }
+    wildcard_match(p.as_bytes(), t.as_bytes())
+}
+
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut px = 0;
+    let mut tx = 0;
+    let mut next_px = 0;
+    let mut next_tx = 0;
+    let mut star = false;
+
+    while tx < text.len() {
+        if px < pattern.len() && (pattern[px] == b'?' || pattern[px] == text[tx]) {
+            px += 1;
+            tx += 1;
+        } else if px < pattern.len() && pattern[px] == b'*' {
+            star = true;
+            px += 1;
+            next_px = px;
+            next_tx = tx + 1;
+        } else if star {
+            px = next_px;
+            tx = next_tx;
+            next_tx += 1;
+        } else {
+            return false;
+        }
+    }
+
+    while px < pattern.len() && pattern[px] == b'*' {
+        px += 1;
+    }
+
+    px == pattern.len()
+}
+
 pub struct ModelAssignmentRegistry {
     pub default_effect_path: String,
     pub default_effect: Option<*mut HikariEffect>,
     pub models: HashMap<usize, ModelAssignment>,
     pub order_to_id: HashMap<i32, usize>,
     pub expanded_models: HashSet<usize>,
+    pub tabs: Vec<OffscreenTabEntry>,
+    pub current_tab_idx: usize,
 }
 
 unsafe impl Send for ModelAssignmentRegistry {}
@@ -1203,12 +1268,24 @@ unsafe impl Sync for ModelAssignmentRegistry {}
 
 impl ModelAssignmentRegistry {
     pub fn new() -> Self {
+        let main_tab = OffscreenTabEntry {
+            name: "Main".to_string(),
+            description: "Main Render Target".to_string(),
+            default_effect_path: String::new(),
+            default_effect: None,
+            default_rules: String::new(),
+            is_offscreen: false,
+            model_overrides: HashMap::new(),
+            subset_overrides: HashMap::new(),
+        };
         Self {
             default_effect_path: String::new(),
             default_effect: None,
             models: HashMap::new(),
             order_to_id: HashMap::new(),
             expanded_models: HashSet::new(),
+            tabs: vec![main_tab],
+            current_tab_idx: 0,
         }
     }
 
@@ -1234,6 +1311,9 @@ impl ModelAssignmentRegistry {
             defer_drop_effect(old);
         }
         self.default_effect_path = path.to_string();
+        if let Ok(source) = std::fs::read_to_string(path) {
+            self.scan_and_register_offscreen_tabs(&source);
+        }
         HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
         crate::log_msg(&format!("[Assignment] Set default effect: '{path}'"));
         Ok(())
@@ -1264,6 +1344,9 @@ impl ModelAssignmentRegistry {
         }
         model.effect_path = path.to_string();
         model.enabled = true;
+        if let Ok(source) = std::fs::read_to_string(path) {
+            self.scan_and_register_offscreen_tabs(&source);
+        }
         HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
         crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) effect: '{path}'"));
         Ok(())
@@ -1302,6 +1385,9 @@ impl ModelAssignmentRegistry {
         }
         sub.effect_path = path.to_string();
         sub.enabled = true;
+        if let Ok(source) = std::fs::read_to_string(path) {
+            self.scan_and_register_offscreen_tabs(&source);
+        }
         HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
         crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) subset #{subset} effect: '{path}'"));
         Ok(())
@@ -1336,6 +1422,9 @@ impl ModelAssignmentRegistry {
     }
 
     pub fn resolve_effect(&self, object_order: i32, subset_index: i32) -> Option<*mut HikariEffect> {
+        if !EFFECTS_ENABLED.load(Ordering::Acquire) {
+            return None;
+        }
         if object_order != 0 {
             let mut resolved_model = self.order_to_id.get(&object_order).and_then(|id| self.models.get(id));
             if resolved_model.is_none() {
@@ -1397,6 +1486,536 @@ impl ModelAssignmentRegistry {
             }
         }
         false
+    }
+
+    pub fn add_tab(&mut self, name: &str, description: &str, default_rules: &str) {
+        if let Some(existing) = self.tabs.iter_mut().find(|t| t.name.eq_ignore_ascii_case(name)) {
+            if !description.is_empty() {
+                existing.description = description.to_string();
+            }
+            if !default_rules.is_empty() {
+                existing.default_rules = default_rules.to_string();
+            }
+            return;
+        }
+        self.tabs.push(OffscreenTabEntry {
+            name: name.to_string(),
+            description: if description.is_empty() { format!("{name} Render Target") } else { description.to_string() },
+            default_effect_path: String::new(),
+            default_effect: None,
+            default_rules: default_rules.to_string(),
+            is_offscreen: true,
+            model_overrides: HashMap::new(),
+            subset_overrides: HashMap::new(),
+        });
+        crate::log_msg(&format!("[Tab] Added offscreen render target tab: '{name}' ({description})"));
+    }
+
+    pub fn scan_and_register_offscreen_tabs(&mut self, source: &str) {
+        let global_vars = crate::shader::parse_global_variables(source);
+        for g in global_vars {
+            if g.semantic.eq_ignore_ascii_case("OFFSCREENRENDERTARGET")
+                || g.annotations.contains_key("Description")
+                || g.annotations.contains_key("DefaultEffect")
+            {
+                let name = g.name;
+                let desc = g.annotations.get("Description").cloned().unwrap_or_else(|| format!("{name} Render Target"));
+                let rules = g.annotations.get("DefaultEffect").cloned().unwrap_or_else(|| "*=none;".to_string());
+                self.add_tab(&name, &desc, &rules);
+            }
+        }
+    }
+
+    pub fn assign_tab_effect(
+        &mut self,
+        tab_idx: usize,
+        object_id: Option<usize>,
+        filename: &str,
+        subset: i32,
+        path: &str,
+    ) -> Result<(), String> {
+        if tab_idx == 0 {
+            match object_id {
+                None => self.assign_default_effect(path),
+                Some(obj_id) => {
+                    if subset >= 0 {
+                        self.assign_subset_effect(obj_id, filename, subset, path)
+                    } else {
+                        self.assign_model_effect(obj_id, filename, path)
+                    }
+                }
+            }
+        } else if let Some(tab) = self.tabs.get_mut(tab_idx) {
+            if path.is_empty() {
+                match object_id {
+                    None => {
+                        if let Some(old) = tab.default_effect.take() {
+                            defer_drop_effect(old);
+                        }
+                        tab.default_effect_path.clear();
+                    }
+                    Some(obj_id) => {
+                        if subset >= 0 {
+                            if let Some(sub) = tab.subset_overrides.get_mut(&(obj_id, subset)) {
+                                if let Some(old) = sub.effect.take() {
+                                    defer_drop_effect(old);
+                                }
+                                sub.effect_path.clear();
+                            }
+                        } else {
+                            if let Some(m) = tab.model_overrides.get_mut(&obj_id) {
+                                if let Some(old) = m.effect.take() {
+                                    defer_drop_effect(old);
+                                }
+                                m.effect_path.clear();
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
+            let new_effect = create_effect_instance(path)?;
+            match object_id {
+                None => {
+                    if let Some(old) = tab.default_effect.replace(new_effect) {
+                        defer_drop_effect(old);
+                    }
+                    tab.default_effect_path = path.to_string();
+                }
+                Some(obj_id) => {
+                    if subset >= 0 {
+                        let sub = tab.subset_overrides.entry((obj_id, subset)).or_insert_with(|| ModelSubsetAssignment {
+                            effect_path: String::new(),
+                            effect: None,
+                            enabled: true,
+                        });
+                        if let Some(old) = sub.effect.replace(new_effect) {
+                            defer_drop_effect(old);
+                        }
+                        sub.effect_path = path.to_string();
+                        sub.enabled = true;
+                    } else {
+                        let m = tab.model_overrides.entry(obj_id).or_insert_with(|| ModelSubsetAssignment {
+                            effect_path: String::new(),
+                            effect: None,
+                            enabled: true,
+                        });
+                        if let Some(old) = m.effect.replace(new_effect) {
+                            defer_drop_effect(old);
+                        }
+                        m.effect_path = path.to_string();
+                        m.enabled = true;
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err("Invalid tab index".to_string())
+        }
+    }
+
+    pub fn set_tab_item_shown(
+        &mut self,
+        tab_idx: usize,
+        object_id: Option<usize>,
+        subset: i32,
+        shown: bool,
+    ) {
+        let Some(obj_id) = object_id else { return };
+        if tab_idx == 0 {
+            if let Some(m) = self.models.get_mut(&obj_id) {
+                if subset >= 0 {
+                    if let Some(s) = m.subsets.get_mut(&subset) {
+                        s.enabled = shown;
+                    } else {
+                        m.subsets.insert(subset, ModelSubsetAssignment {
+                            effect_path: String::new(),
+                            effect: None,
+                            enabled: shown,
+                        });
+                    }
+                } else {
+                    m.enabled = shown;
+                }
+            }
+        } else if let Some(tab) = self.tabs.get_mut(tab_idx) {
+            if subset >= 0 {
+                let sub = tab.subset_overrides.entry((obj_id, subset)).or_insert_with(|| ModelSubsetAssignment {
+                    effect_path: String::new(),
+                    effect: None,
+                    enabled: shown,
+                });
+                sub.enabled = shown;
+            } else {
+                let m = tab.model_overrides.entry(obj_id).or_insert_with(|| ModelSubsetAssignment {
+                    effect_path: String::new(),
+                    effect: None,
+                    enabled: shown,
+                });
+                m.enabled = shown;
+            }
+        }
+    }
+
+    pub fn resolve_tab_effect(
+        &self,
+        tab_idx: usize,
+        object_id: usize,
+        subset_idx: i32,
+        filename: &str,
+    ) -> (Option<*mut HikariEffect>, String, bool) {
+        if tab_idx == 0 {
+            if let Some(m) = self.models.get(&object_id) {
+                if subset_idx >= 0 {
+                    if let Some(sub) = m.subsets.get(&subset_idx) {
+                        let eff = sub.effect.or(m.effect).or(self.default_effect);
+                        let path = if !sub.effect_path.is_empty() {
+                            sub.effect_path.clone()
+                        } else if !m.effect_path.is_empty() {
+                            m.effect_path.clone()
+                        } else {
+                            self.default_effect_path.clone()
+                        };
+                        return (eff, path, sub.enabled && m.enabled);
+                    }
+                }
+                let eff = m.effect.or(self.default_effect);
+                let path = if !m.effect_path.is_empty() {
+                    m.effect_path.clone()
+                } else {
+                    self.default_effect_path.clone()
+                };
+                return (eff, path, m.enabled);
+            }
+            return (self.default_effect, self.default_effect_path.clone(), true);
+        }
+
+        if let Some(tab) = self.tabs.get(tab_idx) {
+            if subset_idx >= 0 {
+                if let Some(sub) = tab.subset_overrides.get(&(object_id, subset_idx)) {
+                    return (sub.effect.or(tab.default_effect), sub.effect_path.clone(), sub.enabled);
+                }
+            }
+            if let Some(m) = tab.model_overrides.get(&object_id) {
+                return (m.effect.or(tab.default_effect), m.effect_path.clone(), m.enabled);
+            }
+
+            let base_name = std::path::Path::new(filename)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| filename.to_string());
+
+            for rule in tab.default_rules.split(';') {
+                let trimmed = rule.trim();
+                if let Some((pattern, action)) = trimmed.split_once('=') {
+                    let pat = pattern.trim();
+                    let act = action.trim();
+                    if match_mme_pattern(pat, &base_name) {
+                        if act.eq_ignore_ascii_case("hide") {
+                            return (None, "(hide)".to_string(), false);
+                        } else if act.eq_ignore_ascii_case("none") {
+                            return (None, "(none)".to_string(), true);
+                        } else {
+                            return (tab.default_effect, act.to_string(), true);
+                        }
+                    }
+                }
+            }
+
+            return (tab.default_effect, tab.default_effect_path.clone(), true);
+        }
+
+        (None, String::new(), true)
+    }
+
+    pub fn reload_all_effects(&mut self) -> Result<usize, String> {
+        let mut count = 0;
+        let mut reloaded_map: HashMap<String, *mut HikariEffect> = HashMap::new();
+
+        if !self.default_effect_path.is_empty() {
+            match create_effect_instance(&self.default_effect_path) {
+                Ok(new_ptr) => {
+                    if let Some(old) = self.default_effect.replace(new_ptr) {
+                        defer_drop_effect(old);
+                    }
+                    reloaded_map.insert(self.default_effect_path.clone(), new_ptr);
+                    count += 1;
+                }
+                Err(e) => crate::log_msg(&format!("Failed to reload default effect: {e}")),
+            }
+        }
+
+        for m in self.models.values_mut() {
+            if !m.effect_path.is_empty() {
+                if let Some(&cached) = reloaded_map.get(&m.effect_path) {
+                    m.effect = Some(cached);
+                } else {
+                    match create_effect_instance(&m.effect_path) {
+                        Ok(new_ptr) => {
+                            if let Some(old) = m.effect.replace(new_ptr) {
+                                defer_drop_effect(old);
+                            }
+                            reloaded_map.insert(m.effect_path.clone(), new_ptr);
+                            count += 1;
+                        }
+                        Err(e) => crate::log_msg(&format!("Failed to reload effect for '{}': {e}", m.filename)),
+                    }
+                }
+            }
+            for sub in m.subsets.values_mut() {
+                if !sub.effect_path.is_empty() {
+                    if let Some(&cached) = reloaded_map.get(&sub.effect_path) {
+                        sub.effect = Some(cached);
+                    } else {
+                        match create_effect_instance(&sub.effect_path) {
+                            Ok(new_ptr) => {
+                                if let Some(old) = sub.effect.replace(new_ptr) {
+                                    defer_drop_effect(old);
+                                }
+                                reloaded_map.insert(sub.effect_path.clone(), new_ptr);
+                                count += 1;
+                            }
+                            Err(e) => crate::log_msg(&format!("Failed to reload subset effect: {e}")),
+                        }
+                    }
+                }
+            }
+        }
+
+        for tab in &mut self.tabs {
+            for m in tab.model_overrides.values_mut() {
+                if !m.effect_path.is_empty() {
+                    if let Some(&cached) = reloaded_map.get(&m.effect_path) {
+                        m.effect = Some(cached);
+                    } else {
+                        if let Ok(new_ptr) = create_effect_instance(&m.effect_path) {
+                            if let Some(old) = m.effect.replace(new_ptr) {
+                                defer_drop_effect(old);
+                            }
+                            reloaded_map.insert(m.effect_path.clone(), new_ptr);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            for sub in tab.subset_overrides.values_mut() {
+                if !sub.effect_path.is_empty() {
+                    if let Some(&cached) = reloaded_map.get(&sub.effect_path) {
+                        sub.effect = Some(cached);
+                    } else {
+                        if let Ok(new_ptr) = create_effect_instance(&sub.effect_path) {
+                            if let Some(old) = sub.effect.replace(new_ptr) {
+                                defer_drop_effect(old);
+                            }
+                            reloaded_map.insert(sub.effect_path.clone(), new_ptr);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.update_has_assigned();
+        Ok(count)
+    }
+
+    pub fn save_emm(&self, path: &str) -> std::io::Result<()> {
+        let host_objs = crate::mmd_host::enumerate_host_objects();
+        let mut out = String::new();
+        out.push_str("[Object]\n");
+        for (i, obj) in host_objs.iter().enumerate() {
+            let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+            out.push_str(&format!("{key} = {}\n", obj.filename));
+        }
+
+        out.push_str("\n[Effect]\n");
+        if !self.default_effect_path.is_empty() {
+            out.push_str(&format!("Default = {}\n", self.default_effect_path));
+        }
+        for (i, obj) in host_objs.iter().enumerate() {
+            let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+            if let Some(m) = self.models.get(&obj.id) {
+                if !m.effect_path.is_empty() {
+                    out.push_str(&format!("{key} = {}\n", m.effect_path));
+                }
+                out.push_str(&format!("{key}.show = {}\n", if m.enabled { "true" } else { "false" }));
+                for (&sub_idx, sub) in &m.subsets {
+                    if !sub.effect_path.is_empty() {
+                        out.push_str(&format!("{key}.{sub_idx} = {}\n", sub.effect_path));
+                    }
+                    out.push_str(&format!("{key}.{sub_idx}.show = {}\n", if sub.enabled { "true" } else { "false" }));
+                }
+            }
+        }
+
+        for tab in self.tabs.iter().skip(1) {
+            out.push_str(&format!("\n[Effect@{}]\n", tab.name));
+            if !tab.default_effect_path.is_empty() {
+                out.push_str(&format!("Default = {}\n", tab.default_effect_path));
+            }
+            for (i, obj) in host_objs.iter().enumerate() {
+                let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+                if let Some(m) = tab.model_overrides.get(&obj.id) {
+                    if !m.effect_path.is_empty() {
+                        out.push_str(&format!("{key} = {}\n", m.effect_path));
+                    }
+                    out.push_str(&format!("{key}.show = {}\n", if m.enabled { "true" } else { "false" }));
+                }
+                for (&(obj_id, sub_idx), sub) in &tab.subset_overrides {
+                    if obj_id == obj.id {
+                        if !sub.effect_path.is_empty() {
+                            out.push_str(&format!("{key}.{sub_idx} = {}\n", sub.effect_path));
+                        }
+                        out.push_str(&format!("{key}.{sub_idx}.show = {}\n", if sub.enabled { "true" } else { "false" }));
+                    }
+                }
+            }
+        }
+
+        std::fs::write(path, out)
+    }
+
+    pub fn load_emm(&mut self, path: &str) -> Result<(), String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let host_objs = crate::mmd_host::enumerate_host_objects();
+
+        let mut current_section = String::new();
+        let mut object_map: HashMap<String, usize> = HashMap::new();
+
+        for (i, obj) in host_objs.iter().enumerate() {
+            let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+            object_map.insert(key, obj.id);
+        }
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                current_section = line[1..line.len() - 1].trim().to_string();
+                if let Some(tab_name) = current_section.strip_prefix("Effect@") {
+                    self.add_tab(tab_name, "", "");
+                }
+                continue;
+            }
+
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+
+                if current_section == "Effect" {
+                    if key.eq_ignore_ascii_case("Default") {
+                        let _ = self.assign_default_effect(val);
+                    } else if let Some((slot_key, prop)) = key.split_once('.') {
+                        if let Some(&obj_id) = object_map.get(slot_key) {
+                            if prop.eq_ignore_ascii_case("show") {
+                                if let Some(m) = self.models.get_mut(&obj_id) {
+                                    m.enabled = val.eq_ignore_ascii_case("true");
+                                }
+                            } else if let Ok(sub_idx) = prop.parse::<i32>() {
+                                let _ = self.assign_subset_effect(obj_id, "", sub_idx, val);
+                            }
+                        }
+                    } else if let Some(&obj_id) = object_map.get(key) {
+                        let _ = self.assign_model_effect(obj_id, "", val);
+                    }
+                } else if let Some(tab_name) = current_section.strip_prefix("Effect@") {
+                    let tab_idx = self.tabs.iter().position(|t| t.name.eq_ignore_ascii_case(tab_name));
+                    if let Some(idx) = tab_idx {
+                        if key.eq_ignore_ascii_case("Default") {
+                            let _ = self.assign_tab_effect(idx, None, "", -1, val);
+                        } else if let Some((slot_key, prop)) = key.split_once('.') {
+                            if let Some(&obj_id) = object_map.get(slot_key) {
+                                if prop.eq_ignore_ascii_case("show") {
+                                    self.set_tab_item_shown(idx, Some(obj_id), -1, val.eq_ignore_ascii_case("true"));
+                                } else if let Ok(sub_idx) = prop.parse::<i32>() {
+                                    let _ = self.assign_tab_effect(idx, Some(obj_id), "", sub_idx, val);
+                                }
+                            }
+                        } else if let Some(&obj_id) = object_map.get(key) {
+                            let _ = self.assign_tab_effect(idx, Some(obj_id), "", -1, val);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.update_has_assigned();
+        Ok(())
+    }
+
+    pub fn save_emd(&self, object_id: usize, path: &str) -> std::io::Result<()> {
+        let mut out = String::new();
+        if let Some(m) = self.models.get(&object_id) {
+            out.push_str("[Effect]\n");
+            if !m.effect_path.is_empty() {
+                out.push_str(&format!("Default = {}\n", m.effect_path));
+            }
+            for (&sub_idx, sub) in &m.subsets {
+                if !sub.effect_path.is_empty() {
+                    out.push_str(&format!("{sub_idx} = {}\n", sub.effect_path));
+                }
+            }
+        }
+        for tab in self.tabs.iter().skip(1) {
+            if let Some(m) = tab.model_overrides.get(&object_id) {
+                out.push_str(&format!("\n[Effect@{}]\n", tab.name));
+                if !m.effect_path.is_empty() {
+                    out.push_str(&format!("Default = {}\n", m.effect_path));
+                }
+                for (&(obj_id, sub_idx), sub) in &tab.subset_overrides {
+                    if obj_id == object_id && !sub.effect_path.is_empty() {
+                        out.push_str(&format!("{sub_idx} = {}\n", sub.effect_path));
+                    }
+                }
+            }
+        }
+        std::fs::write(path, out)
+    }
+
+    pub fn load_emd(&mut self, object_id: usize, path: &str) -> Result<(), String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let mut current_section = String::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                current_section = line[1..line.len() - 1].trim().to_string();
+                if let Some(tab_name) = current_section.strip_prefix("Effect@") {
+                    self.add_tab(tab_name, "", "");
+                }
+                continue;
+            }
+
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+
+                if current_section == "Effect" {
+                    if key.eq_ignore_ascii_case("Default") {
+                        let _ = self.assign_model_effect(object_id, "", val);
+                    } else if let Ok(sub_idx) = key.parse::<i32>() {
+                        let _ = self.assign_subset_effect(object_id, "", sub_idx, val);
+                    }
+                } else if let Some(tab_name) = current_section.strip_prefix("Effect@") {
+                    let tab_idx = self.tabs.iter().position(|t| t.name.eq_ignore_ascii_case(tab_name));
+                    if let Some(idx) = tab_idx {
+                        if key.eq_ignore_ascii_case("Default") {
+                            let _ = self.assign_tab_effect(idx, Some(object_id), "", -1, val);
+                        } else if let Ok(sub_idx) = key.parse::<i32>() {
+                            let _ = self.assign_tab_effect(idx, Some(object_id), "", sub_idx, val);
+                        }
+                    }
+                }
+            }
+        }
+        self.update_has_assigned();
+        Ok(())
     }
 }
 
@@ -2383,6 +3002,7 @@ unsafe extern "system" fn effect_begin_pass(this: *mut c_void, Pass: u32) -> HRE
                     vs_bytecode: bc.clone(),
                     vs: pass.vs.clone(),
                     ps: pass.ps.clone(),
+                    gs: pass.gs.clone(),
                     constant_buffer: eff.constant_buffer.clone(),
                     blend_preset: pass.blend_preset.clone(),
                     depth_preset: pass.depth_preset.clone(),
@@ -2410,13 +3030,22 @@ unsafe extern "system" fn effect_begin_pass(this: *mut c_void, Pass: u32) -> HRE
                 eff.context.HSSetConstantBuffers(0, Some(&cb_slice));
                 eff.context.DSSetConstantBuffers(0, Some(&cb_slice));
             }
-            // Bind all active textures across VS, PS, CS
+            // Bind all active textures across VS, PS, CS, GS, HS, DS
             for slot in 0..16 {
                 if let Some(ref srv) = eff.bound_texture_srvs[slot] {
                     let srv_slice = [Some(srv.clone())];
                     eff.context.VSSetShaderResources(slot as u32, Some(&srv_slice));
                     eff.context.PSSetShaderResources(slot as u32, Some(&srv_slice));
                     eff.context.CSSetShaderResources(slot as u32, Some(&srv_slice));
+                    if pass.gs.is_some() {
+                        eff.context.GSSetShaderResources(slot as u32, Some(&srv_slice));
+                    }
+                    if pass.hs.is_some() {
+                        eff.context.HSSetShaderResources(slot as u32, Some(&srv_slice));
+                    }
+                    if pass.ds.is_some() {
+                        eff.context.DSSetShaderResources(slot as u32, Some(&srv_slice));
+                    }
                 }
             }
 
@@ -2436,6 +3065,12 @@ unsafe extern "system" fn effect_begin_pass(this: *mut c_void, Pass: u32) -> HRE
                         let samplers = [Some(sampler.clone())];
                         eff.context.PSSetSamplers(0, Some(&samplers));
                         eff.context.VSSetSamplers(0, Some(&samplers));
+                        if pass.gs.is_some() {
+                            eff.context.GSSetSamplers(0, Some(&samplers));
+                        }
+                        if pass.ds.is_some() {
+                            eff.context.DSSetSamplers(0, Some(&samplers));
+                        }
                     }
                 }
             }
@@ -2463,8 +3098,12 @@ unsafe extern "system" fn effect_commit_changes(this: *mut c_void) -> HRESULT {
 unsafe extern "system" fn effect_end_pass(this: *mut c_void) -> HRESULT {
     *ACTIVE_EFFECT_PASS.lock().unwrap() = None;
     let eff = &*(this as *mut HikariEffect);
-    // Unbind UAVs to avoid hazards
+    // Unbind UAVs and shader stages to avoid hazards
     eff.context.CSSetUnorderedAccessViews(0, 0, None, None);
+    eff.context.GSSetShader(None, None);
+    eff.context.HSSetShader(None, None);
+    eff.context.DSSetShader(None, None);
+    eff.context.CSSetShader(None, None);
     S_OK
 }
 

@@ -1,8 +1,8 @@
 //! Native Windows Effect Management GUI and MMD integration for Hikari.
 //!
-//! Zero-overhead pure Win32 UI (comctl32 / user32) providing MME-style effect
-//! assignment per model and per subset/material, with top-right menu injection
-//! (MFT_RIGHTJUSTIFY) and live HLSL UI parameter tuning.
+//! Zero-overhead pure Win32 UI (comctl32 / user32) matching MMEffect (MikuMikuEffect)
+//! dialog specifications and control layout with top-right menu injection (MFT_RIGHTJUSTIFY),
+//! multi-tab offscreen render target support, and live HLSL parameter tuning.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -10,26 +10,59 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::Dialogs::*;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::effect::{HikariEffect, UIWidgetKind, ASSIGNMENT_REGISTRY};
 
+// Injected MMEffect Top Menu items (MikuMikuDance main menu bar)
 pub const ID_MENU_ROOT: u32 = 0x4800;
-pub const ID_MENU_MANAGER: u32 = 0x4801;
-pub const ID_MENU_RELOAD: u32 = 0x4802;
-pub const ID_MENU_ABOUT: u32 = 0x4803;
+pub const ID_MME_EFFECT_MAPPING: u32 = 40005;
+pub const ID_MME_ENABLE_EFFECT: u32 = 40020;
+pub const ID_MME_AUTO_RELOAD: u32 = 40001;
+pub const ID_MME_AUTO_SAVE_MAPPING: u32 = 40022;
+pub const ID_MME_RELOAD_ALL: u32 = 40004;
+pub const ID_MME_LOG_WINDOW: u32 = 40002;
+pub const ID_MME_ABOUT: u32 = 40003;
 
-const ID_LISTVIEW: u32 = 1001;
-const ID_SET_EFFECT_BTN: u32 = 1002;
-const ID_REMOVE_EFFECT_BTN: u32 = 1003;
-const ID_EXTRACT_SUBSETS_BTN: u32 = 1004;
-const ID_REFRESH_LIST_BTN: u32 = 1005;
-const ID_RELOAD_BTN: u32 = 1006;
-const ID_STATUS_LABEL: u32 = 1007;
+// Map Effect File Dialog Menu: File(F)
+pub const ID_FILE_OPEN: u32 = 40009;
+pub const ID_FILE_SAVE: u32 = 40010;
+pub const ID_FILE_OPEN_MODEL: u32 = 40016;
+pub const ID_FILE_SAVE_MODEL: u32 = 40017;
+pub const ID_FILE_CLOSE: u32 = 40011;
+
+// Map Effect File Dialog Menu: Edit(E)
+pub const ID_EDIT_SET_EFFECT: u32 = 40007;
+pub const ID_EDIT_REMOVE_EFFECT: u32 = 40012;
+pub const ID_EDIT_HIDE_SHOW: u32 = 40013;
+pub const ID_EDIT_RESET_DEFAULT: u32 = 40008;
+pub const ID_EDIT_SUBSET_EXTRACT: u32 = 40006;
+pub const ID_EDIT_SELECT_ALL: u32 = 40025;
+pub const ID_EDIT_CLEAR_SEL: u32 = 40026;
+
+// Map Effect File Dialog Menu: Tool(T)
+pub const ID_TOOL_DISASSEMBLE: u32 = 40014;
+pub const ID_TOOL_SKIP_VALIDATION: u32 = 40028;
+pub const ID_TOOL_ADD_TAB: u32 = 40029;
+pub const ID_TOOL_TOGGLE_PARAMS: u32 = 40030;
+
+// Dialog Control IDs (matching MME resource IDs)
+pub const ID_TAB_CONTROL: u32 = 1002;
+pub const ID_LISTVIEW: u32 = 1003;
+pub const ID_CAPTION_LABEL: u32 = 1004;
+pub const ID_APPLY_BTN: u32 = 1005;
+pub const ID_GROUP_SELECTED: u32 = 1006;
+pub const ID_SET_EFFECT_BTN: u32 = 1007;
+pub const ID_REMOVE_EFFECT_BTN: u32 = 1008;
+pub const ID_HIDE_SHOW_BTN: u32 = 1011;
+pub const ID_OK_BTN: u32 = 1;
+pub const ID_CANCEL_BTN: u32 = 2;
+pub const ID_STATUS_LABEL: u32 = 1012;
 
 const PARAM_CONTROL_ID_BASE: u32 = 2000;
 
@@ -42,16 +75,18 @@ const TBM_SETRANGE: u32 = 0x0406;
 const LVM_FIRST: u32 = 0x1000;
 const LVM_DELETEALLITEMS: u32 = LVM_FIRST + 9;
 const LVM_GETNEXTITEM: u32 = LVM_FIRST + 12;
+const LVM_SETITEMSTATE: u32 = LVM_FIRST + 43;
+const LVM_GETITEMSTATE: u32 = LVM_FIRST + 44;
 const LVM_SETEXTENDEDLISTVIEWSTYLE: u32 = LVM_FIRST + 54;
 const LVM_SETITEMW: u32 = LVM_FIRST + 76;
 const LVM_INSERTITEMW: u32 = LVM_FIRST + 77;
 const LVM_INSERTCOLUMNW: u32 = LVM_FIRST + 97;
 
 const LVS_REPORT: u32 = 0x0001;
-const LVS_SINGLESEL: u32 = 0x0004;
 const LVS_SHOWSELALWAYS: u32 = 0x0008;
 const LVS_EX_FULLROWSELECT: u32 = 0x00000020;
 const LVS_EX_GRIDLINES: u32 = 0x00000001;
+const LVS_EX_CHECKBOXES: u32 = 0x00000004;
 
 const LVCF_TEXT: u32 = 0x0004;
 const LVCF_WIDTH: u32 = 0x0002;
@@ -61,14 +96,35 @@ const LVIF_TEXT: u32 = 0x0001;
 const LVIF_PARAM: u32 = 0x0004;
 const LVIF_STATE: u32 = 0x0008;
 
-const LVIS_FOCUSED: u32 = 0x0001;
 const LVIS_SELECTED: u32 = 0x0002;
+const LVIS_STATEIMAGEMASK: u32 = 0xF000;
 
 const LVNI_SELECTED: u32 = 0x0002;
 
 const NM_CLICK: u32 = 0u32.wrapping_sub(2);
 const NM_DBLCLK: u32 = 0u32.wrapping_sub(3);
 const LVN_ITEMCHANGED: u32 = 0u32.wrapping_sub(101);
+
+// Tab Control constants
+const TCM_FIRST: u32 = 0x1300;
+const TCM_DELETEALLITEMS: u32 = TCM_FIRST + 9;
+const TCM_GETCURSEL: u32 = TCM_FIRST + 11;
+const TCM_SETCURSEL: u32 = TCM_FIRST + 12;
+const TCM_INSERTITEMW: u32 = TCM_FIRST + 62;
+
+const TCIF_TEXT: u32 = 0x0001;
+const TCN_SELCHANGE: u32 = 0u32.wrapping_sub(551);
+
+#[repr(C)]
+struct TCITEMW {
+    mask: u32,
+    dw_state: u32,
+    dw_state_mask: u32,
+    psz_text: *mut u16,
+    cch_text_max: i32,
+    i_image: i32,
+    l_param: isize,
+}
 
 #[repr(C)]
 struct LVCOLUMNW {
@@ -124,11 +180,16 @@ struct NMLISTVIEW {
 
 static IS_REFRESHING: AtomicBool = AtomicBool::new(false);
 static MENU_INJECTED: AtomicBool = AtomicBool::new(false);
+static MMD_SUBMENU: Mutex<Option<usize>> = Mutex::new(None);
 static ORIGINAL_WNDPROC: Mutex<Option<usize>> = Mutex::new(None);
 static MANAGER_HWND: Mutex<Option<usize>> = Mutex::new(None);
+static LOG_WINDOW_HWND: Mutex<Option<usize>> = Mutex::new(None);
 static PARAM_CONTAINER_HWND: Mutex<Option<usize>> = Mutex::new(None);
+static SHOW_PARAMS_PANEL: AtomicBool = AtomicBool::new(true);
+
 static UI_FONT: Mutex<Option<usize>> = Mutex::new(None);
 static BOLD_FONT: Mutex<Option<usize>> = Mutex::new(None);
+static MONO_FONT: Mutex<Option<usize>> = Mutex::new(None);
 
 #[derive(Clone, Debug)]
 pub struct UiRowRef {
@@ -136,6 +197,7 @@ pub struct UiRowRef {
     pub subset: i32,              // -1 for whole model, >=0 for material subset
     pub filename: String,
     pub effect_path: String,
+    pub shown: bool,
 }
 
 static UI_ROWS: Mutex<Vec<UiRowRef>> = Mutex::new(Vec::new());
@@ -197,7 +259,7 @@ unsafe fn make_child(
     ).unwrap_or_default()
 }
 
-/// Ensures the Hikari menu item is injected into MMD's top menu bar (right-justified).
+/// Ensures the MMEffect menu item is injected into MMD's top menu bar (right-justified).
 pub fn ensure_ui_injected() {
     if MENU_INJECTED.load(Ordering::SeqCst) {
         return;
@@ -205,6 +267,27 @@ pub fn ensure_ui_injected() {
     let hwnd_opt = *crate::backend::GLOBAL_HWND.lock().unwrap();
     if let Some(h) = hwnd_opt {
         init_ui(HWND(h as *mut c_void));
+    }
+}
+
+/// Synchronizes checkmarks for MMEffect menu items.
+pub fn sync_menu_checkmarks() {
+    if let Some(m) = *MMD_SUBMENU.lock().unwrap() {
+        let menu = HMENU(m as *mut c_void);
+        let eff_en = crate::effect::EFFECTS_ENABLED.load(Ordering::Acquire);
+        let auto_rel = crate::effect::AUTO_RELOAD.load(Ordering::Acquire);
+        let auto_sav = crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire);
+
+        unsafe {
+            let eff_flag = (MF_BYCOMMAND.0 | if eff_en { MF_CHECKED.0 } else { MF_UNCHECKED.0 }) as u32;
+            let auto_rel_flag = (MF_BYCOMMAND.0 | if auto_rel { MF_CHECKED.0 } else { MF_UNCHECKED.0 }) as u32;
+            let auto_sav_flag = (MF_BYCOMMAND.0 | if auto_sav { MF_CHECKED.0 } else { MF_UNCHECKED.0 }) as u32;
+
+            let _ = CheckMenuItem(menu, ID_MME_ENABLE_EFFECT, eff_flag);
+            let _ = CheckMenuItem(menu, 40006, eff_flag);
+            let _ = CheckMenuItem(menu, ID_MME_AUTO_RELOAD, auto_rel_flag);
+            let _ = CheckMenuItem(menu, ID_MME_AUTO_SAVE_MAPPING, auto_sav_flag);
+        }
     }
 }
 
@@ -234,23 +317,31 @@ pub fn init_ui(hwnd: HWND) {
             let prev_wndproc = SetWindowLongPtrW(main_hwnd, GWLP_WNDPROC, mmd_subclass_wndproc as usize as isize);
             if prev_wndproc != 0 {
                 *ORIGINAL_WNDPROC.lock().unwrap() = Some(prev_wndproc as usize);
-                crate::log_msg("[UI] Subclassed MMD window procedure for F10/F5 hotkeys");
+                crate::log_msg("[UI] Subclassed MMD window procedure for F10/F5/Ctrl+Shift+E hotkeys");
             }
         }
 
-        // Build popup submenu
+        // Build popup submenu matching MME English menu specification
         let submenu = CreatePopupMenu().unwrap_or_default();
         if submenu.0.is_null() {
             return;
         }
 
-        let _ = AppendMenuW(submenu, MF_STRING, ID_MENU_MANAGER as usize, w!("Менеджер эффектов...\tF10"));
-        let _ = AppendMenuW(submenu, MF_STRING, ID_MENU_RELOAD as usize, w!("Перезагрузить шейдер\tF5"));
+        let _ = AppendMenuW(submenu, MF_STRING, ID_MME_EFFECT_MAPPING as usize, w!("Effect Mapping(M)\tF10"));
         let _ = AppendMenuW(submenu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(submenu, MF_STRING, ID_MENU_ABOUT as usize, w!("О Hikari DX11..."));
+        let _ = AppendMenuW(submenu, MF_STRING | MF_CHECKED, ID_MME_ENABLE_EFFECT as usize, w!("Enable Effect(E)\tCtrl+Shift+E"));
+        let _ = AppendMenuW(submenu, MF_STRING | MF_CHECKED, ID_MME_AUTO_RELOAD as usize, w!("Auto Reload(O)"));
+        let _ = AppendMenuW(submenu, MF_STRING | MF_CHECKED, ID_MME_AUTO_SAVE_MAPPING as usize, w!("Auto Save Mapping File(S)"));
+        let _ = AppendMenuW(submenu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(submenu, MF_STRING, ID_MME_RELOAD_ALL as usize, w!("Reload All(R)\tF5"));
+        let _ = AppendMenuW(submenu, MF_STRING, ID_MME_LOG_WINDOW as usize, w!("Log Window(L)"));
+        let _ = AppendMenuW(submenu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(submenu, MF_STRING, ID_MME_ABOUT as usize, w!("About Hikari Effects(A)"));
+
+        *MMD_SUBMENU.lock().unwrap() = Some(submenu.0 as usize);
 
         // Insert right-justified menu item (MFT_RIGHTJUSTIFY = 0x4000)
-        let title_utf16: Vec<u16> = "Hikari (H)\0".encode_utf16().collect();
+        let title_utf16: Vec<u16> = "Hikari Effects\0".encode_utf16().collect();
         let mut info = MENUITEMINFOW::default();
         info.cbSize = std::mem::size_of::<MENUITEMINFOW>() as u32;
         info.fMask = MIIM_FTYPE | MIIM_STRING | MIIM_SUBMENU | MIIM_ID;
@@ -263,12 +354,13 @@ pub fn init_ui(hwnd: HWND) {
         if InsertMenuItemW(menu, 100, true, &info).is_ok() {
             MENU_INJECTED.store(true, Ordering::SeqCst);
             let _ = DrawMenuBar(main_hwnd);
-            crate::log_msg("[UI] Injected 'Hikari (H)' menu item to top-right corner of MMD menu bar (MFT_RIGHTJUSTIFY)");
+            sync_menu_checkmarks();
+            crate::log_msg("[UI] Injected 'Hikari Effects' menu item to top-right corner of MMD menu bar (MFT_RIGHTJUSTIFY)");
         }
     }
 }
 
-/// Subclassed WndProc for MMD's root window to intercept Hikari shortcuts & menu commands.
+/// Subclassed WndProc for MMD's root window to intercept MMEffect shortcuts & menu commands.
 unsafe extern "system" fn mmd_subclass_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -280,19 +372,50 @@ unsafe extern "system" fn mmd_subclass_wndproc(
             WM_COMMAND => {
                 let cmd_id = (wparam.0 & 0xFFFF) as u32;
                 match cmd_id {
-                    ID_MENU_MANAGER => {
+                    ID_MME_EFFECT_MAPPING => {
                         toggle_effects_manager(hwnd);
                         return Some(LRESULT(0));
                     }
-                    ID_MENU_RELOAD => {
-                        reload_active_effect();
+                    ID_MME_ENABLE_EFFECT | 40006 => {
+                        let cur = crate::effect::EFFECTS_ENABLED.load(Ordering::Acquire);
+                        crate::effect::EFFECTS_ENABLED.store(!cur, Ordering::Release);
+                        sync_menu_checkmarks();
+                        crate::log_msg(&format!("[UI] Effects Enabled: {}", !cur));
                         return Some(LRESULT(0));
                     }
-                    ID_MENU_ABOUT => {
+                    ID_MME_AUTO_RELOAD => {
+                        let cur = crate::effect::AUTO_RELOAD.load(Ordering::Acquire);
+                        crate::effect::AUTO_RELOAD.store(!cur, Ordering::Release);
+                        sync_menu_checkmarks();
+                        crate::log_msg(&format!("[UI] Auto Reload: {}", !cur));
+                        return Some(LRESULT(0));
+                    }
+                    ID_MME_AUTO_SAVE_MAPPING => {
+                        let cur = crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire);
+                        crate::effect::AUTO_SAVE_MAPPING.store(!cur, Ordering::Release);
+                        sync_menu_checkmarks();
+                        crate::log_msg(&format!("[UI] Auto Save Mapping: {}", !cur));
+                        return Some(LRESULT(0));
+                    }
+                    ID_MME_RELOAD_ALL => {
+                        let _ = ASSIGNMENT_REGISTRY.lock().unwrap().reload_all_effects();
+                        if let Some(h) = *MANAGER_HWND.lock().unwrap() {
+                            let parent = HWND(h as *mut c_void);
+                            if let Ok(lv) = GetDlgItem(Some(parent), ID_LISTVIEW as i32) {
+                                refresh_assignment_list(lv);
+                            }
+                        }
+                        return Some(LRESULT(0));
+                    }
+                    ID_MME_LOG_WINDOW => {
+                        show_log_window(hwnd);
+                        return Some(LRESULT(0));
+                    }
+                    ID_MME_ABOUT => {
                         MessageBoxW(
                             Some(hwnd),
-                            w!("Hikari DirectX 11 Pipeline & Shader Runtime\nВерсия 0.1.0\n\nВысокопроизводительный SM5 рендерер и Win32 менеджер параметров для MikuMikuDance."),
-                            w!("О Hikari DX11"),
+                            w!("Hikari DirectX 11 Pipeline & Shader Runtime\nVersion 0.1.0\n\nHigh-performance SM5 DX11 renderer and effect management for MikuMikuDance."),
+                            w!("About Hikari Effects"),
                             MB_OK | MB_ICONINFORMATION,
                         );
                         return Some(LRESULT(0));
@@ -302,11 +425,25 @@ unsafe extern "system" fn mmd_subclass_wndproc(
             }
             WM_KEYDOWN => {
                 let vk = (wparam.0 & 0xFF) as u32;
+                let ctrl_down = (GetKeyState(0x11 /*VK_CONTROL*/) as u16 & 0x8000) != 0;
+                let shift_down = (GetKeyState(0x10 /*VK_SHIFT*/) as u16 & 0x8000) != 0;
+
                 if vk == 0x79 { // VK_F10
                     toggle_effects_manager(hwnd);
                     return Some(LRESULT(0));
                 } else if vk == 0x74 { // VK_F5
-                    reload_active_effect();
+                    let _ = ASSIGNMENT_REGISTRY.lock().unwrap().reload_all_effects();
+                    if let Some(h) = *MANAGER_HWND.lock().unwrap() {
+                        let parent = HWND(h as *mut c_void);
+                        if let Ok(lv) = GetDlgItem(Some(parent), ID_LISTVIEW as i32) {
+                            refresh_assignment_list(lv);
+                        }
+                    }
+                    return Some(LRESULT(0));
+                } else if ctrl_down && shift_down && (vk == 0x45 /* 'E' */) {
+                    let cur = crate::effect::EFFECTS_ENABLED.load(Ordering::Acquire);
+                    crate::effect::EFFECTS_ENABLED.store(!cur, Ordering::Release);
+                    sync_menu_checkmarks();
                     return Some(LRESULT(0));
                 }
             }
@@ -328,7 +465,7 @@ unsafe extern "system" fn mmd_subclass_wndproc(
     }
 }
 
-/// Shows or toggles the Effects Manager window.
+/// Shows or toggles the Effects Manager window ("Map Effect File").
 pub fn toggle_effects_manager(parent: HWND) {
     let mut lock = MANAGER_HWND.lock().unwrap();
     if let Some(h) = *lock {
@@ -348,23 +485,6 @@ pub fn toggle_effects_manager(parent: HWND) {
 
     let hwnd = create_effects_manager_window(parent);
     *lock = Some(hwnd.0 as usize);
-}
-
-fn reload_active_effect() {
-    let sel = *SELECTED_ROW.lock().unwrap();
-    if let Some(row_idx) = sel {
-        let rows = UI_ROWS.lock().unwrap();
-        if row_idx < rows.len() {
-            let path = rows[row_idx].effect_path.clone();
-            drop(rows);
-            if !path.is_empty() {
-                pick_and_assign_effect_path(row_idx, &path);
-                set_status_text(&format!("Шейдер '{path}' перезагружен (F5)."));
-                return;
-            }
-        }
-    }
-    set_status_text("Выберите строку с шейдером для перезагрузки.");
 }
 
 fn get_or_create_fonts() -> (HFONT, HFONT) {
@@ -406,6 +526,25 @@ fn get_or_create_fonts() -> (HFONT, HFONT) {
     (font, bold)
 }
 
+fn get_or_create_mono_font() -> HFONT {
+    let mut mono_lock = MONO_FONT.lock().unwrap();
+    match *mono_lock {
+        Some(f) => HFONT(f as *mut c_void),
+        None => {
+            let f = unsafe {
+                CreateFontW(
+                    -13, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                    w!("Consolas"),
+                )
+            };
+            *mono_lock = Some(f.0 as usize);
+            f
+        }
+    }
+}
+
 fn set_control_font(ctrl: HWND, font: HFONT) {
     if !ctrl.0.is_null() && !font.0.is_null() {
         unsafe {
@@ -414,6 +553,8 @@ fn set_control_font(ctrl: HWND, font: HFONT) {
     }
 }
 
+/// Creates the native MME "Map Effect File" window with File(F), Edit(E), Tool(T) menus,
+/// TabControl, Caption label, ListView with checkboxes, and Selected Items controls.
 fn create_effects_manager_window(parent: HWND) -> HWND {
     let class_name: Vec<u16> = "HikariEffectsManager\0".encode_utf16().collect();
     let container_class_name: Vec<u16> = "HikariParamContainer\0".encode_utf16().collect();
@@ -451,33 +592,91 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
         };
         let _ = RegisterClassExW(&container_wc);
 
+        // Build Dialog Menu Bar: File(F), Edit(E), Tool(T)
+        let main_menu = CreateMenu().unwrap_or_default();
+        let file_menu = CreatePopupMenu().unwrap_or_default();
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_FILE_OPEN as usize, w!("Open(O)"));
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_FILE_SAVE as usize, w!("Save(S)"));
+        let _ = AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_FILE_OPEN_MODEL as usize, w!("Open by Model(M)"));
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_FILE_SAVE_MODEL as usize, w!("Save by Model(N)"));
+        let _ = AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(file_menu, MF_STRING, ID_FILE_CLOSE as usize, w!("Close(C)"));
+        let _ = AppendMenuW(main_menu, MF_POPUP, file_menu.0 as usize, w!("File(F)"));
+
+        let edit_menu = CreatePopupMenu().unwrap_or_default();
+        let _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_SET_EFFECT as usize, w!("Set Effect File(F)"));
+        let _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_REMOVE_EFFECT as usize, w!("Remove Effect(N)"));
+        let _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_HIDE_SHOW as usize, w!("Hide/Show(H)"));
+        let _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_RESET_DEFAULT as usize, w!("Reset with default(R)"));
+        let _ = AppendMenuW(edit_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(edit_menu, MF_STRING, ID_EDIT_SUBSET_EXTRACT as usize, w!("Subset-Extract(E)"));
+        let _ = AppendMenuW(main_menu, MF_POPUP, edit_menu.0 as usize, w!("Edit(E)"));
+
+        let tool_menu = CreatePopupMenu().unwrap_or_default();
+        let _ = AppendMenuW(tool_menu, MF_STRING, ID_TOOL_DISASSEMBLE as usize, w!("Disassemble Effect(D)"));
+        let _ = AppendMenuW(tool_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let skip_val = crate::effect::SKIP_DEVICE_VALIDATION.load(Ordering::Acquire);
+        let skip_flags = MF_STRING | if skip_val { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(tool_menu, skip_flags, ID_TOOL_SKIP_VALIDATION as usize, w!("Skip Device Validation(S)"));
+        let _ = AppendMenuW(tool_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(tool_menu, MF_STRING, ID_TOOL_ADD_TAB as usize, w!("Add Render Target Tab..."));
+        let _ = AppendMenuW(tool_menu, MF_STRING | MF_CHECKED, ID_TOOL_TOGGLE_PARAMS as usize, w!("Show HLSL Parameters Panel"));
+        let _ = AppendMenuW(main_menu, MF_POPUP, tool_menu.0 as usize, w!("Tool(T)"));
+
+        let show_params = SHOW_PARAMS_PANEL.load(Ordering::Acquire);
+        let win_w = if show_params { 920 } else { 590 };
+
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST,
             PCWSTR(class_name.as_ptr()),
-            w!("Hikari - Назначение эффектов MMD (DirectX 11)"),
+            w!("Map Effect File"),
             WS_OVERLAPPEDWINDOW & !(WS_MAXIMIZEBOX | WS_THICKFRAME),
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            880,
-            620,
+            win_w,
+            535,
             Some(parent),
-            None,
+            Some(main_menu),
             None,
             None,
         ).unwrap_or_default();
 
         let (font, bold) = get_or_create_fonts();
 
-        // 1. Left panel: Models & Subsets ListView
-        let list_lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), w!("Объекты и саб-сеты MMD:"), WINDOW_STYLE::default(), 16, 12, 500, 18, hwnd, None);
-        set_control_font(list_lbl, bold);
+        // 1. TabControl (ID 1002)
+        let tab_ctrl = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("SysTabControl32"),
+            PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP,
+            12, 10, 556, 422,
+            Some(hwnd),
+            Some(HMENU(ID_TAB_CONTROL as usize as *mut c_void)),
+            None,
+            None,
+        ).unwrap_or_default();
+        set_control_font(tab_ctrl, font);
 
+        // 2. Caption Label (ID 1004)
+        let caption_lbl = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("Main Render Target"),
+            WINDOW_STYLE::default(),
+            24, 38, 532, 18,
+            hwnd,
+            Some(ID_CAPTION_LABEL),
+        );
+        set_control_font(caption_lbl, bold);
+
+        // 3. ListView (ID 1003) with checkboxes
         let listview = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             w!("SysListView32"),
             PCWSTR::null(),
-            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS),
-            16, 34, 500, 436,
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | WINDOW_STYLE(LVS_REPORT | LVS_SHOWSELALWAYS),
+            20, 58, 540, 364,
             Some(hwnd),
             Some(HMENU(ID_LISTVIEW as usize as *mut c_void)),
             None,
@@ -485,11 +684,16 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
         ).unwrap_or_default();
         set_control_font(listview, font);
 
-        // Extended style: full row select + grid lines
-        let _ = send_msg(listview, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES) as isize);
+        // Extended style: full row select + grid lines + checkboxes
+        let _ = send_msg(
+            listview,
+            LVM_SETEXTENDEDLISTVIEWSTYLE,
+            0,
+            (LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_CHECKBOXES) as isize,
+        );
 
         // Add columns
-        let mut col_obj_text: Vec<u16> = "Объект / Саб-сет\0".encode_utf16().collect();
+        let mut col_obj_text: Vec<u16> = "Object\0".encode_utf16().collect();
         let mut col = LVCOLUMNW {
             mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
             fmt: 0,
@@ -505,39 +709,110 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
         };
         let _ = send_msg(listview, LVM_INSERTCOLUMNW, 0, &col as *const _ as isize);
 
-        let mut col_fx_text: Vec<u16> = "Файл эффекта (.fx)\0".encode_utf16().collect();
-        col.cx = 210;
+        let mut col_fx_text: Vec<u16> = "Effect File\0".encode_utf16().collect();
+        col.cx = 250;
         col.psz_text = col_fx_text.as_mut_ptr();
         col.cch_text_max = col_fx_text.len() as i32;
         col.i_sub_item = 1;
         let _ = send_msg(listview, LVM_INSERTCOLUMNW, 1, &col as *const _ as isize);
 
-        // Buttons below ListView
-        let set_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Задать эффект (.fx)..."), WINDOW_STYLE(BS_PUSHBUTTON as u32), 16, 478, 160, 28, hwnd, Some(ID_SET_EFFECT_BTN));
-        set_control_font(set_btn, bold);
+        // 4. "Selected Items" Group Box (ID 1006)
+        let group_box = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Selected Items"),
+            WINDOW_STYLE(BS_GROUPBOX as u32),
+            12, 438, 260, 48,
+            hwnd,
+            Some(ID_GROUP_SELECTED),
+        );
+        set_control_font(group_box, font);
 
-        let rem_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Снять эффект"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 182, 478, 110, 28, hwnd, Some(ID_REMOVE_EFFECT_BTN));
+        let set_btn = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Set Effect"),
+            WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            20, 454, 74, 24,
+            hwnd,
+            Some(ID_SET_EFFECT_BTN),
+        );
+        set_control_font(set_btn, font);
+
+        let rem_btn = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Remove Effect"),
+            WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            98, 454, 86, 24,
+            hwnd,
+            Some(ID_REMOVE_EFFECT_BTN),
+        );
         set_control_font(rem_btn, font);
 
-        let extract_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Раскрыть саб-сеты (Subset-Extract)"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 298, 478, 218, 28, hwnd, Some(ID_EXTRACT_SUBSETS_BTN));
-        set_control_font(extract_btn, font);
+        let hide_show_btn = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Hide/Show"),
+            WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            188, 454, 76, 24,
+            hwnd,
+            Some(ID_HIDE_SHOW_BTN),
+        );
+        set_control_font(hide_show_btn, font);
 
-        let refresh_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Обновить список MMD"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 16, 512, 160, 26, hwnd, Some(ID_REFRESH_LIST_BTN));
-        set_control_font(refresh_btn, font);
+        // 5. Bottom action buttons: OK (1), Cancel (2), Apply (1005)
+        let ok_btn = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("OK"),
+            WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            320, 454, 74, 24,
+            hwnd,
+            Some(ID_OK_BTN),
+        );
+        set_control_font(ok_btn, bold);
 
-        let reload_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Перезагрузить шейдер (F5)"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 182, 512, 180, 26, hwnd, Some(ID_RELOAD_BTN));
-        set_control_font(reload_btn, font);
+        let cancel_btn = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Cancel"),
+            WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            402, 454, 74, 24,
+            hwnd,
+            Some(ID_CANCEL_BTN),
+        );
+        set_control_font(cancel_btn, font);
 
-        // 2. Right panel: Parameter tweaks
-        let param_lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), w!("Параметры шейдера (HLSL):"), WINDOW_STYLE::default(), 532, 12, 320, 18, hwnd, None);
+        let apply_btn = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("BUTTON"),
+            w!("Apply"),
+            WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            484, 454, 74, 24,
+            hwnd,
+            Some(ID_APPLY_BTN),
+        );
+        set_control_font(apply_btn, font);
+
+        // 6. Right panel: Parameter tweaks container
+        let param_lbl = make_child(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!("HLSL Shader Parameters:"),
+            WINDOW_STYLE::default(),
+            584, 12, 310, 18,
+            hwnd,
+            None,
+        );
         set_control_font(param_lbl, bold);
 
         let container = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             PCWSTR(container_class_name.as_ptr()),
             PCWSTR::null(),
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
-            532, 34, 320, 504,
+            WS_CHILD | (if show_params { WS_VISIBLE } else { WINDOW_STYLE::default() }) | WS_VSCROLL | WS_CLIPCHILDREN,
+            584, 34, 316, 452,
             Some(hwnd),
             None,
             None,
@@ -545,19 +820,8 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
         ).unwrap_or_default();
         *PARAM_CONTAINER_HWND.lock().unwrap() = Some(container.0 as usize);
 
-        // 3. Status bar
-        let status = make_child(
-            WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
-            w!("Готов. Выберите строку и нажмите 'Задать эффект (.fx)...' или дважды кликните."),
-            WINDOW_STYLE::default(),
-            16, 550, 836, 20,
-            hwnd,
-            Some(ID_STATUS_LABEL),
-        );
-        set_control_font(status, font);
-
-        // Populate list
+        // 7. Rebuild tabs & populate list
+        rebuild_tab_control(tab_ctrl);
         refresh_assignment_list(listview);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -566,19 +830,57 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
     }
 }
 
-fn set_status_text(text: &str) {
-    if let Some(h) = *MANAGER_HWND.lock().unwrap() {
-        let parent = HWND(h as *mut c_void);
-        let status = unsafe { GetDlgItem(Some(parent), ID_STATUS_LABEL as i32) };
-        if let Ok(ctrl) = status {
-            if !ctrl.0.is_null() {
-                let w_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-                unsafe {
-                    let _ = SetWindowTextW(ctrl, PCWSTR(w_text.as_ptr()));
-                }
-            }
+fn rebuild_tab_control(tab_ctrl: HWND) {
+    if tab_ctrl.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = send_msg(tab_ctrl, TCM_DELETEALLITEMS, 0, 0);
+
+        let reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+        for (i, tab) in reg.tabs.iter().enumerate() {
+            let mut tab_text: Vec<u16> = format!("{}\0", tab.name).encode_utf16().collect();
+            let ti = TCITEMW {
+                mask: TCIF_TEXT,
+                dw_state: 0,
+                dw_state_mask: 0,
+                psz_text: tab_text.as_mut_ptr(),
+                cch_text_max: tab_text.len() as i32,
+                i_image: -1,
+                l_param: i as isize,
+            };
+            send_msg(tab_ctrl, TCM_INSERTITEMW, i, &ti as *const _ as isize);
+        }
+
+        let cur = reg.current_tab_idx.min(reg.tabs.len().saturating_sub(1));
+        send_msg(tab_ctrl, TCM_SETCURSEL, cur, 0);
+    }
+}
+
+fn update_caption_for_current_tab(parent: HWND) {
+    let reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+    let cur = reg.current_tab_idx;
+    let desc = if let Some(tab) = reg.tabs.get(cur) {
+        if !tab.is_offscreen {
+            "Main Render Target".to_string()
+        } else {
+            tab.description.clone()
+        }
+    } else {
+        "Main Render Target".to_string()
+    };
+    drop(reg);
+
+    unsafe {
+        if let Ok(lbl) = GetDlgItem(Some(parent), ID_CAPTION_LABEL as i32) {
+            let w_desc: Vec<u16> = format!("{desc}\0").encode_utf16().collect();
+            let _ = SetWindowTextW(lbl, PCWSTR(w_desc.as_ptr()));
         }
     }
+}
+
+fn set_status_text(text: &str) {
+    crate::log_msg(&format!("[UI Status] {text}"));
 }
 
 fn refresh_assignment_list(listview: HWND) {
@@ -589,6 +891,8 @@ fn refresh_assignment_list(listview: HWND) {
     struct DisplayRow {
         col0: String,
         col1: String,
+        shown: bool,
+        is_default_row: bool,
         row_ref: UiRowRef,
     }
 
@@ -596,25 +900,40 @@ fn refresh_assignment_list(listview: HWND) {
     {
         let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
         reg.sync_host_objects();
+        let cur_tab = reg.current_tab_idx;
 
         // 1. Default row
-        let def_eff = if reg.default_effect_path.is_empty() {
-            "(нет / none)".to_string()
+        let (def_col1, def_path) = if cur_tab == 0 {
+            if reg.default_effect_path.is_empty() {
+                ("(none)".to_string(), String::new())
+            } else {
+                let name = std::path::Path::new(&reg.default_effect_path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| reg.default_effect_path.clone());
+                (name, reg.default_effect_path.clone())
+            }
+        } else if let Some(tab) = reg.tabs.get(cur_tab) {
+            if !tab.default_rules.is_empty() {
+                (tab.default_rules.clone(), tab.default_effect_path.clone())
+            } else {
+                ("(none)".to_string(), String::new())
+            }
         } else {
-            std::path::Path::new(&reg.default_effect_path)
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| reg.default_effect_path.clone())
+            ("(none)".to_string(), String::new())
         };
 
         display_rows.push(DisplayRow {
-            col0: "(по умолчанию / default)".to_string(),
-            col1: def_eff,
+            col0: "(default)".to_string(),
+            col1: def_col1,
+            shown: true,
+            is_default_row: true,
             row_ref: UiRowRef {
                 object_id: None,
                 subset: -1,
                 filename: "(default)".to_string(),
-                effect_path: reg.default_effect_path.clone(),
+                effect_path: def_path,
+                shown: true,
             },
         });
 
@@ -627,27 +946,29 @@ fn refresh_assignment_list(listview: HWND) {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| obj.filename.clone());
-            let title = format!("{prefix}{base_name} ({})", if obj.is_pmd { "модель" } else { "аксессуар" });
+            let title = format!("{prefix}{base_name} ({})", if obj.is_pmd { "Model" } else { "Accessory" });
 
-            let model_assign = reg.models.get(&obj.id);
-            let model_eff_path = model_assign.map(|m| m.effect_path.as_str()).unwrap_or("");
-            let eff_name = if model_eff_path.is_empty() {
-                "(нет)".to_string()
+            let (_, eff_path, shown) = reg.resolve_tab_effect(cur_tab, obj.id, -1, &obj.filename);
+            let eff_name = if eff_path.is_empty() {
+                "(none)".to_string()
             } else {
-                std::path::Path::new(model_eff_path)
+                std::path::Path::new(&eff_path)
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| model_eff_path.to_string())
+                    .unwrap_or_else(|| eff_path.clone())
             };
 
             display_rows.push(DisplayRow {
                 col0: title,
                 col1: eff_name.clone(),
+                shown,
+                is_default_row: false,
                 row_ref: UiRowRef {
                     object_id: Some(obj.id),
                     subset: -1,
                     filename: obj.filename.clone(),
-                    effect_path: model_eff_path.to_string(),
+                    effect_path: eff_path.clone(),
+                    shown,
                 },
             });
 
@@ -657,38 +978,37 @@ fn refresh_assignment_list(listview: HWND) {
                     let branch = if is_last { "  `-- " } else { "  |-- " };
                     let sub_title = format!("{branch}Material {m}");
 
-                    let sub_eff_path = model_assign
-                        .and_then(|ma| ma.subsets.get(&m))
-                        .map(|s| s.effect_path.as_str())
-                        .unwrap_or("");
-
+                    let (_, sub_eff_path, sub_shown) = reg.resolve_tab_effect(cur_tab, obj.id, m, &obj.filename);
                     let sub_eff_name = if sub_eff_path.is_empty() {
-                        if !model_eff_path.is_empty() {
-                            format!("(наследует: {eff_name})")
+                        if !eff_path.is_empty() {
+                            format!("(inherits: {eff_name})")
                         } else {
-                            "(нет)".to_string()
+                            "(none)".to_string()
                         }
                     } else {
-                        std::path::Path::new(sub_eff_path)
+                        std::path::Path::new(&sub_eff_path)
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| sub_eff_path.to_string())
+                            .unwrap_or_else(|| sub_eff_path.clone())
                     };
 
                     display_rows.push(DisplayRow {
                         col0: sub_title,
                         col1: sub_eff_name,
+                        shown: sub_shown,
+                        is_default_row: false,
                         row_ref: UiRowRef {
                             object_id: Some(obj.id),
                             subset: m,
                             filename: obj.filename.clone(),
-                            effect_path: sub_eff_path.to_string(),
+                            effect_path: sub_eff_path,
+                            shown: sub_shown,
                         },
                     });
                 }
             }
         }
-    } // reg lock dropped!
+    } // reg lock dropped
 
     {
         let mut rows = UI_ROWS.lock().unwrap();
@@ -696,7 +1016,7 @@ fn refresh_assignment_list(listview: HWND) {
         for r in &display_rows {
             rows.push(r.row_ref.clone());
         }
-    } // rows lock dropped!
+    }
 
     IS_REFRESHING.store(true, Ordering::SeqCst);
     unsafe {
@@ -705,6 +1025,35 @@ fn refresh_assignment_list(listview: HWND) {
 
         for (cur_row, r) in display_rows.iter().enumerate() {
             insert_list_item(listview, cur_row as i32, &r.col0, &r.col1);
+
+            // Configure checkbox state image:
+            // Row 0 has NO checkbox (state: 0); normal rows have checked (0x2000) or unchecked (0x1000)
+            let check_state = if r.is_default_row {
+                0x0000
+            } else if r.shown {
+                0x2000
+            } else {
+                0x1000
+            };
+
+            let item_state = LVITEMW {
+                mask: LVIF_STATE,
+                i_item: cur_row as i32,
+                i_sub_item: 0,
+                state: check_state,
+                state_mask: LVIS_STATEIMAGEMASK,
+                psz_text: null_mut(),
+                cch_text_max: 0,
+                i_image: 0,
+                l_param: cur_row as isize,
+                i_indent: 0,
+                i_group_id: 0,
+                c_columns: 0,
+                pu_columns: null_mut(),
+                pi_col_fmt: null_mut(),
+                i_group: 0,
+            };
+            let _ = send_msg(listview, LVM_SETITEMSTATE, cur_row, &item_state as *const _ as isize);
         }
 
         let _ = send_msg(listview, WM_SETREDRAW, 1, 0);
@@ -769,37 +1118,85 @@ fn on_row_selected(row_idx: usize) {
 
     let effect_ptr = {
         let reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+        let cur_tab = reg.current_tab_idx;
         match row.object_id {
-            None => reg.default_effect,
-            Some(obj_id) => {
-                if let Some(m) = reg.models.get(&obj_id) {
-                    if row.subset >= 0 {
-                        m.subsets.get(&row.subset)
-                            .and_then(|s| s.effect)
-                            .or(m.effect)
-                            .or(reg.default_effect)
-                    } else {
-                        m.effect.or(reg.default_effect)
-                    }
+            None => {
+                if cur_tab == 0 {
+                    reg.default_effect
+                } else if let Some(tab) = reg.tabs.get(cur_tab) {
+                    tab.default_effect
                 } else {
                     reg.default_effect
                 }
+            }
+            Some(obj_id) => {
+                let (eff, _, _) = reg.resolve_tab_effect(cur_tab, obj_id, row.subset, &row.filename);
+                eff
             }
         }
     };
 
     *ACTIVE_TARGET_EFFECT.lock().unwrap() = effect_ptr.map(|p| p as usize);
 
-    crate::log_msg(&format!(
-        "[UI] on_row_selected: row #{row_idx} ('{}'), effect={:?}",
-        row.filename,
-        effect_ptr.map(|p| p as usize)
-    ));
-
     if let Some(c) = *PARAM_CONTAINER_HWND.lock().unwrap() {
         let container = HWND(c as *mut c_void);
         rebuild_param_controls(container, effect_ptr);
     }
+}
+
+fn handle_row_check_toggle(row_idx: usize, is_checked: bool) {
+    if row_idx == 0 {
+        return; // (default) row has no check state
+    }
+    let rows = UI_ROWS.lock().unwrap();
+    if row_idx >= rows.len() {
+        return;
+    }
+    let row = rows[row_idx].clone();
+    drop(rows);
+
+    let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+    let cur_tab = reg.current_tab_idx;
+    reg.set_tab_item_shown(cur_tab, row.object_id, row.subset, is_checked);
+    if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
+        let _ = reg.save_emm("hikari_mapping.emm");
+    }
+}
+
+fn toggle_selected_hide_show(listview: HWND) {
+    let sel = unsafe { send_msg(listview, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) };
+    if sel < 1 {
+        set_status_text("Select an object or subset row to toggle visibility.");
+        return;
+    }
+    let row_idx = sel as usize;
+    let cur_state = unsafe { send_msg(listview, LVM_GETITEMSTATE, row_idx, LVIS_STATEIMAGEMASK as isize) } as u32;
+    let is_checked = (cur_state & 0x2000) != 0;
+    let new_check = !is_checked;
+    let new_state = if new_check { 0x2000 } else { 0x1000 };
+
+    let item_state = LVITEMW {
+        mask: LVIF_STATE,
+        i_item: row_idx as i32,
+        i_sub_item: 0,
+        state: new_state,
+        state_mask: LVIS_STATEIMAGEMASK,
+        psz_text: null_mut(),
+        cch_text_max: 0,
+        i_image: 0,
+        l_param: row_idx as isize,
+        i_indent: 0,
+        i_group_id: 0,
+        c_columns: 0,
+        pu_columns: null_mut(),
+        pi_col_fmt: null_mut(),
+        i_group: 0,
+    };
+    unsafe {
+        let _ = send_msg(listview, LVM_SETITEMSTATE, row_idx, &item_state as *const _ as isize);
+    }
+    handle_row_check_toggle(row_idx, new_check);
+    set_status_text(&format!("Visibility: {}", if new_check { "Shown" } else { "Hidden" }));
 }
 
 fn pick_and_assign_effect(row_idx: usize) {
@@ -812,8 +1209,8 @@ fn pick_and_assign_effect(row_idx: usize) {
     };
 
     let mut file_buf = [0u16; 512];
-    let filter = w!("HLSL Effect Files (*.fx)\0*.fx\0All Files (*.*)\0*.*\0\0");
-    let title = w!("Выберите эффект DirectX 11 (.fx)");
+    let filter = w!("HLSL Effect Files (*.fx;*.fxsub;*.fxm)\0*.fx;*.fxsub;*.fxm\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Select DirectX 11 HLSL Effect File (.fx)");
 
     let mut ofn = OPENFILENAMEW::default();
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
@@ -848,22 +1245,16 @@ fn pick_and_assign_effect_path(row_idx: usize, path: &str) {
     };
 
     let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
-    let res = match row.object_id {
-        None => reg.assign_default_effect(path),
-        Some(obj_id) => {
-            if row.subset >= 0 {
-                reg.assign_subset_effect(obj_id, &row.filename, row.subset, path)
-            } else {
-                reg.assign_model_effect(obj_id, &row.filename, path)
-            }
-        }
-    };
-
+    let cur_tab = reg.current_tab_idx;
+    let res = reg.assign_tab_effect(cur_tab, row.object_id, &row.filename, row.subset, path);
+    if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
+        let _ = reg.save_emm("hikari_mapping.emm");
+    }
     drop(reg);
 
     match res {
         Ok(()) => {
-            set_status_text(&format!("Эффект успешно назначен: {path}"));
+            set_status_text(&format!("Effect assigned: {path}"));
             if let Some(h) = *MANAGER_HWND.lock().unwrap() {
                 let parent = HWND(h as *mut c_void);
                 if let Ok(lv) = unsafe { GetDlgItem(Some(parent), ID_LISTVIEW as i32) } {
@@ -873,7 +1264,7 @@ fn pick_and_assign_effect_path(row_idx: usize, path: &str) {
             on_row_selected(row_idx);
         }
         Err(e) => {
-            set_status_text(&format!("Ошибка компиляции эффекта: {e}"));
+            set_status_text(&format!("Effect compilation error: {e}"));
         }
     }
 }
@@ -891,37 +1282,21 @@ fn remove_assigned_effect(row_idx: usize) {
     };
 
     let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
-    let _ = match row.object_id {
-        None => reg.assign_default_effect(""),
-        Some(obj_id) => {
-            if row.subset >= 0 {
-                reg.assign_subset_effect(obj_id, &row.filename, row.subset, "")
-            } else {
-                reg.assign_model_effect(obj_id, &row.filename, "")
-            }
-        }
-    };
+    let cur_tab = reg.current_tab_idx;
+    let _ = reg.assign_tab_effect(cur_tab, row.object_id, &row.filename, row.subset, "");
+    if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
+        let _ = reg.save_emm("hikari_mapping.emm");
+    }
     drop(reg);
 
-    let target_row = {
-        let rows = UI_ROWS.lock().unwrap();
-        if rows.is_empty() {
-            None
-        } else {
-            Some(row_idx.min(rows.len() - 1))
-        }
-    };
-
-    set_status_text("Эффект снят.");
+    set_status_text("Effect removed.");
     if let Some(h) = *MANAGER_HWND.lock().unwrap() {
         let parent = HWND(h as *mut c_void);
         if let Ok(lv) = unsafe { GetDlgItem(Some(parent), ID_LISTVIEW as i32) } {
             refresh_assignment_list(lv);
         }
     }
-    if let Some(idx) = target_row {
-        on_row_selected(idx);
-    }
+    on_row_selected(row_idx);
 }
 
 fn toggle_selected_subset_expand(row_idx: usize) {
@@ -947,9 +1322,228 @@ fn toggle_selected_subset_expand(row_idx: usize) {
     }
 }
 
+fn file_open_emm(parent: HWND, listview: HWND) {
+    let mut file_buf = [0u16; 512];
+    let filter = w!("MME Mapping Files (*.emm)\0*.emm\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Open MME Effect Mapping (.emm)");
+
+    let mut ofn = OPENFILENAMEW::default();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = parent;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = PWSTR(file_buf.as_mut_ptr());
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+        let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        let path = String::from_utf16_lossy(&file_buf[..end]);
+        if !path.is_empty() {
+            let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+            match reg.load_emm(&path) {
+                Ok(()) => {
+                    drop(reg);
+                    if let Ok(tab_ctrl) = unsafe { GetDlgItem(Some(parent), ID_TAB_CONTROL as i32) } {
+                        rebuild_tab_control(tab_ctrl);
+                    }
+                    update_caption_for_current_tab(parent);
+                    refresh_assignment_list(listview);
+                    set_status_text(&format!("Loaded mapping: {path}"));
+                }
+                Err(e) => {
+                    set_status_text(&format!("Error loading .emm: {e}"));
+                }
+            }
+        }
+    }
+}
+
+fn file_save_emm(parent: HWND) {
+    let mut file_buf = [0u16; 512];
+    let filter = w!("MME Mapping Files (*.emm)\0*.emm\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Save MME Effect Mapping (.emm)");
+
+    let mut ofn = OPENFILENAMEW::default();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = parent;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = PWSTR(file_buf.as_mut_ptr());
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_PATHMUSTEXIST;
+
+    if unsafe { GetSaveFileNameW(&mut ofn) }.as_bool() {
+        let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        let mut path = String::from_utf16_lossy(&file_buf[..end]);
+        if !path.ends_with(".emm") {
+            path.push_str(".emm");
+        }
+        let reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+        match reg.save_emm(&path) {
+            Ok(()) => set_status_text(&format!("Saved mapping: {path}")),
+            Err(e) => set_status_text(&format!("Error saving .emm: {e}")),
+        }
+    }
+}
+
+fn file_open_emd(parent: HWND, listview: HWND) {
+    let sel = *SELECTED_ROW.lock().unwrap();
+    let rows = UI_ROWS.lock().unwrap();
+    let obj_id = sel.and_then(|idx| rows.get(idx).and_then(|r| r.object_id));
+    drop(rows);
+
+    let Some(id) = obj_id else {
+        set_status_text("Select a model row first to load .emd.");
+        return;
+    };
+
+    let mut file_buf = [0u16; 512];
+    let filter = w!("MME Model Mapping Files (*.emd)\0*.emd\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Open Model Effect Mapping (.emd)");
+
+    let mut ofn = OPENFILENAMEW::default();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = parent;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = PWSTR(file_buf.as_mut_ptr());
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+        let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        let path = String::from_utf16_lossy(&file_buf[..end]);
+        if !path.is_empty() {
+            let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+            match reg.load_emd(id, &path) {
+                Ok(()) => {
+                    drop(reg);
+                    refresh_assignment_list(listview);
+                    set_status_text(&format!("Loaded model mapping: {path}"));
+                }
+                Err(e) => {
+                    set_status_text(&format!("Error loading .emd: {e}"));
+                }
+            }
+        }
+    }
+}
+
+fn file_save_emd(parent: HWND) {
+    let sel = *SELECTED_ROW.lock().unwrap();
+    let rows = UI_ROWS.lock().unwrap();
+    let obj_id = sel.and_then(|idx| rows.get(idx).and_then(|r| r.object_id));
+    drop(rows);
+
+    let Some(id) = obj_id else {
+        set_status_text("Select a model row first to save .emd.");
+        return;
+    };
+
+    let mut file_buf = [0u16; 512];
+    let filter = w!("MME Model Mapping Files (*.emd)\0*.emd\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Save Model Effect Mapping (.emd)");
+
+    let mut ofn = OPENFILENAMEW::default();
+    ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    ofn.hwndOwner = parent;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = PWSTR(file_buf.as_mut_ptr());
+    ofn.nMaxFile = file_buf.len() as u32;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_PATHMUSTEXIST;
+
+    if unsafe { GetSaveFileNameW(&mut ofn) }.as_bool() {
+        let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        let mut path = String::from_utf16_lossy(&file_buf[..end]);
+        if !path.ends_with(".emd") {
+            path.push_str(".emd");
+        }
+        let reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+        match reg.save_emd(id, &path) {
+            Ok(()) => set_status_text(&format!("Saved model mapping: {path}")),
+            Err(e) => set_status_text(&format!("Error saving .emd: {e}")),
+        }
+    }
+}
+
+fn tool_disassemble_effect(parent: HWND) {
+    let eff_addr = *ACTIVE_TARGET_EFFECT.lock().unwrap();
+    let Some(addr) = eff_addr else {
+        unsafe {
+            MessageBoxW(
+                Some(parent),
+                w!("No effect is currently selected. Select an object with an assigned effect to disassemble its shaders."),
+                w!("Disassemble Effect"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        return;
+    };
+
+    match unsafe { crate::effect::disassemble_hikari_effect(addr as *mut c_void) } {
+        Ok(disasm_bytes) => {
+            let disasm_text = String::from_utf8_lossy(&disasm_bytes);
+            show_text_window(parent, "Hikari - Disassembled HLSL / DXBC Assembly", &disasm_text);
+        }
+        Err(e) => {
+            let err_w: Vec<u16> = format!("Disassembly failed: {e}\0").encode_utf16().collect();
+            unsafe {
+                MessageBoxW(
+                    Some(parent),
+                    PCWSTR(err_w.as_ptr()),
+                    w!("Disassembly Error"),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
+    }
+}
+
+fn tool_add_render_target_tab(parent: HWND, tab_ctrl: HWND, listview: HWND) {
+    let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
+    let count = reg.tabs.len();
+    let name = format!("MaterialMap{}", if count == 0 { "".to_string() } else { format!("_{}", count + 1) });
+    reg.add_tab(
+        &name,
+        "Material buffer render target for deferred shading (MaterialMap)",
+        "self=hide; *controller*.pmx=hide; sky*box*.*=./materials/material_skybox.fx; *.pmx=./materials/material_2.0.fx; *=hide;",
+    );
+    let new_idx = reg.tabs.len(); // 1-based index (0 is Main)
+    reg.current_tab_idx = new_idx;
+    drop(reg);
+
+    rebuild_tab_control(tab_ctrl);
+    update_caption_for_current_tab(parent);
+    refresh_assignment_list(listview);
+    set_status_text(&format!("Added offscreen render target tab '{name}'."));
+}
+
+fn tool_toggle_params_panel(parent: HWND) {
+    let cur = SHOW_PARAMS_PANEL.load(Ordering::Acquire);
+    let new_val = !cur;
+    SHOW_PARAMS_PANEL.store(new_val, Ordering::Release);
+
+    unsafe {
+        let menu = GetMenu(parent);
+        if !menu.0.is_null() {
+            let chk_flag = (MF_BYCOMMAND.0 | if new_val { MF_CHECKED.0 } else { MF_UNCHECKED.0 }) as u32;
+            let _ = CheckMenuItem(menu, ID_TOOL_TOGGLE_PARAMS, chk_flag);
+        }
+        if let Some(c) = *PARAM_CONTAINER_HWND.lock().unwrap() {
+            let _ = ShowWindow(HWND(c as *mut c_void), if new_val { SW_SHOW } else { SW_HIDE });
+        }
+        let mut rect = RECT::default();
+        let _ = GetWindowRect(parent, &mut rect);
+        let new_w = if new_val { 920 } else { 590 };
+        let h = rect.bottom - rect.top;
+        let _ = SetWindowPos(parent, None, rect.left, rect.top, new_w, h, SWP_NOZORDER | SWP_NOMOVE);
+    }
+}
+
 fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffect>) {
     unsafe {
-        // Destroy existing controls in container safely
         ACTIVE_PARAM_CONTROLS.lock().unwrap().clear();
 
         let mut children = Vec::new();
@@ -970,9 +1564,9 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                 let placeholder = make_child(
                     WINDOW_EX_STYLE::default(),
                     w!("STATIC"),
-                    w!("Шейдер не назначен для выбранного объекта.\n\nНажмите 'Задать эффект (.fx)...', чтобы наложить шейдер."),
+                    w!("No effect assigned to the selected object.\n\nClick 'Set Effect' to assign an HLSL effect file."),
                     WINDOW_STYLE::default(),
-                    14, 20, 290, 80,
+                    14, 20, 280, 80,
                     container,
                     None,
                 );
@@ -999,20 +1593,20 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                 last_group = ui_desc.group.clone();
                 current_y += 6;
                 let w_group: Vec<u16> = format!("[ {} ]", last_group).encode_utf16().chain(std::iter::once(0)).collect();
-                let grp_lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), PCWSTR(w_group.as_ptr()), WINDOW_STYLE::default(), 10, current_y, 290, 18, container, None);
+                let grp_lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), PCWSTR(w_group.as_ptr()), WINDOW_STYLE::default(), 10, current_y, 280, 18, container, None);
                 set_control_font(grp_lbl, bold);
                 current_y += 22;
             }
 
             let name_disp = if !ui_desc.label.is_empty() { &ui_desc.label } else { &param.name };
             let w_label: Vec<u16> = format!("{}:", name_disp).encode_utf16().chain(std::iter::once(0)).collect();
-            let lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), PCWSTR(w_label.as_ptr()), WINDOW_STYLE::default(), 10, current_y, 290, 18, container, None);
+            let lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), PCWSTR(w_label.as_ptr()), WINDOW_STYLE::default(), 10, current_y, 280, 18, container, None);
             set_control_font(lbl, font);
             current_y += 20;
 
             if !ui_desc.help.is_empty() {
                 let w_help: Vec<u16> = format!("  {}", ui_desc.help).encode_utf16().chain(std::iter::once(0)).collect();
-                let help_lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), PCWSTR(w_help.as_ptr()), WINDOW_STYLE::default(), 10, current_y, 290, 16, container, None);
+                let help_lbl = make_child(WINDOW_EX_STYLE::default(), w!("STATIC"), PCWSTR(w_help.as_ptr()), WINDOW_STYLE::default(), 10, current_y, 280, 16, container, None);
                 set_control_font(help_lbl, font);
                 current_y += 18;
             }
@@ -1035,7 +1629,7 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                         WINDOW_STYLE(TBS_HORZ as u32 | TBS_AUTOTICKS as u32),
                         10,
                         current_y,
-                        210,
+                        200,
                         28,
                         container,
                         Some(trackbar_id),
@@ -1048,7 +1642,7 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                         w!("EDIT"),
                         PCWSTR(w_val.as_ptr()),
                         WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                        226,
+                        216,
                         current_y + 2,
                         64,
                         22,
@@ -1084,7 +1678,7 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                     let chk = make_child(
                         WINDOW_EX_STYLE::default(),
                         w!("BUTTON"),
-                        w!("Включить"),
+                        w!("Enable"),
                         WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
                         10,
                         current_y,
@@ -1125,11 +1719,11 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                     let color_btn = make_child(
                         WINDOW_EX_STYLE::default(),
                         w!("BUTTON"),
-                        w!("Выбрать цвет..."),
+                        w!("Pick Color..."),
                         WINDOW_STYLE(BS_PUSHBUTTON as u32),
                         10,
                         current_y,
-                        130,
+                        120,
                         24,
                         container,
                         Some(btn_id),
@@ -1143,7 +1737,7 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                         w!("STATIC"),
                         PCWSTR(w_rgb.as_ptr()),
                         WINDOW_STYLE::default(),
-                        148,
+                        138,
                         current_y + 3,
                         140,
                         20,
@@ -1178,7 +1772,7 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
                         WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
                         10,
                         current_y,
-                        280,
+                        270,
                         160,
                         container,
                         Some(combo_id),
@@ -1214,13 +1808,13 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
         *ACTIVE_PARAM_CONTROLS.lock().unwrap() = param_controls;
 
         // Scrollbar configuration
-        if current_y > 500 {
+        if current_y > 450 {
             let si = SCROLLINFO {
                 cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_RANGE | SIF_PAGE,
                 nMin: 0,
                 nMax: current_y,
-                nPage: 500,
+                nPage: 450,
                 nPos: 0,
                 nTrackPos: 0,
             };
@@ -1232,7 +1826,7 @@ fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffe
     }
 }
 
-/// Window procedure for the Effects Manager dialog.
+/// Window procedure for the Effects Manager dialog ("Map Effect File").
 unsafe extern "system" fn effects_manager_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -1257,18 +1851,36 @@ unsafe fn effects_manager_wndproc_inner(
                 return LRESULT(0);
             }
             let nmhdr = &*(lparam.0 as *const NMHDR);
-            if nmhdr.id_from == ID_LISTVIEW as usize {
+            if nmhdr.id_from == ID_TAB_CONTROL as usize {
+                if nmhdr.code == TCN_SELCHANGE {
+                    let cur = send_msg(nmhdr.hwnd_from, TCM_GETCURSEL, 0, 0) as usize;
+                    ASSIGNMENT_REGISTRY.lock().unwrap().current_tab_idx = cur;
+                    update_caption_for_current_tab(hwnd);
+                    if let Ok(lv) = GetDlgItem(Some(hwnd), ID_LISTVIEW as i32) {
+                        refresh_assignment_list(lv);
+                    }
+                    return LRESULT(0);
+                }
+            } else if nmhdr.id_from == ID_LISTVIEW as usize {
                 if IS_REFRESHING.load(Ordering::Relaxed) {
                     return LRESULT(0);
                 }
                 if nmhdr.code == LVN_ITEMCHANGED {
                     let nmlv = &*(lparam.0 as *const NMLISTVIEW);
-                    if (nmlv.u_changed & LVIF_STATE) != 0
-                        && (nmlv.u_new_state & LVIS_SELECTED) != 0
-                        && (nmlv.u_old_state & LVIS_SELECTED) == 0
-                    {
-                        if nmlv.i_item >= 0 {
-                            on_row_selected(nmlv.i_item as usize);
+                    if (nmlv.u_changed & LVIF_STATE) != 0 {
+                        // Check for selection change
+                        if (nmlv.u_new_state & LVIS_SELECTED) != 0 && (nmlv.u_old_state & LVIS_SELECTED) == 0 {
+                            if nmlv.i_item >= 0 {
+                                on_row_selected(nmlv.i_item as usize);
+                            }
+                        }
+
+                        // Check for checkbox state change
+                        let old_check = nmlv.u_old_state & LVIS_STATEIMAGEMASK;
+                        let new_check = nmlv.u_new_state & LVIS_STATEIMAGEMASK;
+                        if old_check != 0 && new_check != 0 && old_check != new_check {
+                            let is_checked = (new_check & 0x2000) != 0;
+                            handle_row_check_toggle(nmlv.i_item as usize, is_checked);
                         }
                     }
                 } else if nmhdr.code == NM_CLICK {
@@ -1288,44 +1900,122 @@ unsafe fn effects_manager_wndproc_inner(
             let cmd_id = (wparam.0 & 0xFFFF) as u32;
             let notify_code = ((wparam.0 >> 16) & 0xFFFF) as u32;
 
+            let listview = GetDlgItem(Some(hwnd), ID_LISTVIEW as i32).unwrap_or_default();
+            let tab_ctrl = GetDlgItem(Some(hwnd), ID_TAB_CONTROL as i32).unwrap_or_default();
+
             match cmd_id {
-                ID_SET_EFFECT_BTN => {
+                // Button / Menu Set Effect
+                ID_SET_EFFECT_BTN | ID_EDIT_SET_EFFECT => {
                     let sel = *SELECTED_ROW.lock().unwrap();
                     if let Some(row_idx) = sel {
                         pick_and_assign_effect(row_idx);
                     } else {
-                        set_status_text("Сначала выберите объект в списке слева.");
+                        set_status_text("Please select an item in the list first.");
                     }
                     return LRESULT(0);
                 }
-                ID_REMOVE_EFFECT_BTN => {
+                // Button / Menu Remove Effect
+                ID_REMOVE_EFFECT_BTN | ID_EDIT_REMOVE_EFFECT => {
                     let sel = *SELECTED_ROW.lock().unwrap();
                     if let Some(row_idx) = sel {
                         remove_assigned_effect(row_idx);
                     }
                     return LRESULT(0);
                 }
-                ID_EXTRACT_SUBSETS_BTN => {
+                // Button / Menu Hide/Show
+                ID_HIDE_SHOW_BTN | ID_EDIT_HIDE_SHOW => {
+                    toggle_selected_hide_show(listview);
+                    return LRESULT(0);
+                }
+                // Menu Reset with default
+                ID_EDIT_RESET_DEFAULT => {
+                    let sel = *SELECTED_ROW.lock().unwrap();
+                    if let Some(row_idx) = sel {
+                        remove_assigned_effect(row_idx);
+                    }
+                    return LRESULT(0);
+                }
+                // Menu Subset-Extract
+                ID_EDIT_SUBSET_EXTRACT => {
                     let sel = *SELECTED_ROW.lock().unwrap();
                     if let Some(row_idx) = sel {
                         toggle_selected_subset_expand(row_idx);
                     }
                     return LRESULT(0);
                 }
-                ID_REFRESH_LIST_BTN => {
-                    let listview = GetDlgItem(Some(hwnd), ID_LISTVIEW as i32).unwrap_or_default();
-                    refresh_assignment_list(listview);
-                    set_status_text("Список объектов MMD синхронизирован.");
+                // Menu File -> Open (.emm)
+                ID_FILE_OPEN => {
+                    file_open_emm(hwnd, listview);
                     return LRESULT(0);
                 }
-                ID_RELOAD_BTN => {
-                    reload_active_effect();
+                // Menu File -> Save (.emm)
+                ID_FILE_SAVE => {
+                    file_save_emm(hwnd);
+                    return LRESULT(0);
+                }
+                // Menu File -> Open by Model (.emd)
+                ID_FILE_OPEN_MODEL => {
+                    file_open_emd(hwnd, listview);
+                    return LRESULT(0);
+                }
+                // Menu File -> Save by Model (.emd)
+                ID_FILE_SAVE_MODEL => {
+                    file_save_emd(hwnd);
+                    return LRESULT(0);
+                }
+                // Menu File -> Close
+                ID_FILE_CLOSE | ID_CANCEL_BTN => {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    return LRESULT(0);
+                }
+                // Menu Tool -> Disassemble Effect
+                ID_TOOL_DISASSEMBLE => {
+                    tool_disassemble_effect(hwnd);
+                    return LRESULT(0);
+                }
+                // Menu Tool -> Skip Device Validation
+                ID_TOOL_SKIP_VALIDATION => {
+                    let cur = crate::effect::SKIP_DEVICE_VALIDATION.load(Ordering::Acquire);
+                    let new_val = !cur;
+                    crate::effect::SKIP_DEVICE_VALIDATION.store(new_val, Ordering::Release);
+                    let menu = GetMenu(hwnd);
+                    if !menu.0.is_null() {
+                        let chk_flag = (MF_BYCOMMAND.0 | if new_val { MF_CHECKED.0 } else { MF_UNCHECKED.0 }) as u32;
+                        let _ = CheckMenuItem(menu, ID_TOOL_SKIP_VALIDATION, chk_flag);
+                    }
+                    set_status_text(&format!("Skip Device Validation: {new_val}"));
+                    return LRESULT(0);
+                }
+                // Menu Tool -> Add Render Target Tab...
+                ID_TOOL_ADD_TAB => {
+                    tool_add_render_target_tab(hwnd, tab_ctrl, listview);
+                    return LRESULT(0);
+                }
+                // Menu Tool -> Show HLSL Parameters Panel
+                ID_TOOL_TOGGLE_PARAMS => {
+                    tool_toggle_params_panel(hwnd);
+                    return LRESULT(0);
+                }
+                // Button OK
+                ID_OK_BTN => {
+                    if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
+                        let _ = ASSIGNMENT_REGISTRY.lock().unwrap().save_emm("hikari_mapping.emm");
+                    }
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    return LRESULT(0);
+                }
+                // Button Apply
+                ID_APPLY_BTN => {
+                    if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
+                        let _ = ASSIGNMENT_REGISTRY.lock().unwrap().save_emm("hikari_mapping.emm");
+                    }
+                    set_status_text("Mapping applied.");
                     return LRESULT(0);
                 }
                 _ => {}
             }
 
-            // Check if this command belongs to a parameter control
+            // Parameter tweak controls dispatch
             if cmd_id >= PARAM_CONTROL_ID_BASE {
                 let eff_addr = *ACTIVE_TARGET_EFFECT.lock().unwrap();
                 if let Some(addr) = eff_addr {
@@ -1506,5 +2196,239 @@ unsafe fn param_container_wndproc_inner(
         _ => {}
     }
 
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Modeless Log Window displaying compiler and effect diagnostic logs.
+pub fn show_log_window(parent: HWND) {
+    let mut lock = LOG_WINDOW_HWND.lock().unwrap();
+    if let Some(h) = *lock {
+        let hwnd = HWND(h as *mut c_void);
+        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            refresh_log_window_content(hwnd);
+            return;
+        }
+    }
+
+    let class_name: Vec<u16> = "HikariLogWindow\0".encode_utf16().collect();
+    unsafe {
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(log_window_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: HINSTANCE(null_mut()),
+            hIcon: HICON(null_mut()),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as isize as *mut c_void),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            hIconSm: HICON(null_mut()),
+        };
+        let _ = RegisterClassExW(&wc);
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST,
+            PCWSTR(class_name.as_ptr()),
+            w!("Hikari Effects Log"),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            640,
+            420,
+            Some(parent),
+            None,
+            None,
+            None,
+        ).unwrap_or_default();
+
+        let (font, _) = get_or_create_fonts();
+        let mono_font = get_or_create_mono_font();
+
+        // 1001: Readonly multiline edit
+        let edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("EDIT"),
+            PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WINDOW_STYLE(ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | ES_AUTOHSCROLL as u32),
+            10, 10, 604, 320,
+            Some(hwnd),
+            Some(HMENU(1001 as usize as *mut c_void)),
+            None,
+            None,
+        ).unwrap_or_default();
+        set_control_font(edit, mono_font);
+
+        let clear_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Clear"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 220, 342, 80, 26, hwnd, Some(3));
+        set_control_font(clear_btn, font);
+
+        let close_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Close"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 320, 342, 80, 26, hwnd, Some(2));
+        set_control_font(close_btn, font);
+
+        *lock = Some(hwnd.0 as usize);
+        refresh_log_window_content(hwnd);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
+    }
+}
+
+fn refresh_log_window_content(hwnd: HWND) {
+    let logs = crate::get_recent_logs();
+    let logs_w: Vec<u16> = format!("{logs}\0").encode_utf16().collect();
+    unsafe {
+        if let Ok(edit) = GetDlgItem(Some(hwnd), 1001) {
+            let _ = SetWindowTextW(edit, PCWSTR(logs_w.as_ptr()));
+            // Scroll to end
+            let len = logs_w.len().saturating_sub(1);
+            let _ = SendMessageW(edit, 0x00B1 /* EM_SETSEL */, Some(WPARAM(len)), Some(LPARAM(len as isize)));
+            let _ = SendMessageW(edit, 0x00B7 /* EM_SCROLLCARET */, None, None);
+        }
+    }
+}
+
+unsafe extern "system" fn log_window_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let cmd_id = (wparam.0 & 0xFFFF) as u32;
+            if cmd_id == 2 { // Close
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return LRESULT(0);
+            } else if cmd_id == 3 { // Clear
+                crate::clear_logs();
+                refresh_log_window_content(hwnd);
+                return LRESULT(0);
+            }
+        }
+        WM_SIZE => {
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+            if let Ok(edit) = GetDlgItem(Some(hwnd), 1001) {
+                let _ = SetWindowPos(edit, None, 10, 10, w - 20, (h - 54).max(50), SWP_NOZORDER);
+            }
+            if let Ok(clear_btn) = GetDlgItem(Some(hwnd), 3) {
+                let _ = SetWindowPos(clear_btn, None, w / 2 - 85, h - 36, 80, 26, SWP_NOZORDER);
+            }
+            if let Ok(close_btn) = GetDlgItem(Some(hwnd), 2) {
+                let _ = SetWindowPos(close_btn, None, w / 2 + 5, h - 36, 80, 26, SWP_NOZORDER);
+            }
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn show_text_window(parent: HWND, title: &str, text: &str) {
+    let class_name: Vec<u16> = "HikariTextWindow\0".encode_utf16().collect();
+    let title_w: Vec<u16> = format!("{title}\0").encode_utf16().collect();
+
+    unsafe {
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(text_window_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: HINSTANCE(null_mut()),
+            hIcon: HICON(null_mut()),
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as isize as *mut c_void),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            hIconSm: HICON(null_mut()),
+        };
+        let _ = RegisterClassExW(&wc);
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST,
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            720,
+            500,
+            Some(parent),
+            None,
+            None,
+            None,
+        ).unwrap_or_default();
+
+        let (font, _) = get_or_create_fonts();
+        let mono_font = get_or_create_mono_font();
+
+        let edit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("EDIT"),
+            PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | WINDOW_STYLE(ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32 | ES_AUTOHSCROLL as u32),
+            10, 10, 684, 400,
+            Some(hwnd),
+            Some(HMENU(1001 as usize as *mut c_void)),
+            None,
+            None,
+        ).unwrap_or_default();
+        set_control_font(edit, mono_font);
+
+        let text_w: Vec<u16> = format!("{text}\0").encode_utf16().collect();
+        let _ = SetWindowTextW(edit, PCWSTR(text_w.as_ptr()));
+
+        let close_btn = make_child(WINDOW_EX_STYLE::default(), w!("BUTTON"), w!("Close"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 310, 422, 90, 26, hwnd, Some(2));
+        set_control_font(close_btn, font);
+
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
+    }
+}
+
+unsafe extern "system" fn text_window_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            let cmd_id = (wparam.0 & 0xFFFF) as u32;
+            if cmd_id == 2 {
+                let _ = DestroyWindow(hwnd);
+                return LRESULT(0);
+            }
+        }
+        WM_SIZE => {
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+            if let Ok(edit) = GetDlgItem(Some(hwnd), 1001) {
+                let _ = SetWindowPos(edit, None, 10, 10, w - 20, (h - 54).max(50), SWP_NOZORDER);
+            }
+            if let Ok(close_btn) = GetDlgItem(Some(hwnd), 2) {
+                let _ = SetWindowPos(close_btn, None, w / 2 - 45, h - 36, 90, 26, SWP_NOZORDER);
+            }
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            return LRESULT(0);
+        }
+        _ => {}
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }

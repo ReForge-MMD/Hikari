@@ -655,10 +655,14 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     unsafe {
         ctx.context.VSSetShader(pass_info.vs.as_ref(), None);
         ctx.context.PSSetShader(pass_info.ps.as_ref(), None);
+        ctx.context.GSSetShader(pass_info.gs.as_ref(), None);
         if let Some(ref cb) = pass_info.constant_buffer {
             let cbs = [Some(cb.clone()), Some(cb.clone()), Some(cb.clone()), Some(cb.clone())];
             ctx.context.VSSetConstantBuffers(0, Some(&cbs));
             ctx.context.PSSetConstantBuffers(0, Some(&cbs));
+            if pass_info.gs.is_some() {
+                ctx.context.GSSetConstantBuffers(0, Some(&cbs));
+            }
         }
         ctx.context.IASetInputLayout(&input_layout);
         let vbs = [Some(d3d11_vb)];

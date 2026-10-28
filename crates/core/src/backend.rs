@@ -229,6 +229,9 @@ pub fn on_set_indices(ptr: usize) {
 }
 
 pub fn should_render_dx11() -> bool {
+    if !crate::effect::EFFECTS_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
     crate::effect::HAS_ASSIGNED_EFFECTS.load(std::sync::atomic::Ordering::Relaxed)
         || crate::effect::ACTIVE_EFFECT_PASS.lock().unwrap().is_some()
         || ACTIVE_EFFECT.lock().unwrap().is_some()

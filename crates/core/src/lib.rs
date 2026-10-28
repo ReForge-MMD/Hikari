@@ -158,9 +158,30 @@ pub fn install_av_tracer() {
 }
 
 static LOG_MUTEX: Mutex<()> = Mutex::new(());
+static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SESSION_MARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+pub fn get_recent_logs() -> String {
+    if let Ok(guard) = LOG_BUFFER.lock() {
+        guard.join("\r\n")
+    } else {
+        String::new()
+    }
+}
+
+pub fn clear_logs() {
+    if let Ok(mut guard) = LOG_BUFFER.lock() {
+        guard.clear();
+    }
+}
+
 pub fn log_msg(msg: &str) {
+    if let Ok(mut buf) = LOG_BUFFER.lock() {
+        if buf.len() > 2000 {
+            buf.drain(0..500);
+        }
+        buf.push(msg.to_string());
+    }
     if let Ok(_guard) = LOG_MUTEX.lock() {
         let log_path = std::env::current_exe()
             .ok()
