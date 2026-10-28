@@ -1505,46 +1505,12 @@ unsafe extern "system" fn effect_get_pass_desc(this: *mut c_void, hPass: D3DXHAN
     if t_idx < eff.techniques.len() && p_idx < eff.techniques[t_idx].passes.len() {
         (*pDesc).Name = eff.pass_c_names[t_idx][p_idx].as_ptr();
         (*pDesc).Annotations = eff.pass_annotations[t_idx][p_idx].len() as u32;
-        // The DXBC SM 5.0 bytecode must NOT reach the native D3D9 pipeline
-        // (MME validates it as D3D9 shader tokens and the real device faults).
-        // Hand MME a valid D3D9-shaped stub pair instead so its validation and
-        // shader-creation path succeed without touching Hikari's DX11 draw.
-        let (vs, ps) = d3d9_stub_bytecode();
-        (*pDesc).pVertexShaderFunction = vs.as_ptr() as *const u32;
-        (*pDesc).pPixelShaderFunction = ps.as_ptr() as *const u32;
+        (*pDesc).pVertexShaderFunction = std::ptr::null();
+        (*pDesc).pPixelShaderFunction = std::ptr::null();
         S_OK
     } else {
         windows::core::HRESULT(-2147467259)
     }
-}
-
-fn d3d9_stub_bytecode() -> (&'static Vec<u8>, &'static Vec<u8>) {
-    static STUBS: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
-    STUBS.get_or_init(|| {
-        // ...
-        let vs_source = "
-float4 main(float4 pos : POSITION) : POSITION {
-    return pos;
-}
-";
-        let ps_source = "
-float4 main() : COLOR {
-    return float4(1.0f, 0.0f, 0.0f, 1.0f);
-}
-";
-        let vs = crate::shader::compile_hlsl(vs_source, "main", "vs_2_0", None, &[])
-            .unwrap_or_default();
-        let ps = crate::shader::compile_hlsl(ps_source, "main", "ps_2_0", None, &[])
-            .unwrap_or_default();
-        crate::log_msg(&format!(
-            "d3d9 stub bytecode compiled: vs={} bytes, ps={} bytes",
-            vs.len(),
-            ps.len()
-        ));
-        (vs, ps)
-    });
-    let stubs = STUBS.get().unwrap();
-    (&stubs.0, &stubs.1)
 }
 
 unsafe extern "system" fn effect_get_parameter_desc(this: *mut c_void, hParameter: D3DXHANDLE, pDesc: *mut D3DXPARAMETER_DESC) -> HRESULT {
@@ -2424,7 +2390,7 @@ unsafe extern "system" fn effect_end(_this: *mut c_void) -> HRESULT {
 unsafe extern "system" fn effect_get_device(_this: *mut c_void, ppDevice: *mut *mut c_void) -> HRESULT {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {
-        crate::log_msg("ID3DXEffect::GetDevice returns a null device (S_OK) - MME may dereference it");
+        crate::log_msg("ID3DXEffect::GetDevice called");
     }
     if !ppDevice.is_null() {
         *ppDevice = null_mut();

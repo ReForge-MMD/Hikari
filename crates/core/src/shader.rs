@@ -369,9 +369,6 @@ pub fn compile_hlsl(
     source_name: Option<&str>,
     defines: &[(&str, &str)],
 ) -> Result<Vec<u8>, String> {
-    // Legacy D3D9 profiles (vs_2_0..ps_3_0) are compiled as-is: Hikari
-    // sometimes hands D3D9-shaped stub bytecode to the native MME/D3D9
-    // pipeline, and rewriting it to SM5 recreates the DXBC-in-D3D9 crash.
     let compile_target = target.to_string();
 
     let compile_fn = get_d3dcompile().ok_or_else(|| "d3dcompiler_47.dll not found on system".to_string())?;

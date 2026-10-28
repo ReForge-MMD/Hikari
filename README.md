@@ -118,14 +118,11 @@ Hikari acts as a drop-in runtime plugin that bridges legacy MMD/MME Direct3D 9 h
   - **Static Model** (stride 32: Position, Normal, UV).
   - **Screen Quad / Post-Process** (stride 20: Position, UV).
 
-### 7. Extended Direct3D 9 Vtable Interception
-Intercepts host virtual table calls tailored to MMDPluginDLL1 offset (+1 relative to native D3D9):
-- **Slot 38 (`SetRenderTarget`)**: Routes offscreen render target switches to D3D11 RTVs.
-- **Slot 40 (`SetDepthStencilSurface`)**: Routes depth stencil surface switches to D3D11 DSVs.
-- **Slot 44 (`Clear`)**: Clears active color and depth-stencil surfaces.
-- **Slot 48 (`SetViewport`)**: Routes viewport dimension changes to D3D11 viewports.
-- **Slot 82 (`DrawPrimitive`) & Slot 83 (`DrawIndexedPrimitive`)**: Applies pass pipeline states, binds SRVs, and executes D3D11 draw calls.
-- **Slot 84 (`DrawPrimitiveUP`)**: Intercepts user-memory vertex drawing for fullscreen post-process quads (`Draw=Buffer;`).
+### 7. Direct3D 9 COM Proxy Interception
+Directly intercepts Direct3D 9 device calls via a custom COM wrapper (`d3d9.dll` proxy in the MMD root directory):
+- **Slot 16 (`CreateDevice`)**: Creates the proxy device wrapper and initializes the DirectX 11 runtime.
+- **Slot 41 (`BeginScene`) & Slot 42 (`EndScene`)**: Hooks scene boundaries and composites the DX11 rendered model layers into the native D3D9 backbuffer.
+- **Slot 82 (`DrawIndexedPrimitive`)**: Intercepts active SM 5.0 effect passes and renders models directly via DirectX 11.
 
 ---
 
@@ -240,42 +237,33 @@ To execute all 13 unit and integration tests:
 cargo test
 ```
 
-### Compiling Release DLL
-To build the optimized production DLL:
+### Compiling Release Binaries
+To build the optimized production binaries:
 ```bash
 cargo build --release
 ```
-The compiled library will be output to `target\release\hikari.dll`.
+The compiled libraries (`d3d9.dll`, `hikari_core.dll`, `HikariEffects.dll`) will be output to `target\release\`.
 
 ---
 
 ## Installation in MMD
 
-1. Navigate to your MMD plugin directory:
-   ```
-   <MMD_Directory>\plugin\Hikari\
-   ```
-2. Copy `hikari.dll` into the folder:
+1. Hikari runs as a standalone Direct3D 9 proxy loader, directly replacing MMEffect.
+2. Build the workspace:
    ```powershell
-   Copy-Item -Path "target\release\hikari.dll" -Destination "<MMD_Directory>\plugin\Hikari\hikari.dll" -Force
+   cargo build --release
    ```
-3. Create or verify `mmdplugin.config.json` in the same directory:
-   ```json
-   {
-     "id": "Hikari",
-     "version": "0.1.0",
-     "includeDLL": [
-       "hikari\\.dll"
-     ]
-   }
+3. Deploy the binaries and test shaders to your MMD root directory:
+   ```powershell
+   .\deploy.ps1 -Release -MmdDir "C:\Path\To\MikuMikuDance"
    ```
-4. Launch MikuMikuDance (x64) with MikuMikuEffect installed. Check the log file `hikari.log` in the MMD root directory for initialization messages.
+4. Launch `MikuMikuDance.exe`. Hikari will automatically initialize its DirectX 11 pipeline and inject the effect management menu into the main menu bar. Check `hikari.log` in the MMD root directory for initialization logs.
 
 ---
 
 ## Known Behaviors & Technical Nuances
 
-- **Overlay Viewport**: Hikari presents Direct3D 11 frames via a hardware child overlay window directly over MMD's 3D viewport. While a DX11 shader is actively rendering, MMD's internal D3D9 bone manipulation handles and coordinate gizmos are visually layered beneath the D3D11 frame. When no DX11 shader is rendering, the overlay is hidden automatically.
+- **Backbuffer Composite**: Hikari renders DirectX 11 model layers offscreen and seamlessly composites the result directly into the native D3D9 backbuffer at `EndScene`. MMD's internal D3D9 bone handles, coordinate axes, and GUI overlay cleanly above or blend with the DX11 output.
 - **Fixed-Function Removal**: Direct3D 9 fixed-function pipeline states (such as `LightEnable`, `TextureTransformFlags`, `Ambient`) are unsupported in Shader Model 5.0. Shaders must handle lighting and transformations entirely within the programmable stages.
 - **Include Files**: HLSL `#include` statements are supported natively via `D3D_COMPILE_STANDARD_FILE_INCLUDE`. Included files must be located relative to the shader file or the current working directory.
 
