@@ -1,7 +1,6 @@
 //! DirectX 11 rendering bridge, D3D9/DX11 composite and draw call execution.
 
 use std::ffi::c_void;
-use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use windows::core::{Interface, HRESULT};
@@ -639,28 +638,14 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     let vb9: windows::Win32::Graphics::Direct3D9::IDirect3DVertexBuffer9 = unsafe {
         std::mem::transmute(vb_addr as *mut c_void)
     };
-    let mut vb_desc = windows::Win32::Graphics::Direct3D9::D3DVERTEXBUFFER_DESC::default();
-    let mut p_vb_data: *mut c_void = null_mut();
-    let vb_bytes = unsafe {
-        if vb9.GetDesc(&mut vb_desc).is_ok()
-            && vb_desc.Size > 0
-            && vb9.Lock(0, vb_desc.Size, &mut p_vb_data, Direct3D9::D3DLOCK_READONLY as u32).is_ok()
-            && !p_vb_data.is_null()
-        {
-            let slice = std::slice::from_raw_parts(p_vb_data as *const u8, vb_desc.Size as usize);
-            let bytes = slice.to_vec();
-            let _ = vb9.Unlock();
+    let d3d11_vb = match ctx.get_or_upload_vertex_buffer(vb_addr, &vb9) {
+        Ok(b) => {
             std::mem::forget(vb9);
-            Some(bytes)
-        } else {
-            std::mem::forget(vb9);
-            None
+            b
         }
-    };
-    let vb_bytes = match vb_bytes {
-        Some(b) => b,
-        None => {
-            log_draw_failure_once("failed to read the D3D9 vertex buffer");
+        Err(error) => {
+            std::mem::forget(vb9);
+            log_draw_failure_once(&format!("uploading the vertex buffer failed: {error}"));
             return false;
         }
     };
@@ -668,43 +653,13 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     let ib9: windows::Win32::Graphics::Direct3D9::IDirect3DIndexBuffer9 = unsafe {
         std::mem::transmute(ib_addr as *mut c_void)
     };
-    let mut ib_desc = windows::Win32::Graphics::Direct3D9::D3DINDEXBUFFER_DESC::default();
-    let mut p_ib_data: *mut c_void = null_mut();
-    let (ib_bytes, is_32bit) = unsafe {
-        if ib9.GetDesc(&mut ib_desc).is_ok()
-            && ib_desc.Size > 0
-            && ib9.Lock(0, ib_desc.Size, &mut p_ib_data, Direct3D9::D3DLOCK_READONLY as u32).is_ok()
-            && !p_ib_data.is_null()
-        {
-            let is_32 = ib_desc.Format == Direct3D9::D3DFMT_INDEX32;
-            let slice = std::slice::from_raw_parts(p_ib_data as *const u8, ib_desc.Size as usize);
-            let bytes = slice.to_vec();
-            let _ = ib9.Unlock();
+    let (d3d11_ib, is_32bit) = match ctx.get_or_upload_index_buffer(ib_addr, &ib9) {
+        Ok(res) => {
             std::mem::forget(ib9);
-            (Some(bytes), is_32)
-        } else {
+            res
+        }
+        Err(error) => {
             std::mem::forget(ib9);
-            (None, false)
-        }
-    };
-    let ib_bytes = match ib_bytes {
-        Some(b) => b,
-        None => {
-            log_draw_failure_once("failed to read the D3D9 index buffer");
-            return false;
-        }
-    };
-
-    let d3d11_vb = match ctx.upload_dynamic_vertex_buffer(&vb_bytes) {
-        Ok(b) => b,
-        Err(error) => {
-            log_draw_failure_once(&format!("uploading the vertex buffer failed: {error}"));
-            return false;
-        }
-    };
-    let d3d11_ib = match ctx.upload_dynamic_index_buffer(&ib_bytes) {
-        Ok(b) => b,
-        Err(error) => {
             log_draw_failure_once(&format!("uploading the index buffer failed: {error}"));
             return false;
         }
@@ -787,22 +742,10 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     }
 
     if !DRAW_SUCCESS_LOGGED.swap(true, Ordering::Relaxed) {
-        let v0_str = if vb_bytes.len() >= 12 {
-            let x = f32::from_ne_bytes(vb_bytes[0..4].try_into().unwrap());
-            let y = f32::from_ne_bytes(vb_bytes[4..8].try_into().unwrap());
-            let z = f32::from_ne_bytes(vb_bytes[8..12].try_into().unwrap());
-            format!("({:.2}, {:.2}, {:.2})", x, y, z)
-        } else {
-            "none".to_string()
-        };
         crate::log_msg(&format!(
-            "D3D11 indexed shader draw submitted: prim_type={prim_type}, base_vertex={base_vertex_index}, min_vertex={min_vertex_index}, num_vertices={num_vertices}, start_index={start_index}, prim_count={prim_count}, stride={stride}, vertices={}, indices={index_count}, VB_bytes={}, IB_bytes={}, IB_32bit={is_32bit}, VS={}, PS={}, V0={}",
-            vb_bytes.len() / stride.max(1) as usize,
-            vb_bytes.len(),
-            ib_bytes.len(),
+            "D3D11 indexed shader draw submitted: prim_type={prim_type}, base_vertex={base_vertex_index}, min_vertex={min_vertex_index}, num_vertices={num_vertices}, start_index={start_index}, prim_count={prim_count}, stride={stride}, indices={index_count}, IB_32bit={is_32bit}, VS={}, PS={}",
             pass_info.vs.is_some(),
             pass_info.ps.is_some(),
-            v0_str,
         ));
     }
 

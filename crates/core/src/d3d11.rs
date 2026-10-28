@@ -83,6 +83,9 @@ pub struct D3D11Context {
     pub dynamic_vb_size: usize,
     pub dynamic_ib: Option<ID3D11Buffer>,
     pub dynamic_ib_size: usize,
+    pub ib_cache: HashMap<usize, (ID3D11Buffer, bool)>,
+    pub vb_cache: HashMap<usize, (u64, ID3D11Buffer, usize)>,
+    pub frame_counter: u64,
     pub input_layout_cache: HashMap<(usize, u32), ID3D11InputLayout>,
     pub texture_cache: HashMap<usize, ID3D11ShaderResourceView>,
     pub state_manager: StateManager,
@@ -244,6 +247,9 @@ impl D3D11Context {
             dynamic_vb_size: 0,
             dynamic_ib: None,
             dynamic_ib_size: 0,
+            ib_cache: HashMap::new(),
+            vb_cache: HashMap::new(),
+            frame_counter: 0,
             input_layout_cache: HashMap::new(),
             texture_cache: HashMap::new(),
             state_manager,
@@ -993,6 +999,124 @@ float4 BlitPS(VOut input) : SV_Target {
             self.context.Unmap(ib, 0);
         }
         Ok(ib.clone())
+    }
+
+    /// Returns the cached DX11 index buffer for a D3D9 index buffer pointer,
+    /// or uploads it once if not yet cached.
+    pub fn get_or_upload_index_buffer(
+        &mut self,
+        ib_addr: usize,
+        ib9: &windows::Win32::Graphics::Direct3D9::IDirect3DIndexBuffer9,
+    ) -> Result<(ID3D11Buffer, bool)> {
+        if let Some((ib, is_32)) = self.ib_cache.get(&ib_addr) {
+            return Ok((ib.clone(), *is_32));
+        }
+
+        let mut ib_desc = windows::Win32::Graphics::Direct3D9::D3DINDEXBUFFER_DESC::default();
+        let mut p_ib_data: *mut c_void = null_mut();
+        unsafe {
+            ib9.GetDesc(&mut ib_desc)?;
+            if ib_desc.Size == 0 {
+                return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+            }
+            ib9.Lock(0, ib_desc.Size, &mut p_ib_data, windows::Win32::Graphics::Direct3D9::D3DLOCK_READONLY as u32)?;
+            if p_ib_data.is_null() {
+                let _ = ib9.Unlock();
+                return Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER));
+            }
+
+            let is_32 = ib_desc.Format == windows::Win32::Graphics::Direct3D9::D3DFMT_INDEX32;
+            let slice = std::slice::from_raw_parts(p_ib_data as *const u8, ib_desc.Size as usize);
+
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: (ib_desc.Size as u32).next_power_of_two().max(32768),
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_INDEX_BUFFER.0 as u32,
+                ..Default::default()
+            };
+            let subresource = D3D11_SUBRESOURCE_DATA {
+                pSysMem: slice.as_ptr() as *const c_void,
+                SysMemPitch: 0,
+                SysMemSlicePitch: 0,
+            };
+            let mut buf_opt = None;
+            let hr = self.device.CreateBuffer(&desc, Some(&subresource), Some(&mut buf_opt));
+            let _ = ib9.Unlock();
+            hr?;
+
+            let buf = buf_opt.unwrap();
+            self.ib_cache.insert(ib_addr, (buf.clone(), is_32));
+            Ok((buf, is_32))
+        }
+    }
+
+    /// Returns the cached DX11 vertex buffer for the current frame,
+    /// or uploads it once per frame if not yet updated.
+    pub fn get_or_upload_vertex_buffer(
+        &mut self,
+        vb_addr: usize,
+        vb9: &windows::Win32::Graphics::Direct3D9::IDirect3DVertexBuffer9,
+    ) -> Result<ID3D11Buffer> {
+        let current_frame = self.frame_counter;
+        if let Some((last_frame, vb, _cap)) = self.vb_cache.get(&vb_addr) {
+            if *last_frame == current_frame {
+                return Ok(vb.clone());
+            }
+        }
+
+        let mut vb_desc = windows::Win32::Graphics::Direct3D9::D3DVERTEXBUFFER_DESC::default();
+        let mut p_vb_data: *mut c_void = null_mut();
+        unsafe {
+            vb9.GetDesc(&mut vb_desc)?;
+            if vb_desc.Size == 0 {
+                return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+            }
+            vb9.Lock(0, vb_desc.Size, &mut p_vb_data, windows::Win32::Graphics::Direct3D9::D3DLOCK_READONLY as u32)?;
+            if p_vb_data.is_null() {
+                let _ = vb9.Unlock();
+                return Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER));
+            }
+
+            let size = vb_desc.Size as usize;
+            let slice = std::slice::from_raw_parts(p_vb_data as *const u8, size);
+
+            let (buf, cap) = if let Some((_, existing_buf, cap)) = self.vb_cache.get(&vb_addr) {
+                if *cap >= size {
+                    (existing_buf.clone(), *cap)
+                } else {
+                    let new_cap = size.next_power_of_two().max(65536);
+                    let desc = D3D11_BUFFER_DESC {
+                        ByteWidth: new_cap as u32,
+                        Usage: D3D11_USAGE_DYNAMIC,
+                        BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+                        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                        ..Default::default()
+                    };
+                    let new_buf = self.create_buffer(&desc, None)?;
+                    (new_buf, new_cap)
+                }
+            } else {
+                let new_cap = size.next_power_of_two().max(65536);
+                let desc = D3D11_BUFFER_DESC {
+                    ByteWidth: new_cap as u32,
+                    Usage: D3D11_USAGE_DYNAMIC,
+                    BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                    ..Default::default()
+                };
+                let new_buf = self.create_buffer(&desc, None)?;
+                (new_buf, new_cap)
+            };
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(&buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), mapped.pData as *mut u8, size);
+            self.context.Unmap(&buf, 0);
+
+            let _ = vb9.Unlock();
+            self.vb_cache.insert(vb_addr, (current_frame, buf.clone(), cap));
+            Ok(buf)
+        }
     }
 
     /// Obtains or creates an ID3D11InputLayout matching the Vertex Shader and MMD vertex stride.

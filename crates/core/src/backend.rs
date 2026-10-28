@@ -180,6 +180,11 @@ pub fn on_begin_scene(_device: *mut c_void) {
 }
 
 pub fn on_end_scene(device: *mut c_void) {
+    if let Ok(mut guard) = GLOBAL_D3D11.lock() {
+        if let Some(ref mut ctx) = *guard {
+            ctx.frame_counter = ctx.frame_counter.wrapping_add(1);
+        }
+    }
     crate::ui::ensure_ui_injected();
     static SYNC_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if SYNC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60 == 0 {
