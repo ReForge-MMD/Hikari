@@ -317,15 +317,26 @@ impl ProxyDevice9 {
     unsafe fn alloc(real: *mut c_void) -> *mut c_void {
         static VTBL: OnceLock<[usize; 119]> = OnceLock::new();
         let vtbl = VTBL.get_or_init(|| build_proxy_vtbl());
+        PROXY_VTBL_ADDR.store(vtbl.as_ptr() as usize, std::sync::atomic::Ordering::SeqCst);
         let proxy = Box::new(ProxyDevice9 { vtbl, real });
         Box::into_raw(proxy) as *mut c_void
     }
 }
 
+static PROXY_VTBL_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Dereference the real device pointer from a proxy `this`.
 #[inline(always)]
 unsafe fn real_dev(this: *mut c_void) -> *mut c_void {
-    (*(this as *const ProxyDevice9)).real
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let vtbl_ptr = *(this as *const usize);
+    if vtbl_ptr == PROXY_VTBL_ADDR.load(std::sync::atomic::Ordering::Relaxed) {
+        (*(this as *const ProxyDevice9)).real
+    } else {
+        this
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -397,11 +408,13 @@ fn build_proxy_vtbl() -> [usize; 119] {
     slots[0]   = proxy_QueryInterface        as usize;
     slots[1]   = proxy_AddRef                as usize;
     slots[2]   = proxy_Release               as usize;
+    slots[16]  = proxy_Reset                 as usize;
     slots[17]  = proxy_Present               as usize;
     slots[37]  = proxy_SetRenderTarget       as usize;
     slots[41]  = proxy_BeginScene            as usize;
     slots[42]  = proxy_EndScene              as usize;
     slots[43]  = proxy_Clear                 as usize;
+    slots[44]  = proxy_SetTransform          as usize;
     slots[47]  = proxy_SetViewport           as usize;
     slots[57]  = proxy_SetRenderState        as usize;
     slots[65]  = proxy_SetTexture            as usize;
@@ -428,6 +441,20 @@ unsafe extern "system" fn proxy_QueryInterface(
     riid: *const windows::core::GUID,
     ppv: *mut *mut c_void,
 ) -> HRESULT {
+    if ppv.is_null() || riid.is_null() {
+        return windows::Win32::Foundation::E_POINTER;
+    }
+
+    const IID_IUNKNOWN: windows::core::GUID = windows::core::GUID::from_u128(0x00000000_0000_0000_c000_000000000046);
+    const IID_IDIRECT3DDEVICE9: windows::core::GUID = windows::core::GUID::from_u128(0xd0223b96_bf7a_43fd_92bd_a43b0d82b9eb);
+
+    let guid = *riid;
+    if guid == IID_IDIRECT3DDEVICE9 || guid == IID_IUNKNOWN {
+        proxy_AddRef(this);
+        *ppv = this;
+        return windows::Win32::Foundation::S_OK;
+    }
+
     type F = unsafe extern "system" fn(*mut c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[0]);
     f(real_dev(this), riid, ppv)
@@ -453,6 +480,27 @@ unsafe extern "system" fn proxy_Release(this: *mut c_void) -> u32 {
 // ---------------------------------------------------------------------------
 // Intercepted device methods — typed stubs that call hooks then forward.
 // ---------------------------------------------------------------------------
+
+unsafe extern "system" fn proxy_Reset(
+    this: *mut c_void,
+    p_presentation_parameters: *mut c_void,
+) -> HRESULT {
+    hikari_core::log_msg("[d3d9] Pre-Reset: releasing D3D9 default-pool resources");
+    hikari_core::backend::on_device_reset_pre();
+
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[16]);
+    let hr = f(real_dev(this), p_presentation_parameters);
+
+    if hr.is_ok() {
+        hikari_core::log_msg("[d3d9] Post-Reset: reinitializing composite pipeline");
+        hikari_core::backend::on_device_reset_post(real_dev(this), p_presentation_parameters);
+    } else {
+        hikari_core::log_msg(&format!("[d3d9] Reset returned failure: {:?}", hr));
+    }
+
+    hr
+}
 
 unsafe extern "system" fn proxy_Present(
     this: *mut c_void,
@@ -503,6 +551,17 @@ unsafe extern "system" fn proxy_Clear(
     type F = unsafe extern "system" fn(*mut c_void, u32, *const c_void, u32, u32, f32, u32) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[43]);
     f(real_dev(this), count, p_rects, flags, color, z, stencil)
+}
+
+unsafe extern "system" fn proxy_SetTransform(
+    this: *mut c_void,
+    state: u32,
+    p_matrix: *const f32,
+) -> HRESULT {
+    hikari_core::backend::on_set_transform(state, p_matrix);
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const f32) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_DEV_VTBL[44]);
+    f(real_dev(this), state, p_matrix)
 }
 
 unsafe extern "system" fn proxy_SetViewport(this: *mut c_void, p_viewport: *const c_void) -> HRESULT {
@@ -556,36 +615,31 @@ unsafe extern "system" fn proxy_SetSamplerState(
     f(real_dev(this), sampler, state, value)
 }
 
+static BOUND_VERTEX_SHADER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BOUND_PIXEL_SHADER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BOUND_TEXTURE_0: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 static DRAW_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 unsafe fn log_d3d9_draw_state(dev: *mut c_void, call_name: &str, prim_type: u32, count: u32) {
     let n = DRAW_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < 40 || n % 1000 == 0 {
-        let mut ps: *mut c_void = std::ptr::null_mut();
-        let mut vs: *mut c_void = std::ptr::null_mut();
-        let mut tex0: *mut c_void = std::ptr::null_mut();
+        let ps = BOUND_PIXEL_SHADER.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+        let vs = BOUND_VERTEX_SHADER.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
+        let tex0 = BOUND_TEXTURE_0.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
         let mut fvf: u32 = 0;
         let mut colorop: u32 = 0;
         let mut alphaop: u32 = 0;
         let mut blend_en: u32 = 0;
 
-        type PfnGetShader = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
-        type PfnGetTex = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
         type PfnGetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, *mut u32) -> HRESULT;
         type PfnGetRS = unsafe extern "system" fn(*mut c_void, u32, *mut u32) -> HRESULT;
         type PfnGetFVF = unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT;
-        type PfnRelease = unsafe extern "system" fn(*mut c_void) -> u32;
 
-        let get_ps: PfnGetShader = std::mem::transmute(REAL_DEV_VTBL[108]);
-        let get_vs: PfnGetShader = std::mem::transmute(REAL_DEV_VTBL[93]);
-        let get_tex: PfnGetTex = std::mem::transmute(REAL_DEV_VTBL[64]);
         let get_tss: PfnGetTSS = std::mem::transmute(REAL_DEV_VTBL[66]);
         let get_rs: PfnGetRS = std::mem::transmute(REAL_DEV_VTBL[58]);
         let get_fvf: PfnGetFVF = std::mem::transmute(REAL_DEV_VTBL[90]);
 
-        let _ = get_ps(dev, &mut ps);
-        let _ = get_vs(dev, &mut vs);
-        let _ = get_tex(dev, 0, &mut tex0);
         let _ = get_tss(dev, 0, 1 /* COLOROP */, &mut colorop);
         let _ = get_tss(dev, 0, 4 /* ALPHAOP */, &mut alphaop);
         let _ = get_rs(dev, 27 /* ALPHABLENDENABLE */, &mut blend_en);
@@ -594,17 +648,6 @@ unsafe fn log_d3d9_draw_state(dev: *mut c_void, call_name: &str, prim_type: u32,
         hikari_core::log_msg(&format!(
             "[{call_name} #{n}] type={prim_type} prims={count} fvf=0x{fvf:X} ps={ps:p} vs={vs:p} tex0={tex0:p} colorop={colorop} alphaop={alphaop} blend={blend_en}"
         ));
-
-        let release = |p: *mut c_void| {
-            if !p.is_null() {
-                let v = *(p as *const *const usize);
-                let rel: PfnRelease = std::mem::transmute(*v.add(2));
-                rel(p);
-            }
-        };
-        release(ps);
-        release(vs);
-        release(tex0);
     }
 }
 
@@ -612,56 +655,46 @@ unsafe fn log_d3d9_draw_state(dev: *mut c_void, call_name: &str, prim_type: u32,
 /// In D3D9, if COLOROP is D3DTOP_DISABLE (1) on stage 0, all stage outputs (including cascade stages)
 /// are completely disabled and the rasterizer emits only untextured vertex diffuse color.
 unsafe fn ensure_fixed_function_stage0(dev: *mut c_void) {
-    type PfnGetShader = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
-    type PfnGetTex = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
+    if dev.is_null() {
+        return;
+    }
+    // If a programmable pixel shader is active, fixed-function stage 0 state does not apply.
+    if BOUND_PIXEL_SHADER.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        return;
+    }
+    // Only restore modulation if a texture is bound to stage 0.
+    let tex0 = BOUND_TEXTURE_0.load(std::sync::atomic::Ordering::Relaxed);
+    if tex0 == 0 {
+        return;
+    }
+
     type PfnGetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, *mut u32) -> HRESULT;
     type PfnSetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
-    type PfnRelease = unsafe extern "system" fn(*mut c_void) -> u32;
 
-    let get_ps: PfnGetShader = std::mem::transmute(REAL_DEV_VTBL[108]);
-    let mut ps: *mut c_void = std::ptr::null_mut();
-    let _ = get_ps(dev, &mut ps);
+    let get_tss: PfnGetTSS = std::mem::transmute(REAL_DEV_VTBL[66]);
+    let set_tss: PfnSetTSS = std::mem::transmute(REAL_DEV_VTBL[67]);
 
-    if ps.is_null() {
-        let get_tex: PfnGetTex = std::mem::transmute(REAL_DEV_VTBL[64]);
-        let mut tex0: *mut c_void = std::ptr::null_mut();
-        let _ = get_tex(dev, 0, &mut tex0);
+    let mut colorop = 0u32;
+    let mut alphaop = 0u32;
+    let _ = get_tss(dev, 0, 1 /* D3DTSS_COLOROP */, &mut colorop);
+    let _ = get_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, &mut alphaop);
 
-        if !tex0.is_null() {
-            let get_tss: PfnGetTSS = std::mem::transmute(REAL_DEV_VTBL[66]);
-            let set_tss: PfnSetTSS = std::mem::transmute(REAL_DEV_VTBL[67]);
+    if colorop == 1 /* D3DTOP_DISABLE */ || alphaop == 1 /* D3DTOP_DISABLE */ {
+        // Restore standard fixed-function stage 0 modulation
+        let _ = set_tss(dev, 0, 1 /* D3DTSS_COLOROP */, 4 /* D3DTOP_MODULATE */);
+        let _ = set_tss(dev, 0, 2 /* D3DTSS_COLORARG1 */, 2 /* D3DTA_TEXTURE */);
+        let _ = set_tss(dev, 0, 3 /* D3DTSS_COLORARG2 */, 0 /* D3DTA_DIFFUSE */);
+        let _ = set_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, 4 /* D3DTOP_MODULATE */);
+        let _ = set_tss(dev, 0, 5 /* D3DTSS_ALPHAARG1 */, 2 /* D3DTA_TEXTURE */);
+        let _ = set_tss(dev, 0, 6 /* D3DTSS_ALPHAARG2 */, 0 /* D3DTA_DIFFUSE */);
 
-            let mut colorop = 0u32;
-            let mut alphaop = 0u32;
-            let _ = get_tss(dev, 0, 1 /* D3DTSS_COLOROP */, &mut colorop);
-            let _ = get_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, &mut alphaop);
-
-            if colorop == 1 /* D3DTOP_DISABLE */ || alphaop == 1 /* D3DTOP_DISABLE */ {
-                // Restore standard fixed-function stage 0 modulation
-                let _ = set_tss(dev, 0, 1 /* D3DTSS_COLOROP */, 4 /* D3DTOP_MODULATE */);
-                let _ = set_tss(dev, 0, 2 /* D3DTSS_COLORARG1 */, 2 /* D3DTA_TEXTURE */);
-                let _ = set_tss(dev, 0, 3 /* D3DTSS_COLORARG2 */, 0 /* D3DTA_DIFFUSE */);
-                let _ = set_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, 4 /* D3DTOP_MODULATE */);
-                let _ = set_tss(dev, 0, 5 /* D3DTSS_ALPHAARG1 */, 2 /* D3DTA_TEXTURE */);
-                let _ = set_tss(dev, 0, 6 /* D3DTSS_ALPHAARG2 */, 0 /* D3DTA_DIFFUSE */);
-
-                static RESTORE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                let n = RESTORE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 {
-                    hikari_core::log_msg(&format!(
-                        "[FixedFunction] Restored stage 0 COLOROP/ALPHAOP from ({colorop}, {alphaop}) to MODULATE for tex0={tex0:p}"
-                    ));
-                }
-            }
-
-            let v = *(tex0 as *const *const usize);
-            let rel: PfnRelease = std::mem::transmute(*v.add(2));
-            rel(tex0);
+        static RESTORE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = RESTORE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 10 {
+            hikari_core::log_msg(&format!(
+                "[FixedFunction] Restored stage 0 COLOROP/ALPHAOP from ({colorop}, {alphaop}) to MODULATE for tex0=0x{tex0:X}"
+            ));
         }
-    } else {
-        let v = *(ps as *const *const usize);
-        let rel: PfnRelease = std::mem::transmute(*v.add(2));
-        rel(ps);
     }
 }
 
@@ -670,6 +703,9 @@ unsafe extern "system" fn proxy_SetTexture(
     stage: u32,
     p_texture: *mut c_void,
 ) -> HRESULT {
+    if stage == 0 {
+        BOUND_TEXTURE_0.store(p_texture as usize, std::sync::atomic::Ordering::Relaxed);
+    }
     hikari_core::backend::on_set_texture(stage, p_texture as usize);
     let dev = real_dev(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> HRESULT;
@@ -753,6 +789,7 @@ unsafe extern "system" fn proxy_SetVertexShader(
     this: *mut c_void,
     p_shader: *mut c_void,
 ) -> HRESULT {
+    BOUND_VERTEX_SHADER.store(p_shader as usize, std::sync::atomic::Ordering::Relaxed);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[92]);
     f(real_dev(this), p_shader)
@@ -782,6 +819,7 @@ unsafe extern "system" fn proxy_SetPixelShader(
     this: *mut c_void,
     p_shader: *mut c_void,
 ) -> HRESULT {
+    BOUND_PIXEL_SHADER.store(p_shader as usize, std::sync::atomic::Ordering::Relaxed);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[107]);
     f(real_dev(this), p_shader)

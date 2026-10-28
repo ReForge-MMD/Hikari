@@ -38,12 +38,13 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DYNAMIC, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT,
-    DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_UINT, DXGI_FORMAT_R32_FLOAT,
-    DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-    DXGI_ALPHA_MODE_IGNORE,
-    DXGI_FORMAT_UNKNOWN, DXGI_MODE_SCALING_UNSPECIFIED,
-    DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM,
+    DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_UINT,
+    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
+    DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_UNKNOWN,
+    DXGI_MODE_SCALING_UNSPECIFIED, DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
+    DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIFactory2, IDXGISwapChain,
@@ -1172,8 +1173,10 @@ float4 BlitPS(VOut input) : SV_Target {
             }
         }
 
-        let tex9: windows::Win32::Graphics::Direct3D9::IDirect3DTexture9 = unsafe {
-            std::mem::transmute(tex9_ptr)
+        let tex9 = unsafe {
+            std::mem::ManuallyDrop::new(
+                windows::Win32::Graphics::Direct3D9::IDirect3DTexture9::from_raw(tex9_ptr)
+            )
         };
         let mut desc = windows::Win32::Graphics::Direct3D9::D3DSURFACE_DESC::default();
         let mut locked_rect = windows::Win32::Graphics::Direct3D9::D3DLOCKED_RECT::default();
@@ -1181,32 +1184,87 @@ float4 BlitPS(VOut input) : SV_Target {
         unsafe {
             tex9.GetLevelDesc(0, &mut desc)?;
             stage("getdesc", format!("{:?} {}x{}", desc.Format, desc.Width, desc.Height));
-            tex9.LockRect(0, &mut locked_rect, null_mut(), 0)?;
+            tex9.LockRect(
+                0,
+                &mut locked_rect,
+                null_mut(),
+                windows::Win32::Graphics::Direct3D9::D3DLOCK_READONLY as u32,
+            )?;
             stage("lock", format!("pitch={}", locked_rect.Pitch));
+
+            if locked_rect.pBits.is_null() {
+                let _ = tex9.UnlockRect(0);
+                return Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER));
+            }
+
             let width = desc.Width.max(1);
             let height = desc.Height.max(1);
             let pitch = locked_rect.Pitch as usize;
-            let row_bytes = width as usize * 4;
-            // Copy CPU-side and release the D3D9 lock BEFORE touching D3D11:
-            // cross-API lock nesting has crashed some driver stacks.
-            let mut cpu: Vec<u8> = vec![0u8; row_bytes * height as usize];
-            for y in 0..height as usize {
+
+            let fmt_val = desc.Format.0 as u32;
+            let (dxgi_fmt, row_bytes, num_rows) = match fmt_val {
+                // D3DFMT_A8R8G8B8 (21) | D3DFMT_X8R8G8B8 (22)
+                21 | 22 => (
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    width as usize * 4,
+                    height as usize,
+                ),
+                // D3DFMT_A8 (28)
+                28 => (
+                    DXGI_FORMAT_R8_UNORM,
+                    width as usize,
+                    height as usize,
+                ),
+                // D3DFMT_DXT1 (0x31545844)
+                0x31545844 => {
+                    let block_w = (width as usize + 3) / 4;
+                    let block_h = (height as usize + 3) / 4;
+                    (DXGI_FORMAT_BC1_UNORM, block_w * 8, block_h)
+                }
+                // D3DFMT_DXT2 / DXT3 (0x32545844, 0x33545844)
+                0x32545844 | 0x33545844 => {
+                    let block_w = (width as usize + 3) / 4;
+                    let block_h = (height as usize + 3) / 4;
+                    (DXGI_FORMAT_BC2_UNORM, block_w * 16, block_h)
+                }
+                // D3DFMT_DXT4 / DXT5 (0x34545844, 0x35545844)
+                0x34545844 | 0x35545844 => {
+                    let block_w = (width as usize + 3) / 4;
+                    let block_h = (height as usize + 3) / 4;
+                    (DXGI_FORMAT_BC3_UNORM, block_w * 16, block_h)
+                }
+                // D3DFMT_A8B8G8R8 (32)
+                32 => (
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    width as usize * 4,
+                    height as usize,
+                ),
+                // Fallback: 32-bit BGRA
+                _ => (
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    width as usize * 4,
+                    height as usize,
+                ),
+            };
+
+            let copy_row_bytes = row_bytes.min(pitch);
+            let mut cpu: Vec<u8> = vec![0u8; row_bytes * num_rows];
+            for y in 0..num_rows {
                 let src = std::slice::from_raw_parts(
                     (locked_rect.pBits as *const u8).add(y * pitch),
-                    row_bytes,
+                    copy_row_bytes,
                 );
-                cpu[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(src);
+                cpu[y * row_bytes..y * row_bytes + copy_row_bytes].copy_from_slice(src);
             }
             let _ = tex9.UnlockRect(0);
             stage("unlock_copied", format!("{} bytes", cpu.len()));
-            std::mem::forget(tex9); // Do not release MMD's texture!
 
             let tex_desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Format: dxgi_fmt,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
@@ -1215,7 +1273,7 @@ float4 BlitPS(VOut input) : SV_Target {
             let subresource = D3D11_SUBRESOURCE_DATA {
                 pSysMem: cpu.as_ptr() as *const c_void,
                 SysMemPitch: row_bytes as u32,
-                SysMemSlicePitch: (row_bytes * height as usize) as u32,
+                SysMemSlicePitch: (row_bytes * num_rows) as u32,
             };
             let mut d3d11_tex = None;
             let mut srv_opt = None;

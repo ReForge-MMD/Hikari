@@ -28,12 +28,146 @@ pub fn on_device_created(device: *mut c_void, hwnd: HWND) {
             Ok(ctx) => {
                 crate::log_msg("[backend] D3D11Context created successfully");
                 *d3d11_lock = Some(ctx);
+                crate::ui::init_ui(hwnd);
             }
             Err(e) => {
                 crate::log_msg(&format!("[backend] Failed to create D3D11Context: {:?}", e));
             }
         }
+    } else {
+        crate::ui::init_ui(hwnd);
     }
+}
+
+pub fn on_device_reset_pre() {
+    crate::vtable::release_d3d9_resources();
+}
+
+pub fn on_device_reset_post(device: *mut c_void, _params: *mut c_void) {
+    unsafe {
+        crate::vtable::register_d3d9_device(device);
+        crate::vtable::ensure_composite_targets_initialized(device);
+    }
+}
+
+pub static CURRENT_WORLD_MATRIX: Mutex<[f32; 16]> = Mutex::new([
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+]);
+pub static CURRENT_VIEW_MATRIX: Mutex<[f32; 16]> = Mutex::new([
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+]);
+pub static CURRENT_PROJ_MATRIX: Mutex<[f32; 16]> = Mutex::new([
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+]);
+
+pub fn on_set_transform(state: u32, matrix_ptr: *const f32) {
+    if matrix_ptr.is_null() {
+        return;
+    }
+    let mut mat = [0.0f32; 16];
+    unsafe {
+        std::ptr::copy_nonoverlapping(matrix_ptr, mat.as_mut_ptr(), 16);
+    }
+    match state {
+        2 => *CURRENT_VIEW_MATRIX.lock().unwrap() = mat,
+        3 => *CURRENT_PROJ_MATRIX.lock().unwrap() = mat,
+        256..=511 => *CURRENT_WORLD_MATRIX.lock().unwrap() = mat,
+        _ => {}
+    }
+}
+
+fn mul_mat4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    let mut r = [0.0f32; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            let mut sum = 0.0f32;
+            for k in 0..4 {
+                sum += a[row * 4 + k] * b[k * 4 + col];
+            }
+            r[row * 4 + col] = sum;
+        }
+    }
+    r
+}
+
+pub fn update_effect_standard_matrices(eff: &mut crate::effect::HikariEffect) {
+    let w = *CURRENT_WORLD_MATRIX.lock().unwrap();
+    let v = *CURRENT_VIEW_MATRIX.lock().unwrap();
+    let p = *CURRENT_PROJ_MATRIX.lock().unwrap();
+    let wv = mul_mat4(&w, &v);
+    let wvp = mul_mat4(&wv, &p);
+
+    let mut write_mat = |sem: &str, alt_names: &[&str], mat: &[f32; 16]| {
+        let idx_opt = eff.param_by_semantic.get(sem)
+            .copied()
+            .or_else(|| {
+                for name in alt_names {
+                    if let Some(&idx) = eff.param_by_name.get(&name.to_lowercase()) {
+                        return Some(idx);
+                    }
+                }
+                None
+            });
+        if let Some(idx) = idx_opt {
+            let param = &eff.parameters[idx];
+            if param.offset + 64 <= eff.constant_data.len() {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(mat.as_ptr() as *const u8, 64)
+                };
+                eff.constant_data[param.offset..param.offset + 64].copy_from_slice(slice);
+                eff.constant_dirty = true;
+            }
+        }
+    };
+
+    write_mat("WORLD", &["World", "WorldMatrix"], &w);
+    write_mat("VIEW", &["View", "ViewMatrix"], &v);
+    write_mat("PROJECTION", &["Projection", "Proj", "ProjMatrix"], &p);
+    write_mat("WORLDVIEW", &["WorldView", "WorldViewMatrix"], &wv);
+    write_mat("WORLDVIEWPROJECTION", &["WorldViewProj", "WorldViewProjection", "wvp"], &wvp);
+
+    // Compute CameraPosition from View matrix
+    let cam_x = -(v[12] * v[0] + v[13] * v[4] + v[14] * v[8]);
+    let cam_y = -(v[12] * v[1] + v[13] * v[5] + v[14] * v[9]);
+    let cam_z = -(v[12] * v[2] + v[13] * v[6] + v[14] * v[10]);
+    let cam_pos = [cam_x, cam_y, cam_z, 1.0f32];
+
+    let mut write_vec4 = |sem: &str, alt_names: &[&str], vec: &[f32; 4]| {
+        let idx_opt = eff.param_by_semantic.get(sem)
+            .copied()
+            .or_else(|| {
+                for name in alt_names {
+                    if let Some(&idx) = eff.param_by_name.get(&name.to_lowercase()) {
+                        return Some(idx);
+                    }
+                }
+                None
+            });
+        if let Some(idx) = idx_opt {
+            let param = &eff.parameters[idx];
+            if param.offset + 16 <= eff.constant_data.len() {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(vec.as_ptr() as *const u8, 16)
+                };
+                eff.constant_data[param.offset..param.offset + 16].copy_from_slice(slice);
+                eff.constant_dirty = true;
+            }
+        }
+    };
+
+    write_vec4("POSITION", &["CameraPosition", "CameraPos"], &cam_pos);
+    write_vec4("CAMERAPOSITION", &["CameraPosition", "CameraPos"], &cam_pos);
+    write_vec4("DIRECTION", &["LightDirection", "LightDir"], &[0.5, 1.0, -0.5, 0.0]);
+    write_vec4("LIGHTDIRECTION", &["LightDirection", "LightDir"], &[0.5, 1.0, -0.5, 0.0]);
 }
 
 pub fn on_begin_scene(_device: *mut c_void) {
@@ -41,7 +175,15 @@ pub fn on_begin_scene(_device: *mut c_void) {
 }
 
 pub fn on_end_scene(device: *mut c_void) {
+    crate::ui::ensure_ui_injected();
+    static SYNC_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SYNC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60 == 0 {
+        if let Ok(mut reg) = crate::effect::ASSIGNMENT_REGISTRY.lock() {
+            reg.sync_host_objects();
+        }
+    }
     unsafe {
+        crate::vtable::ensure_composite_targets_initialized(device);
         execute_dx11_composite(device);
     }
 }
@@ -92,8 +234,10 @@ pub fn on_set_indices(ptr: usize) {
 }
 
 pub fn should_render_dx11() -> bool {
-    crate::effect::ACTIVE_EFFECT_PASS.lock().unwrap().is_some()
+    crate::effect::HAS_ASSIGNED_EFFECTS.load(std::sync::atomic::Ordering::Relaxed)
+        || crate::effect::ACTIVE_EFFECT_PASS.lock().unwrap().is_some()
         || ACTIVE_EFFECT.lock().unwrap().is_some()
+        || crate::effect::EFFECT_REGISTRY.lock().unwrap().iter().any(|e| e.enabled)
 }
 
 pub fn on_draw_indexed_primitive_dx11(

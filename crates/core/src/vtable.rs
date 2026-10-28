@@ -24,6 +24,33 @@ pub static BOUND_IB: Mutex<Option<usize>> = Mutex::new(None);
 pub static BOUND_TEXTURES: Mutex<[Option<usize>; 8]> = Mutex::new([None; 8]);
 pub static ACTIVE_RENDER_TARGETS: Mutex<[Option<usize>; 4]> = Mutex::new([None; 4]);
 pub static ACTIVE_DEPTH_STENCIL: Mutex<Option<usize>> = Mutex::new(None);
+
+pub struct TexPair {
+    pub sys_tex: Direct3D9::IDirect3DTexture9,
+    pub gpu_tex: Option<Direct3D9::IDirect3DTexture9>,
+    pub format: D3DFORMAT,
+    pub size: (u32, u32),
+}
+
+unsafe impl Send for TexPair {}
+unsafe impl Sync for TexPair {}
+
+pub static TEX_PAIR: Mutex<Option<TexPair>> = Mutex::new(None);
+
+pub fn release_d3d9_resources() {
+    crate::log_msg("[vtable] release_d3d9_resources: dropping D3D9 default-pool surfaces");
+    *TEX_PAIR.lock().unwrap() = None;
+    *BOUND_VB.lock().unwrap() = None;
+    *BOUND_IB.lock().unwrap() = None;
+    *BOUND_TEXTURES.lock().unwrap() = [None; 8];
+    *ACTIVE_RENDER_TARGETS.lock().unwrap() = [None; 4];
+    *ACTIVE_DEPTH_STENCIL.lock().unwrap() = None;
+    if let Ok(mut guard) = GLOBAL_D3D11.lock() {
+        if let Some(ref mut ctx) = *guard {
+            ctx.texture_cache.clear();
+        }
+    }
+}
 static DRAW_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static DRAW_SUCCESS_LOGGED: AtomicBool = AtomicBool::new(false);
 static DRAW_WAIT_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -245,10 +272,8 @@ fn destroy_overlay_window() {
 
 fn clear_frame_targets_once(ctx: &D3D11Context) {
     if !DX11_FRAME_CLEARED.swap(true, Ordering::AcqRel) {
-        // The D3D11 depth texture is private to Hikari and must be initialized
-        // before the first model draw. Flip-discard also requires a defined
-        // backbuffer for every presented frame.
-        ctx.clear([0.0, 0.0, 0.0, 1.0], 1.0, 0);
+        // Transparent black (alpha = 0.0) so untouched pixels let the native MMD scene show through
+        ctx.clear([0.0, 0.0, 0.0, 0.0], 1.0, 0);
         if !FRAME_CLEAR_LOGGED.swap(true, Ordering::Relaxed) {
             crate::log_msg("Cleared DX11 overlay color/depth targets before the first model draw");
         }
@@ -445,11 +470,11 @@ static D3D9_DEVICE: Mutex<Option<usize>> = Mutex::new(None);
 static COMPOSITE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Obtains the real in-process D3D9 device through a captured D3D9 resource.
-unsafe fn resolve_d3d9_device() -> Option<Direct3D9::IDirect3DDevice9> {
+unsafe fn resolve_d3d9_device() -> Option<std::mem::ManuallyDrop<Direct3D9::IDirect3DDevice9>> {
     let cached = *D3D9_DEVICE.lock().unwrap();
     if let Some(addr) = cached {
         if addr != 0 {
-            return Some(std::mem::transmute(addr));
+            return Some(std::mem::ManuallyDrop::new(std::mem::transmute(addr)));
         }
     }
     let vb_addr = match *BOUND_VB.lock().unwrap() {
@@ -468,7 +493,7 @@ unsafe fn resolve_d3d9_device() -> Option<Direct3D9::IDirect3DDevice9> {
     std::mem::forget(device);
     if address != 0 {
         *D3D9_DEVICE.lock().unwrap() = Some(address);
-        Some(std::mem::transmute(address))
+        Some(std::mem::ManuallyDrop::new(std::mem::transmute(address)))
     } else {
         None
     }
@@ -517,23 +542,13 @@ unsafe extern "system" fn hook_end_scene(this: *mut c_void) -> HRESULT {
         // Static reusable D3D9 textures: the system-memory staging texture the
         // DX11 model layer is copied into, and the DEFAULT-pool texture the
         // native device samples for the overlay quad.
-        struct TexPair {
-            sys_tex: Direct3D9::IDirect3DTexture9,
-            gpu_tex: Option<Direct3D9::IDirect3DTexture9>,
-            format: D3DFORMAT,
-            size: (u32, u32),
-        }
-        thread_local! {
-            static TEX_PAIR: std::sync::Mutex<Option<TexPair>> =
-                const { std::sync::Mutex::new(None) };
-        }
-        let rebuild = TEX_PAIR.with(|cell| {
-            let slot = cell.lock().unwrap();
+        let rebuild = {
+            let slot = TEX_PAIR.lock().unwrap();
             match slot.as_ref() {
                 Some(pair) => pair.size != (w, h) || pair.format != desc.Format,
                 None => true,
             }
-        });
+        };
         if rebuild {
             log_wheel("create_sys_tex", format!("{}x{} fmt=0x{:X} sysmem", w, h, desc.Format.0));
             let mut sys_tex: Option<Direct3D9::IDirect3DTexture9> = None;
@@ -549,18 +564,16 @@ unsafe extern "system" fn hook_end_scene(this: *mut c_void) -> HRESULT {
             ).map_err(|e| format!("CreateTexture(gpu) failed: {e}"))?;
             let gpu_tex = gpu_tex.ok_or("CreateTexture returned none")?;
             log_wheel("textures_created", format!("sys={:p} gpu={:p}", sys_tex.as_raw(), gpu_tex.as_raw()));
-            TEX_PAIR.with(|cell| {
-                *cell.lock().unwrap() = Some(TexPair {
-                    sys_tex,
-                    gpu_tex: Some(gpu_tex),
-                    format: desc.Format,
-                    size: (w, h),
-                });
+            *TEX_PAIR.lock().unwrap() = Some(TexPair {
+                sys_tex,
+                gpu_tex: Some(gpu_tex),
+                format: desc.Format,
+                size: (w, h),
             });
             log_wheel("texpair_commit", String::new());
         }
-        let (sys_tex, gpu_tex) = TEX_PAIR.with(|cell| {
-            let slot = cell.lock().unwrap();
+        let (sys_tex, gpu_tex) = {
+            let slot = TEX_PAIR.lock().unwrap();
             match slot.as_ref() {
                 Some(pair) => {
                     let gpu = pair.gpu_tex.clone().ok_or("gpu texture missing".to_string())?;
@@ -568,7 +581,7 @@ unsafe extern "system" fn hook_end_scene(this: *mut c_void) -> HRESULT {
                 }
                 None => Err("texture pair missing".to_string()),
             }
-        })?;
+        }?;
         log_wheel("texpair_fetch", String::new());
 
     // 1. Read back the DX11 model layer (transparent background, model
@@ -617,6 +630,8 @@ unsafe extern "system" fn hook_end_scene(this: *mut c_void) -> HRESULT {
         }
         Ok(())
     });
+
+    DX11_FRAME_CLEARED.store(false, Ordering::Release);
 
     match outcome {
         Ok(()) => {
@@ -684,6 +699,7 @@ unsafe fn draw_model_layer_d3d9(
         D3DRS_ZENABLE, D3DRS_LIGHTING, D3DRS_CLIPPING,
         D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA,
         D3DTSS_ALPHAOP, D3DTSS_COLOROP, D3DTOP_SELECTARG1,
+        D3DTSS_COLORARG1, D3DTSS_ALPHAARG1, D3DTA_TEXTURE,
         D3DFVF_XYZRHW, D3DFVF_TEX1, D3DPT_TRIANGLELIST,
     };
 
@@ -722,12 +738,21 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::GetRenderState(device, D3DRS_DESTBLEND, &mut rs_dst).ok();
     let mut ts_color = 0u32;
     Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 0, D3DTSS_COLOROP, &mut ts_color).ok();
+    let mut ts_color_arg1 = 0u32;
+    Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 0, D3DTSS_COLORARG1, &mut ts_color_arg1).ok();
     let mut ts_alpha = 0u32;
     Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 0, D3DTSS_ALPHAOP, &mut ts_alpha).ok();
+    let mut ts_alpha_arg1 = 0u32;
+    Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 0, D3DTSS_ALPHAARG1, &mut ts_alpha_arg1).ok();
     let mut old_fvf = 0u32;
     Direct3D9::IDirect3DDevice9::GetFVF(device, &mut old_fvf).ok();
+    let old_decl = Direct3D9::IDirect3DDevice9::GetVertexDeclaration(device).ok();
     let old_tex = Direct3D9::IDirect3DDevice9::GetTexture(device, 0).ok();
+    let old_vs = Direct3D9::IDirect3DDevice9::GetVertexShader(device).ok();
+    let old_ps = Direct3D9::IDirect3DDevice9::GetPixelShader(device).ok();
 
+    Direct3D9::IDirect3DDevice9::SetVertexShader(device, None).ok();
+    Direct3D9::IDirect3DDevice9::SetPixelShader(device, None).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_ZENABLE, 0)
         .map_err(|e| format!("SetRenderState(Z) failed: {}", e.code()))?;
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_LIGHTING, 0).ok();
@@ -738,7 +763,9 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA.0 as u32).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA.0 as u32).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1.0 as u32).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1.0 as u32).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE).ok();
 
     Direct3D9::IDirect3DDevice9::SetFVF(device, D3DFVF_XYZRHW | D3DFVF_TEX1)
         .map_err(|e| format!("SetFVF failed: {}", e.code()))?;
@@ -749,9 +776,14 @@ unsafe fn draw_model_layer_d3d9(
     ).map_err(|e| format!("DrawPrimitiveUP failed: {}", e.code()))?;
 
     // Restore the device exactly as MMD had left it.
-    Direct3D9::IDirect3DDevice9::SetTexture(device, 0, old_tex.as_ref())
-        .ok();
-    Direct3D9::IDirect3DDevice9::SetFVF(device, old_fvf).ok();
+    Direct3D9::IDirect3DDevice9::SetTexture(device, 0, old_tex.as_ref()).ok();
+    if let Some(ref decl) = old_decl {
+        Direct3D9::IDirect3DDevice9::SetVertexDeclaration(device, Some(decl)).ok();
+    } else {
+        Direct3D9::IDirect3DDevice9::SetFVF(device, old_fvf).ok();
+    }
+    Direct3D9::IDirect3DDevice9::SetVertexShader(device, old_vs.as_ref()).ok();
+    Direct3D9::IDirect3DDevice9::SetPixelShader(device, old_ps.as_ref()).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_ZENABLE, old[0]).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_LIGHTING, old[1]).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_CLIPPING, old[2]).ok();
@@ -760,7 +792,9 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_SRCBLEND, rs_src).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_DESTBLEND, rs_dst).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_COLOROP, ts_color).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_COLORARG1, ts_color_arg1).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAOP, ts_alpha).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAARG1, ts_alpha_arg1).ok();
     Ok(())
 }
 
@@ -1422,7 +1456,10 @@ unsafe extern "system" fn hook_draw_primitive(
 
     let pass_info = match active_pass {
         Some(p) => p,
-        None => return,
+        None => match crate::effect::get_active_direct_effect_pass() {
+            Some(p) => p,
+            None => return,
+        },
     };
 
     let mut guard = GLOBAL_D3D11.lock().unwrap();
@@ -1449,7 +1486,11 @@ unsafe extern "system" fn hook_draw_primitive(
     let mut vb_desc = windows::Win32::Graphics::Direct3D9::D3DVERTEXBUFFER_DESC::default();
     let mut p_vb_data: *mut c_void = null_mut();
     let vb_bytes = unsafe {
-        if vb9.GetDesc(&mut vb_desc).is_ok() && vb9.Lock(0, vb_desc.Size, &mut p_vb_data, 0).is_ok() {
+        if vb9.GetDesc(&mut vb_desc).is_ok()
+            && vb_desc.Size > 0
+            && vb9.Lock(0, vb_desc.Size, &mut p_vb_data, Direct3D9::D3DLOCK_READONLY as u32).is_ok()
+            && !p_vb_data.is_null()
+        {
             let slice = std::slice::from_raw_parts(p_vb_data as *const u8, vb_desc.Size as usize);
             let bytes = slice.to_vec();
             let _ = vb9.Unlock();
@@ -1542,11 +1583,55 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     num_vertices: u32,
     start_index: u32,
     prim_count: u32,
-) {
+) -> bool {
     let active_pass = {
         let guard = crate::effect::ACTIVE_EFFECT_PASS.lock().unwrap();
         guard.clone()
     };
+
+    let current_obj = crate::mmd_host::get_current_object();
+    let current_mat = crate::mmd_host::get_current_material();
+    let current_tech = crate::mmd_host::get_current_technic();
+
+    // When there is no explicit MME active pass, only intercept model mesh passes:
+    // Technic == 0 means non-mesh objects (bones, bone select boxes, axis guides, UI handles).
+    // Material < 0 means no model subset is active.
+    if active_pass.is_none() && (current_tech == 0 || current_mat < 0) {
+        return false;
+    }
+
+    // Synchronize live camera and world matrices from the real D3D9 device
+    let raw_dev = if !_this.is_null() {
+        _this
+    } else {
+        resolve_d3d9_device().map(|d| d.as_raw()).unwrap_or(std::ptr::null_mut())
+    };
+    if !raw_dev.is_null() {
+        let dev = std::mem::ManuallyDrop::new(std::mem::transmute::<*mut c_void, Direct3D9::IDirect3DDevice9>(raw_dev));
+        let mut w_mat = [0.0f32; 16];
+        let mut v_mat = [0.0f32; 16];
+        let mut p_mat = [0.0f32; 16];
+
+        if dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(256), w_mat.as_mut_ptr() as *mut _).is_ok() {
+            *crate::backend::CURRENT_WORLD_MATRIX.lock().unwrap() = w_mat;
+        }
+        if dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(2), v_mat.as_mut_ptr() as *mut _).is_ok() {
+            *crate::backend::CURRENT_VIEW_MATRIX.lock().unwrap() = v_mat;
+        }
+        if dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(3), p_mat.as_mut_ptr() as *mut _).is_ok() {
+            *crate::backend::CURRENT_PROJ_MATRIX.lock().unwrap() = p_mat;
+        }
+
+        static MATRIX_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !MATRIX_LOGGED.swap(true, Ordering::Relaxed) {
+            let v = *crate::backend::CURRENT_VIEW_MATRIX.lock().unwrap();
+            let p = *crate::backend::CURRENT_PROJ_MATRIX.lock().unwrap();
+            crate::log_msg(&format!(
+                "Captured live camera from D3D9: View._11={:.3}, Proj._11={:.3}, Proj._33={:.3}",
+                v[0], p[0], p[10]
+            ));
+        }
+    }
 
     static PASS_STATE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let total = DRAW_INDEXED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1559,13 +1644,29 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
             p
         }
         None => {
-            if total % 300 == 0 {
-                let active = DRAW_INDEXED_ACTIVE.load(Ordering::Relaxed);
-                crate::log_msg(&format!(
-                    "DrawIndexedPrimitive heartbeat: total={total}, SM5-active={active}, the rest are passed through to the D3D9/MMDX11 path"
-                ));
+            if let Some(p) = crate::effect::get_assigned_effect_pass(current_obj, current_mat) {
+                DRAW_INDEXED_ACTIVE.fetch_add(1, Ordering::Relaxed);
+                if !PASS_STATE_LOG.swap(true, Ordering::Relaxed) {
+                    crate::log_msg(&format!(
+                        "hook_draw_indexed_primitive: Model/Subset assigned effect is ACTIVE (obj={current_obj}, mat={current_mat}) - intercepting and drawing on DirectX 11"
+                    ));
+                }
+                p
+            } else if let Some(p) = crate::effect::get_active_direct_effect_pass() {
+                DRAW_INDEXED_ACTIVE.fetch_add(1, Ordering::Relaxed);
+                if !PASS_STATE_LOG.swap(true, Ordering::Relaxed) {
+                    crate::log_msg("hook_draw_indexed_primitive: Direct Hikari effect is ACTIVE - intercepting and drawing on DirectX 11");
+                }
+                p
+            } else {
+                if total % 300 == 0 {
+                    let active = DRAW_INDEXED_ACTIVE.load(Ordering::Relaxed);
+                    crate::log_msg(&format!(
+                        "DrawIndexedPrimitive heartbeat: total={total}, SM5-active={active}, obj={current_obj}, mat={current_mat}, the rest are passed through to the D3D9/MMDX11 path"
+                    ));
+                }
+                return false;
             }
-            return;
         }
     };
 
@@ -1574,14 +1675,25 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         Some(c) => c,
         None => {
             log_draw_failure_once("D3D11 context is missing");
-            return;
+            return false;
         }
     };
+    if ctx.render_target_view.is_none() {
+        let device = resolve_d3d9_device();
+        if let Some(dev) = device {
+            if let Ok(back) = Direct3D9::IDirect3DDevice9::GetBackBuffer(&dev, 0, 0, Direct3D9::D3DBACKBUFFER_TYPE_MONO) {
+                let mut desc = D3DSURFACE_DESC::default();
+                if back.GetDesc(&mut desc).is_ok() && desc.Width > 0 && desc.Height > 0 {
+                    let _ = ctx.recreate_composite(desc.Width, desc.Height);
+                }
+            }
+        }
+    }
     if ctx.render_target_view.is_none() {
         if !DRAW_WAIT_LOGGED.swap(true, Ordering::Relaxed) {
             crate::log_msg("Skipping initial DrawIndexedPrimitive until the composite model target exists");
         }
-        return;
+        return false;
     }
     clear_frame_targets_once(ctx);
 
@@ -1589,7 +1701,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         Some(v) => v,
         None => {
             log_draw_failure_once("no vertex buffer was captured before the indexed draw");
-            return;
+            return false;
         }
     };
 
@@ -1597,7 +1709,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         Some(i) => i,
         None => {
             log_draw_failure_once("no index buffer was captured before the indexed draw");
-            return;
+            return false;
         }
     };
 
@@ -1607,7 +1719,11 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     let mut vb_desc = windows::Win32::Graphics::Direct3D9::D3DVERTEXBUFFER_DESC::default();
     let mut p_vb_data: *mut c_void = null_mut();
     let vb_bytes = unsafe {
-        if vb9.GetDesc(&mut vb_desc).is_ok() && vb9.Lock(0, vb_desc.Size, &mut p_vb_data, 0).is_ok() {
+        if vb9.GetDesc(&mut vb_desc).is_ok()
+            && vb_desc.Size > 0
+            && vb9.Lock(0, vb_desc.Size, &mut p_vb_data, Direct3D9::D3DLOCK_READONLY as u32).is_ok()
+            && !p_vb_data.is_null()
+        {
             let slice = std::slice::from_raw_parts(p_vb_data as *const u8, vb_desc.Size as usize);
             let bytes = slice.to_vec();
             let _ = vb9.Unlock();
@@ -1622,7 +1738,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         Some(b) => b,
         None => {
             log_draw_failure_once("failed to read the D3D9 vertex buffer");
-            return;
+            return false;
         }
     };
 
@@ -1632,8 +1748,12 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     let mut ib_desc = windows::Win32::Graphics::Direct3D9::D3DINDEXBUFFER_DESC::default();
     let mut p_ib_data: *mut c_void = null_mut();
     let (ib_bytes, is_32bit) = unsafe {
-        if ib9.GetDesc(&mut ib_desc).is_ok() && ib9.Lock(0, ib_desc.Size, &mut p_ib_data, 0).is_ok() {
-            let is_32 = ib_desc.Format == windows::Win32::Graphics::Direct3D9::D3DFMT_INDEX32;
+        if ib9.GetDesc(&mut ib_desc).is_ok()
+            && ib_desc.Size > 0
+            && ib9.Lock(0, ib_desc.Size, &mut p_ib_data, Direct3D9::D3DLOCK_READONLY as u32).is_ok()
+            && !p_ib_data.is_null()
+        {
+            let is_32 = ib_desc.Format == Direct3D9::D3DFMT_INDEX32;
             let slice = std::slice::from_raw_parts(p_ib_data as *const u8, ib_desc.Size as usize);
             let bytes = slice.to_vec();
             let _ = ib9.Unlock();
@@ -1648,7 +1768,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         Some(b) => b,
         None => {
             log_draw_failure_once("failed to read the D3D9 index buffer");
-            return;
+            return false;
         }
     };
 
@@ -1656,14 +1776,14 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         Ok(b) => b,
         Err(error) => {
             log_draw_failure_once(&format!("uploading the vertex buffer failed: {error}"));
-            return;
+            return false;
         }
     };
     let d3d11_ib = match ctx.upload_dynamic_index_buffer(&ib_bytes) {
         Ok(b) => b,
         Err(error) => {
             log_draw_failure_once(&format!("uploading the index buffer failed: {error}"));
-            return;
+            return false;
         }
     };
 
@@ -1671,7 +1791,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         Ok(l) => l,
         Err(error) => {
             log_draw_failure_once(&format!("creating the vertex input layout failed (stride {stride}): {error}"));
-            return;
+            return false;
         }
     };
 
@@ -1753,6 +1873,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     }
 
     DX11_FRAME_RENDERED.store(true, Ordering::Release);
+    true
 }
 
 fn log_draw_failure_once(message: &str) {
@@ -1821,6 +1942,33 @@ pub unsafe fn register_d3d9_device(device: *mut c_void) {
     }
 }
 
+pub unsafe fn ensure_composite_targets_initialized(device_ptr: *mut c_void) {
+    if device_ptr.is_null() {
+        return;
+    }
+    if let Ok(mut guard) = GLOBAL_D3D11.lock() {
+        if let Some(ctx) = guard.as_mut() {
+            let dev: Direct3D9::IDirect3DDevice9 = std::mem::transmute(device_ptr);
+            if let Ok(back) = dev.GetBackBuffer(0, 0, Direct3D9::D3DBACKBUFFER_TYPE_MONO) {
+                let mut desc = D3DSURFACE_DESC::default();
+                if back.GetDesc(&mut desc).is_ok() && desc.Width > 0 && desc.Height > 0 {
+                    let needs_recreate = ctx.render_target_view.is_none()
+                        || ctx.width != desc.Width
+                        || ctx.height != desc.Height;
+                    if needs_recreate {
+                        let _ = ctx.recreate_composite(desc.Width, desc.Height);
+                        crate::log_msg(&format!(
+                            "[backend] Auto-initialized D3D11 composite targets: {}x{}",
+                            desc.Width, desc.Height
+                        ));
+                    }
+                }
+            }
+            std::mem::forget(dev);
+        }
+    }
+}
+
 pub unsafe fn execute_dx11_composite(device: *mut c_void) {
     let _ = hook_end_scene(device);
 }
@@ -1834,7 +1982,6 @@ pub unsafe fn execute_dx11_draw_indexed(
     start_index: u32,
     prim_count: u32,
 ) -> bool {
-    let was_rendered = DX11_FRAME_RENDERED.load(Ordering::Relaxed);
     hook_draw_indexed_primitive(
         this,
         prim_type,
@@ -1843,6 +1990,5 @@ pub unsafe fn execute_dx11_draw_indexed(
         num_vertices,
         start_index,
         prim_count,
-    );
-    DX11_FRAME_RENDERED.load(Ordering::Relaxed) != was_rendered
+    )
 }

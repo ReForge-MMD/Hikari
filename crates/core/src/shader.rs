@@ -140,6 +140,7 @@ pub struct TechniqueDesc {
 pub struct GlobalVarDesc {
     pub name: String,
     pub semantic: String,
+    pub default_val: String,
     pub annotations: HashMap<String, String>,
 }
 
@@ -253,7 +254,7 @@ pub fn parse_global_variables(source: &str) -> Vec<GlobalVarDesc> {
 
 fn parse_single_global_var(decl: &str) -> Option<GlobalVarDesc> {
     let (prefix, rest) = decl.split_once('<')?;
-    let (anno_str, _) = rest.split_once('>')?;
+    let (anno_str, after_gt) = rest.split_once('>')?;
 
     let prefix = prefix.trim();
     let (var_part, semantic) = if let Some((v, s)) = prefix.split_once(':') {
@@ -267,9 +268,16 @@ fn parse_single_global_var(decl: &str) -> Option<GlobalVarDesc> {
         return None;
     }
 
+    let default_val = if let Some((_, val)) = after_gt.split_once('=') {
+        val.trim().trim_end_matches(';').trim().to_string()
+    } else {
+        String::new()
+    };
+
     Some(GlobalVarDesc {
         name,
         semantic,
+        default_val,
         annotations: parse_annotations_block(anno_str),
     })
 }

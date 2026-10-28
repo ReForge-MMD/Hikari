@@ -59,10 +59,9 @@ Copy-Item -LiteralPath $d3d9Src -Destination $targetD3D9 -Force
 Copy-Item -LiteralPath $coreSrc -Destination (Join-Path $MmdDir "hikari_core.dll") -Force
 Copy-Item -LiteralPath $effectsSrc -Destination (Join-Path $MmdDir "HikariEffects.dll") -Force
 
-# Copy test_model.fx to MMD root for testing
-$testFxSrc = Join-Path $projectDir "test_model.fx"
-if (Test-Path -LiteralPath $testFxSrc) {
-    Copy-Item -LiteralPath $testFxSrc -Destination (Join-Path $MmdDir "test_model.fx") -Force
+# Copy shader files to MMD root for testing
+Get-ChildItem -Path $projectDir -Filter "*.fx" | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $MmdDir $_.Name) -Force
 }
 
 Write-Host "Deploy complete! d3d9.dll, hikari_core.dll, HikariEffects.dll deployed to root of $MmdDir" -ForegroundColor Green

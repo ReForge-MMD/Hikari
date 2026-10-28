@@ -204,3 +204,28 @@ fn test_compile_model_fx_file() {
     }
 }
 
+#[test]
+fn test_compile_red_model_fx_file() {
+    let ctx = D3D11Context::new(windows::Win32::Foundation::HWND(null_mut()), 0, 0)
+        .expect("Failed to create D3D11Context");
+    let fx_path = if std::path::Path::new("red_model.fx").exists() {
+        "red_model.fx"
+    } else {
+        "../../red_model.fx"
+    };
+    let fx_content = std::fs::read_to_string(fx_path)
+        .expect("Failed to read red_model.fx");
+
+    let eff_ptr = HikariEffect::new(&fx_content, Some("red_model.fx"), &ctx)
+        .expect("HikariEffect::new should compile red_model.fx cleanly");
+    assert!(!eff_ptr.is_null());
+    unsafe {
+        let eff = &*eff_ptr;
+        assert!(eff.techniques.len() >= 2);
+        assert!(eff.param_by_name.contains_key("redcolor"));
+        assert!(eff.param_by_name.contains_key("redglow"));
+        drop(Box::from_raw(eff_ptr));
+    }
+}
+
+

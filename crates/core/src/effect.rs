@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::collections::HashSet;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows::core::{BOOL, GUID, HRESULT};
 use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
@@ -85,6 +85,30 @@ pub struct EffectAnnotation {
     pub c_val: CString,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UIWidgetKind {
+    None,
+    Slider,
+    Drag,
+    Checkbox,
+    Color,
+    Combo,
+    Input,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParameterUIDesc {
+    pub label: String,
+    pub widget: UIWidgetKind,
+    pub min: f32,
+    pub max: f32,
+    pub step: f32,
+    pub items: Vec<String>,
+    pub group: String,
+    pub help: String,
+    pub default_val: String,
+}
+
 /// Represents a parameter tracked by the effect.
 #[derive(Clone, Debug)]
 pub struct EffectParameter {
@@ -97,6 +121,7 @@ pub struct EffectParameter {
     pub offset: usize,
     pub size: usize,
     pub annotation_indices: Vec<usize>,
+    pub ui: Option<ParameterUIDesc>,
 }
 
 /// Synthetic ID3DXEffect implementation in Rust.
@@ -321,7 +346,17 @@ impl HikariEffect {
 
         for g in global_vars {
             let mut anno_indices = Vec::new();
-            for (k, v) in g.annotations {
+            let mut ui_label = String::new();
+            let mut ui_widget = UIWidgetKind::None;
+            let mut ui_min = 0.0f32;
+            let mut ui_max = 1.0f32;
+            let mut ui_step = 0.01f32;
+            let mut ui_items = Vec::new();
+            let mut ui_group = String::new();
+            let mut ui_help = String::new();
+            let mut has_ui = false;
+
+            for (k, v) in &g.annotations {
                 let a_idx = annotations.len();
                 annotations.push(EffectAnnotation {
                     name: k.clone(),
@@ -330,6 +365,59 @@ impl HikariEffect {
                     c_val: CString::new(v.as_str()).unwrap_or_default(),
                 });
                 anno_indices.push(a_idx);
+
+                let lower_k = k.to_lowercase();
+                match lower_k.as_str() {
+                    "uiname" | "name" => {
+                        ui_label = v.clone();
+                        has_ui = true;
+                    }
+                    "uiwidget" | "widget" => {
+                        has_ui = true;
+                        let lw = v.to_lowercase();
+                        ui_widget = match lw.as_str() {
+                            "slider" => UIWidgetKind::Slider,
+                            "drag" => UIWidgetKind::Drag,
+                            "checkbox" | "check" | "bool" => UIWidgetKind::Checkbox,
+                            "color" => UIWidgetKind::Color,
+                            "combo" | "dropdown" | "list" => UIWidgetKind::Combo,
+                            "input" | "edit" => UIWidgetKind::Input,
+                            _ => UIWidgetKind::None,
+                        };
+                    }
+                    "uimin" | "min" => {
+                        if let Ok(val) = v.parse::<f32>() {
+                            ui_min = val;
+                            has_ui = true;
+                        }
+                    }
+                    "uimax" | "max" => {
+                        if let Ok(val) = v.parse::<f32>() {
+                            ui_max = val;
+                            has_ui = true;
+                        }
+                    }
+                    "uistep" | "step" => {
+                        if let Ok(val) = v.parse::<f32>() {
+                            ui_step = val;
+                        }
+                    }
+                    "uiitems" | "items" => {
+                        has_ui = true;
+                        ui_items = v
+                            .split([',', ';', '\0'])
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    "uigroup" | "group" => {
+                        ui_group = v.clone();
+                    }
+                    "uihelp" | "help" => {
+                        ui_help = v.clone();
+                    }
+                    _ => {}
+                }
             }
 
             let lower = g.name.to_lowercase();
@@ -344,6 +432,38 @@ impl HikariEffect {
             let c_name = CString::new(g.name.as_str()).unwrap_or_default();
             let c_semantic = CString::new(semantic.as_str()).unwrap_or_default();
             let (hlsl_type, row_major) = var_types.get(&lower).cloned().unwrap_or_default();
+
+            if has_ui {
+                if ui_label.is_empty() {
+                    ui_label = g.name.clone();
+                }
+                if ui_widget == UIWidgetKind::None {
+                    ui_widget = match hlsl_type.as_str() {
+                        "bool" => UIWidgetKind::Checkbox,
+                        "float" => UIWidgetKind::Slider,
+                        "float3" | "float4" => UIWidgetKind::Color,
+                        "int" => UIWidgetKind::Input,
+                        _ => UIWidgetKind::None,
+                    };
+                }
+            }
+
+            let ui_desc = if has_ui {
+                Some(ParameterUIDesc {
+                    label: ui_label,
+                    widget: ui_widget,
+                    min: ui_min,
+                    max: ui_max,
+                    step: ui_step,
+                    items: ui_items,
+                    group: ui_group,
+                    help: ui_help,
+                    default_val: g.default_val.clone(),
+                })
+            } else {
+                None
+            };
+
             let p_idx = parameters.len();
             parameters.push(EffectParameter {
                 name: g.name.clone(),
@@ -355,6 +475,7 @@ impl HikariEffect {
                 offset: next_cb_offset,
                 size: 64,
                 annotation_indices: anno_indices,
+                ui: ui_desc,
             });
             next_cb_offset += 64;
             param_by_name.insert(lower, p_idx);
@@ -401,6 +522,7 @@ impl HikariEffect {
                                         offset,
                                         size,
                                         annotation_indices: Vec::new(),
+                                        ui: None,
                                     });
                                     param_by_name.insert(lower, p_idx);
                                     if !semantic.is_empty() {
@@ -470,6 +592,7 @@ impl HikariEffect {
                         offset: next_cb_offset,
                         size,
                         annotation_indices: Vec::new(),
+                        ui: None,
                     });
                     next_cb_offset += size;
                     param_by_name.insert(lower, p_idx);
@@ -481,6 +604,19 @@ impl HikariEffect {
         // Allocate a 64KB constant buffer (register b0)
         let cb_size = 65536;
         let constant_buffer = d3d11.create_constant_buffer(cb_size).ok();
+        let mut constant_data = vec![0u8; cb_size];
+        let mut constant_dirty = false;
+
+        for p in &parameters {
+            if let Some(ref ui_desc) = p.ui {
+                if !ui_desc.default_val.is_empty() && p.offset + p.size <= constant_data.len() {
+                    let slice = &mut constant_data[p.offset..p.offset + p.size];
+                    if parse_and_write_default_val(&ui_desc.default_val, &p.hlsl_type, slice) {
+                        constant_dirty = true;
+                    }
+                }
+            }
+        }
 
         static VTBL: ID3DXEffectVtbl = ID3DXEffectVtbl {
             QueryInterface: effect_query_interface,
@@ -588,8 +724,8 @@ impl HikariEffect {
                 None, None, None, None, None, None, None, None,
             ],
             constant_buffer,
-            constant_data: vec![0u8; cb_size],
-            constant_dirty: false,
+            constant_data,
+            constant_dirty,
             device: d3d11.device.clone(),
             context: d3d11.context.clone(),
         });
@@ -616,7 +752,513 @@ impl HikariEffect {
         }
         self.constant_dirty = false;
     }
+
+    pub fn get_param_value_f32(&self, param_idx: usize) -> Option<f32> {
+        let p = self.parameters.get(param_idx)?;
+        if p.offset + 4 <= self.constant_data.len() {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&self.constant_data[p.offset..p.offset + 4]);
+            Some(f32::from_ne_bytes(bytes))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_param_value_f32(&mut self, param_idx: usize, val: f32) {
+        if let Some(p) = self.parameters.get(param_idx) {
+            if p.offset + 4 <= self.constant_data.len() {
+                self.constant_data[p.offset..p.offset + 4].copy_from_slice(&val.to_ne_bytes());
+                self.constant_dirty = true;
+            }
+        }
+    }
+
+    pub fn get_param_value_float3(&self, param_idx: usize) -> Option<[f32; 3]> {
+        let p = self.parameters.get(param_idx)?;
+        if p.offset + 12 <= self.constant_data.len() {
+            let mut res = [0.0f32; 3];
+            for i in 0..3 {
+                let off = p.offset + i * 4;
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&self.constant_data[off..off + 4]);
+                res[i] = f32::from_ne_bytes(bytes);
+            }
+            Some(res)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_param_value_float3(&mut self, param_idx: usize, val: [f32; 3]) {
+        if let Some(p) = self.parameters.get(param_idx) {
+            if p.offset + 12 <= self.constant_data.len() {
+                for i in 0..3 {
+                    let off = p.offset + i * 4;
+                    self.constant_data[off..off + 4].copy_from_slice(&val[i].to_ne_bytes());
+                }
+                self.constant_dirty = true;
+            }
+        }
+    }
+
+    pub fn get_param_value_i32(&self, param_idx: usize) -> Option<i32> {
+        let p = self.parameters.get(param_idx)?;
+        if p.offset + 4 <= self.constant_data.len() {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&self.constant_data[p.offset..p.offset + 4]);
+            Some(i32::from_ne_bytes(bytes))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_param_value_i32(&mut self, param_idx: usize, val: i32) {
+        if let Some(p) = self.parameters.get(param_idx) {
+            if p.offset + 4 <= self.constant_data.len() {
+                self.constant_data[p.offset..p.offset + 4].copy_from_slice(&val.to_ne_bytes());
+                self.constant_dirty = true;
+            }
+        }
+    }
+
+    pub fn get_param_value_bool(&self, param_idx: usize) -> Option<bool> {
+        let p = self.parameters.get(param_idx)?;
+        if p.offset + 4 <= self.constant_data.len() {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&self.constant_data[p.offset..p.offset + 4]);
+            let i = u32::from_ne_bytes(bytes);
+            let f = f32::from_ne_bytes(bytes);
+            Some(i != 0 || f > 0.5)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_param_value_bool(&mut self, param_idx: usize, val: bool) {
+        if let Some(p) = self.parameters.get(param_idx) {
+            if p.offset + 4 <= self.constant_data.len() {
+                let v = if val { 1u32 } else { 0u32 };
+                self.constant_data[p.offset..p.offset + 4].copy_from_slice(&v.to_ne_bytes());
+                self.constant_dirty = true;
+            }
+        }
+    }
+
+    pub fn get_first_pass_info(&mut self) -> Option<ActivePassInfo> {
+        self.update_gpu_constants();
+        if self.compiled_techniques.is_empty() {
+            return None;
+        }
+        let tech_idx = self.active_tech_idx.min(self.compiled_techniques.len() - 1);
+        let tech = &self.compiled_techniques[tech_idx];
+        if tech.is_empty() {
+            return None;
+        }
+        let pass_idx = self.active_pass_idx.min(tech.len() - 1);
+        let pass = &tech[pass_idx];
+        let bc = pass.vs_bytecode.as_ref()?;
+        Some(ActivePassInfo {
+            vs_bytecode: bc.clone(),
+            vs: pass.vs.clone(),
+            ps: pass.ps.clone(),
+            constant_buffer: self.constant_buffer.clone(),
+            blend_preset: pass.blend_preset.clone(),
+            depth_preset: pass.depth_preset.clone(),
+            raster_preset: pass.raster_preset.clone(),
+        })
+    }
 }
+
+pub fn parse_and_write_default_val(val_str: &str, ty: &str, out: &mut [u8]) -> bool {
+    let val = val_str.trim().trim_end_matches(';').trim();
+    if val.is_empty() || out.is_empty() {
+        return false;
+    }
+    let lower_val = val.to_lowercase();
+    if ty == "bool" || lower_val == "true" || lower_val == "false" {
+        let b = if lower_val == "true" || lower_val == "1" { 1u32 } else { 0u32 };
+        if out.len() >= 4 {
+            out[..4].copy_from_slice(&b.to_ne_bytes());
+            return true;
+        }
+    }
+    if ty.starts_with("int") {
+        if let Ok(i) = val.parse::<i32>() {
+            if out.len() >= 4 {
+                out[..4].copy_from_slice(&i.to_ne_bytes());
+                return true;
+            }
+        }
+    }
+    let clean = val
+        .trim_start_matches("float4")
+        .trim_start_matches("float3")
+        .trim_start_matches("float2")
+        .trim_start_matches("float")
+        .trim_matches(['(', ')', '{', '}']);
+    let parts: Vec<f32> = clean
+        .split(',')
+        .filter_map(|s| s.trim().trim_end_matches(['f', 'F']).parse::<f32>().ok())
+        .collect();
+    if !parts.is_empty() {
+        let count = parts.len().min(out.len() / 4);
+        for i in 0..count {
+            out[i * 4..(i + 1) * 4].copy_from_slice(&parts[i].to_ne_bytes());
+        }
+        return true;
+    }
+    false
+}
+
+#[derive(Clone)]
+pub struct EffectItemInfo {
+    pub path: String,
+    pub name: String,
+    pub effect: *mut HikariEffect,
+    pub enabled: bool,
+}
+
+unsafe impl Send for EffectItemInfo {}
+unsafe impl Sync for EffectItemInfo {}
+
+pub static EFFECT_REGISTRY: Mutex<Vec<EffectItemInfo>> = Mutex::new(Vec::new());
+
+pub fn load_effect_from_file(path: &str) -> Result<usize, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read effect file '{}': {}", path, e))?;
+
+    let d3d11_guard = crate::vtable::GLOBAL_D3D11.lock().unwrap();
+    let d3d11 = d3d11_guard
+        .as_ref()
+        .ok_or_else(|| "DirectX 11 context is not initialized yet".to_string())?;
+
+    let effect_ptr = HikariEffect::new(&source, Some(path), d3d11)?;
+
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    let mut reg = EFFECT_REGISTRY.lock().unwrap();
+    let idx = reg.len();
+    reg.push(EffectItemInfo {
+        path: path.to_string(),
+        name: file_name,
+        effect: effect_ptr,
+        enabled: true,
+    });
+
+    crate::log_msg(&format!("Successfully loaded Hikari effect #{idx}: '{path}'"));
+    Ok(idx)
+}
+
+pub fn reload_effect(idx: usize) -> Result<(), String> {
+    let mut reg = EFFECT_REGISTRY.lock().unwrap();
+    let item = reg.get_mut(idx).ok_or_else(|| "Effect index out of bounds".to_string())?;
+
+    let source = std::fs::read_to_string(&item.path)
+        .map_err(|e| format!("Failed to read effect file '{}': {}", item.path, e))?;
+
+    let d3d11_guard = crate::vtable::GLOBAL_D3D11.lock().unwrap();
+    let d3d11 = d3d11_guard
+        .as_ref()
+        .ok_or_else(|| "DirectX 11 context is not initialized yet".to_string())?;
+
+    let new_effect_ptr = HikariEffect::new(&source, Some(&item.path), d3d11)?;
+
+    if !item.effect.is_null() {
+        unsafe {
+            let old = &mut *item.effect;
+            let new_eff = &mut *new_effect_ptr;
+            for (p_name, &old_p_idx) in &old.param_by_name {
+                if let Some(&new_p_idx) = new_eff.param_by_name.get(p_name) {
+                    let old_p = &old.parameters[old_p_idx];
+                    let new_p = &new_eff.parameters[new_p_idx];
+                    if old_p.size == new_p.size
+                        && old_p.offset + old_p.size <= old.constant_data.len()
+                        && new_p.offset + new_p.size <= new_eff.constant_data.len()
+                    {
+                        new_eff.constant_data[new_p.offset..new_p.offset + new_p.size]
+                            .copy_from_slice(&old.constant_data[old_p.offset..old_p.offset + old_p.size]);
+                        new_eff.constant_dirty = true;
+                    }
+                }
+            }
+            drop(Box::from_raw(item.effect));
+        }
+    }
+
+    item.effect = new_effect_ptr;
+    crate::log_msg(&format!("Successfully reloaded Hikari effect #{idx}: '{}'", item.path));
+    Ok(())
+}
+
+pub fn get_active_direct_effect_pass() -> Option<ActivePassInfo> {
+    let reg = EFFECT_REGISTRY.lock().unwrap();
+    for item in reg.iter() {
+        if item.enabled && !item.effect.is_null() {
+            unsafe {
+                let eff = &mut *item.effect;
+                crate::backend::update_effect_standard_matrices(eff);
+                eff.update_gpu_constants();
+                return eff.get_first_pass_info();
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModelSubsetAssignment {
+    pub effect_path: String,
+    pub effect: Option<*mut HikariEffect>,
+    pub enabled: bool,
+}
+
+unsafe impl Send for ModelSubsetAssignment {}
+unsafe impl Sync for ModelSubsetAssignment {}
+
+#[derive(Clone, Debug)]
+pub struct ModelAssignment {
+    pub object_id: usize,
+    pub filename: String,
+    pub effect_path: String,
+    pub effect: Option<*mut HikariEffect>,
+    pub subsets: HashMap<i32, ModelSubsetAssignment>,
+    pub enabled: bool,
+}
+
+unsafe impl Send for ModelAssignment {}
+unsafe impl Sync for ModelAssignment {}
+
+pub struct ModelAssignmentRegistry {
+    pub default_effect_path: String,
+    pub default_effect: Option<*mut HikariEffect>,
+    pub models: HashMap<usize, ModelAssignment>,
+    pub order_to_id: HashMap<i32, usize>,
+    pub expanded_models: HashSet<usize>,
+}
+
+unsafe impl Send for ModelAssignmentRegistry {}
+unsafe impl Sync for ModelAssignmentRegistry {}
+
+impl ModelAssignmentRegistry {
+    pub fn new() -> Self {
+        Self {
+            default_effect_path: String::new(),
+            default_effect: None,
+            models: HashMap::new(),
+            order_to_id: HashMap::new(),
+            expanded_models: HashSet::new(),
+        }
+    }
+
+    pub fn update_has_assigned(&self) {
+        let has = self.default_effect.is_some() || self.models.values().any(|m| {
+            m.effect.is_some() || m.subsets.values().any(|s| s.effect.is_some())
+        });
+        HAS_ASSIGNED_EFFECTS.store(has, Ordering::Release);
+    }
+
+    pub fn assign_default_effect(&mut self, path: &str) -> Result<(), String> {
+        if path.is_empty() {
+            if let Some(old) = self.default_effect.take() {
+                unsafe { drop(Box::from_raw(old)); }
+            }
+            self.default_effect_path.clear();
+            self.update_has_assigned();
+            return Ok(());
+        }
+
+        let new_effect = create_effect_instance(path)?;
+        if let Some(old) = self.default_effect.replace(new_effect) {
+            unsafe { drop(Box::from_raw(old)); }
+        }
+        self.default_effect_path = path.to_string();
+        HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
+        crate::log_msg(&format!("[Assignment] Set default effect: '{path}'"));
+        Ok(())
+    }
+
+    pub fn assign_model_effect(&mut self, object_id: usize, filename: &str, path: &str) -> Result<(), String> {
+        let model = self.models.entry(object_id).or_insert_with(|| ModelAssignment {
+            object_id,
+            filename: filename.to_string(),
+            effect_path: String::new(),
+            effect: None,
+            subsets: HashMap::new(),
+            enabled: true,
+        });
+
+        if path.is_empty() {
+            if let Some(old) = model.effect.take() {
+                unsafe { drop(Box::from_raw(old)); }
+            }
+            model.effect_path.clear();
+            self.update_has_assigned();
+            return Ok(());
+        }
+
+        let new_effect = create_effect_instance(path)?;
+        if let Some(old) = model.effect.replace(new_effect) {
+            unsafe { drop(Box::from_raw(old)); }
+        }
+        model.effect_path = path.to_string();
+        model.enabled = true;
+        HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
+        crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) effect: '{path}'"));
+        Ok(())
+    }
+
+    pub fn assign_subset_effect(&mut self, object_id: usize, filename: &str, subset: i32, path: &str) -> Result<(), String> {
+        let model = self.models.entry(object_id).or_insert_with(|| ModelAssignment {
+            object_id,
+            filename: filename.to_string(),
+            effect_path: String::new(),
+            effect: None,
+            subsets: HashMap::new(),
+            enabled: true,
+        });
+
+        if path.is_empty() {
+            if let Some(sub) = model.subsets.get_mut(&subset) {
+                if let Some(old) = sub.effect.take() {
+                    unsafe { drop(Box::from_raw(old)); }
+                }
+                sub.effect_path.clear();
+            }
+            self.update_has_assigned();
+            return Ok(());
+        }
+
+        let new_effect = create_effect_instance(path)?;
+        let sub = model.subsets.entry(subset).or_insert_with(|| ModelSubsetAssignment {
+            effect_path: String::new(),
+            effect: None,
+            enabled: true,
+        });
+
+        if let Some(old) = sub.effect.replace(new_effect) {
+            unsafe { drop(Box::from_raw(old)); }
+        }
+        sub.effect_path = path.to_string();
+        sub.enabled = true;
+        HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
+        crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) subset #{subset} effect: '{path}'"));
+        Ok(())
+    }
+
+    pub fn toggle_subset_expand(&mut self, object_id: usize) {
+        if self.expanded_models.contains(&object_id) {
+            self.expanded_models.remove(&object_id);
+        } else {
+            self.expanded_models.insert(object_id);
+        }
+    }
+
+    pub fn is_subset_expanded(&self, object_id: usize) -> bool {
+        self.expanded_models.contains(&object_id)
+    }
+
+    pub fn sync_host_objects(&mut self) {
+        let host_objs = crate::mmd_host::enumerate_host_objects();
+        self.order_to_id.clear();
+        for obj in host_objs {
+            self.order_to_id.insert(obj.order, obj.id);
+            self.models.entry(obj.id).or_insert_with(|| ModelAssignment {
+                object_id: obj.id,
+                filename: obj.filename.clone(),
+                effect_path: String::new(),
+                effect: None,
+                subsets: HashMap::new(),
+                enabled: obj.disp,
+            });
+        }
+    }
+
+    pub fn resolve_effect(&self, object_order: i32, subset_index: i32) -> Option<*mut HikariEffect> {
+        if object_order != 0 {
+            let mut resolved_model = self.order_to_id.get(&object_order).and_then(|id| self.models.get(id));
+            if resolved_model.is_none() {
+                resolved_model = self.models.get(&(object_order as usize));
+            }
+
+            if let Some(model) = resolved_model {
+                if model.enabled {
+                    // Check subset override
+                    if subset_index >= 0 {
+                        if let Some(sub) = model.subsets.get(&subset_index) {
+                            if sub.enabled && sub.effect.is_some() {
+                                return sub.effect;
+                            }
+                        }
+                    }
+                    // Check model effect
+                    if let Some(eff) = model.effect {
+                        return Some(eff);
+                    }
+                }
+            }
+        } else if subset_index >= 0 {
+            // In Camera mode, MMD sets ExpGetCurrentObject() to 0 while still rendering model subsets.
+            // If models are loaded and assigned effects, resolve against the active model.
+            for model in self.models.values() {
+                if model.enabled {
+                    if let Some(sub) = model.subsets.get(&subset_index) {
+                        if sub.enabled && sub.effect.is_some() {
+                            return sub.effect;
+                        }
+                    }
+                    if let Some(eff) = model.effect {
+                        return Some(eff);
+                    }
+                }
+            }
+        }
+
+        // Fallback to default effect
+        self.default_effect
+    }
+}
+
+pub static HAS_ASSIGNED_EFFECTS: AtomicBool = AtomicBool::new(false);
+
+pub static ASSIGNMENT_REGISTRY: std::sync::LazyLock<Mutex<ModelAssignmentRegistry>> =
+    std::sync::LazyLock::new(|| Mutex::new(ModelAssignmentRegistry::new()));
+
+pub fn get_assigned_effect_pass(object_order: i32, subset_index: i32) -> Option<ActivePassInfo> {
+    if !HAS_ASSIGNED_EFFECTS.load(Ordering::Relaxed) {
+        return None;
+    }
+    let reg = ASSIGNMENT_REGISTRY.lock().ok()?;
+    if let Some(eff_ptr) = reg.resolve_effect(object_order, subset_index) {
+        if !eff_ptr.is_null() {
+            unsafe {
+                let eff = &mut *eff_ptr;
+                crate::backend::update_effect_standard_matrices(eff);
+                eff.update_gpu_constants();
+                return eff.get_first_pass_info();
+            }
+        }
+    }
+    None
+}
+
+pub fn create_effect_instance(path: &str) -> Result<*mut HikariEffect, String> {
+    if path.is_empty() {
+        return Err("Empty path".to_string());
+    }
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read effect file '{}': {}", path, e))?;
+
+    let d3d11_guard = crate::vtable::GLOBAL_D3D11.lock().unwrap();
+    let d3d11 = d3d11_guard
+        .as_ref()
+        .ok_or_else(|| "DirectX 11 context is not initialized yet".to_string())?;
+
+    HikariEffect::new(&source, Some(path), d3d11)
+}
+
 
 pub unsafe fn is_hikari_effect(this: *mut c_void) -> bool {
     if this.is_null() {

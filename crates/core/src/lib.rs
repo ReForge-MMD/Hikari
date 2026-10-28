@@ -11,6 +11,8 @@ pub mod states;
 pub mod targets;
 pub mod vtable;
 pub mod backend;
+pub mod ui;
+pub mod mmd_host;
 
 use std::ffi::c_void;
 use std::fs::OpenOptions;
