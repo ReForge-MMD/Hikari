@@ -3,48 +3,6 @@
 // Compatible with MikuMikuDance & Hikari Effects Manager
 // ==============================================================================
 
-// --- UI Configurable Parameters (Live Tweaks via Hikari F10 Menu) ---
-float Brightness <
-    string UIName = "Яркость (Exposure)";
-    string UIWidget = "Slider";
-    float UIMin = 0.0;
-    float UIMax = 3.0;
-    float UIStep = 0.05;
-    string UIGroup = "Освещение";
-    string UIHelp = "Регулировка общей экспозиции и свечения";
-> = 1.0;
-
-float3 RedColor <
-    string UIName = "Красный оттенок (Red Tint)";
-    string UIWidget = "Color";
-    string UIGroup = "Цвет и стиль";
-    string UIHelp = "Основной красный цвет заливки модели";
-> = float3(1.0, 0.08, 0.12);
-
-float RedGlow <
-    string UIName = "Интенсивность свечения (Rim Glow)";
-    string UIWidget = "Slider";
-    float UIMin = 0.0;
-    float UIMax = 2.0;
-    float UIStep = 0.05;
-    string UIGroup = "Цвет и стиль";
-    string UIHelp = "Сила неонового контурного свечения по краям";
-> = 0.6;
-
-bool EnableShading <
-    string UIName = "Динамическое освещение";
-    string UIWidget = "Checkbox";
-    string UIGroup = "Шейдинг";
-    string UIHelp = "Включение расчета светотени";
-> = true;
-
-int ShadingMode <
-    string UIName = "Режим затенения";
-    string UIWidget = "Combo";
-    string UIItems = "Чистый красный (Unlit),Ламберт (Lambert),Аниме-Тун (Toon),Неоновый контур (Neon Rim)";
-    string UIGroup = "Шейдинг";
-> = 1;
-
 // --- Constant Buffer (Slot b0) ---
 cbuffer ModelConstants : register(b0) {
     row_major float4x4 WorldViewProj : WORLDVIEWPROJECTION;
@@ -57,6 +15,48 @@ cbuffer ModelConstants : register(b0) {
     float4 MaterialDiffuse           : DIFFUSE  < string Object = "Geometry"; >;
     float4 MaterialAmbient           : AMBIENT  < string Object = "Geometry"; >;
     float4 MaterialSpecular          : SPECULAR < string Object = "Geometry"; >;
+
+    // --- UI Configurable Parameters (Live Tweaks via Hikari F10 Menu) ---
+    float Brightness <
+        string UIName = "Яркость (Exposure)";
+        string UIWidget = "Slider";
+        float UIMin = 0.0;
+        float UIMax = 3.0;
+        float UIStep = 0.05;
+        string UIGroup = "Освещение";
+        string UIHelp = "Регулировка общей экспозиции и свечения";
+    > = 1.0;
+
+    float3 RedColor <
+        string UIName = "Красный оттенок (Red Tint)";
+        string UIWidget = "Color";
+        string UIGroup = "Цвет и стиль";
+        string UIHelp = "Основной красный цвет заливки модели";
+    > = float3(1.0, 0.08, 0.12);
+
+    float RedGlow <
+        string UIName = "Интенсивность свечения (Rim Glow)";
+        string UIWidget = "Slider";
+        float UIMin = 0.0;
+        float UIMax = 2.0;
+        float UIStep = 0.05;
+        string UIGroup = "Цвет и стиль";
+        string UIHelp = "Сила неонового контурного свечения по краям";
+    > = 0.6;
+
+    bool EnableShading <
+        string UIName = "Динамическое освещение";
+        string UIWidget = "Checkbox";
+        string UIGroup = "Шейдинг";
+        string UIHelp = "Включение расчета светотени";
+    > = true;
+
+    int ShadingMode <
+        string UIName = "Режим затенения";
+        string UIWidget = "Combo";
+        string UIItems = "Чистый красный (Unlit),Ламберт (Lambert),Аниме-Тун (Toon),Неоновый контур (Neon Rim)";
+        string UIGroup = "Шейдинг";
+    > = 1;
 
     float  Time                      : TIME;
     bool   use_texture;

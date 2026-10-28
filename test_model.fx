@@ -3,38 +3,6 @@
 // Compatible with MikuMikuDance & Hikari Effects Manager (Direct Win32 UI)
 // ==============================================================================
 
-// --- UI Configurable Parameters (Tweaked live via Hikari F10 Menu) ---
-float Brightness <
-    string UIName = "Яркость (Exposure)";
-    string UIWidget = "Slider";
-    float UIMin = 0.0;
-    float UIMax = 3.0;
-    float UIStep = 0.05;
-    string UIGroup = "Освещение";
-    string UIHelp = "Регулировка общей экспозиции и яркости модели";
-> = 1.0;
-
-float3 TintColor <
-    string UIName = "Оттенок (Tint Color)";
-    string UIWidget = "Color";
-    string UIGroup = "Цветокоррекция";
-    string UIHelp = "Базовый оттенок модели";
-> = float3(1.0, 1.0, 1.0);
-
-bool EnableShading <
-    string UIName = "Динамическое затенение";
-    string UIWidget = "Checkbox";
-    string UIGroup = "Шейдинг";
-    string UIHelp = "Включение расчета диффузного освещения";
-> = true;
-
-int ShadingMode <
-    string UIName = "Режим затенения";
-    string UIWidget = "Combo";
-    string UIItems = "Без освещения (Unlit),Ламберт (Lambert),Стилизованный (Toon),Контурный (RimLight)";
-    string UIGroup = "Шейдинг";
-> = 1;
-
 // --- Constant Buffer (Slot b0) ---
 cbuffer ModelConstants : register(b0) {
     row_major float4x4 WorldViewProj : WORLDVIEWPROJECTION;
@@ -47,6 +15,38 @@ cbuffer ModelConstants : register(b0) {
     float4 MaterialDiffuse           : DIFFUSE  < string Object = "Geometry"; >;
     float4 MaterialAmbient           : AMBIENT  < string Object = "Geometry"; >;
     float4 MaterialSpecular          : SPECULAR < string Object = "Geometry"; >;
+
+    // --- UI Configurable Parameters (Tweaked live via Hikari F10 Menu) ---
+    float Brightness <
+        string UIName = "Яркость (Exposure)";
+        string UIWidget = "Slider";
+        float UIMin = 0.0;
+        float UIMax = 3.0;
+        float UIStep = 0.05;
+        string UIGroup = "Освещение";
+        string UIHelp = "Регулировка общей экспозиции и яркости модели";
+    > = 1.0;
+
+    float3 TintColor <
+        string UIName = "Оттенок (Tint Color)";
+        string UIWidget = "Color";
+        string UIGroup = "Цветокоррекция";
+        string UIHelp = "Базовый оттенок модели";
+    > = float3(1.0, 1.0, 1.0);
+
+    bool EnableShading <
+        string UIName = "Динамическое затенение";
+        string UIWidget = "Checkbox";
+        string UIGroup = "Шейдинг";
+        string UIHelp = "Включение расчета диффузного освещения";
+    > = true;
+
+    int ShadingMode <
+        string UIName = "Режим затенения";
+        string UIWidget = "Combo";
+        string UIItems = "Без освещения (Unlit),Ламберт (Lambert),Стилизованный (Toon),Контурный (RimLight)";
+        string UIGroup = "Шейдинг";
+    > = 1;
 
     float  Time                      : TIME;
     bool   use_texture;

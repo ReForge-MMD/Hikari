@@ -122,7 +122,7 @@ impl Default for PassDesc {
             ds_entry: None,
             blend_preset: BlendPreset::Opaque,
             depth_preset: DepthPreset::ReadWriteLessEqual,
-            raster_preset: RasterizerPreset::CullBackSolid,
+            raster_preset: RasterizerPreset::CullNoneSolid,
         }
     }
 }
@@ -631,8 +631,10 @@ pub fn parse_techniques(source: &str) -> Vec<TechniqueDesc> {
                         pass.raster_preset = RasterizerPreset::CullNoneSolid;
                     } else if upper.contains("CW") || upper.contains("FRONT") {
                         pass.raster_preset = RasterizerPreset::CullFrontSolid;
-                    } else {
+                    } else if upper.contains("CCW") || upper.contains("BACK") {
                         pass.raster_preset = RasterizerPreset::CullBackSolid;
+                    } else {
+                        pass.raster_preset = RasterizerPreset::CullNoneSolid;
                     }
                 }
 

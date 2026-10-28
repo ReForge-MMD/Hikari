@@ -168,7 +168,12 @@ pub fn update_effect_standard_matrices(eff: &mut crate::effect::HikariEffect) {
     write_vec4("CAMERAPOSITION", &["CameraPosition", "CameraPos"], &cam_pos);
     write_vec4("DIRECTION", &["LightDirection", "LightDir"], &[0.5, 1.0, -0.5, 0.0]);
     write_vec4("LIGHTDIRECTION", &["LightDirection", "LightDir"], &[0.5, 1.0, -0.5, 0.0]);
+    write_vec4("DIFFUSE", &["MaterialDiffuse"], &[1.0, 1.0, 1.0, 1.0]);
+    write_vec4("AMBIENT", &["MaterialAmbient"], &[0.5, 0.5, 0.5, 1.0]);
+    write_vec4("SPECULAR", &["MaterialSpecular"], &[0.0, 0.0, 0.0, 1.0]);
 }
+
+pub static CURRENT_VIEWPORT: Mutex<Option<windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT>> = Mutex::new(None);
 
 pub fn on_begin_scene(_device: *mut c_void) {
     // BeginScene hook
@@ -186,6 +191,7 @@ pub fn on_end_scene(device: *mut c_void) {
         crate::vtable::ensure_composite_targets_initialized(device);
         execute_dx11_composite(device);
     }
+    crate::effect::drain_deferred_effects();
 }
 
 pub fn on_clear(_flags: u32, _color: u32, _z: f32, _stencil: u32) {
@@ -193,16 +199,17 @@ pub fn on_clear(_flags: u32, _color: u32, _z: f32, _stencil: u32) {
 }
 
 pub fn on_set_viewport(x: u32, y: u32, w: u32, h: u32) {
+    let vp = windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT {
+        TopLeftX: x as f32,
+        TopLeftY: y as f32,
+        Width: w as f32,
+        Height: h as f32,
+        MinDepth: 0.0,
+        MaxDepth: 1.0,
+    };
+    *CURRENT_VIEWPORT.lock().unwrap() = Some(vp);
     if let Ok(guard) = GLOBAL_D3D11.lock() {
         if let Some(ref ctx) = *guard {
-            let vp = windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT {
-                TopLeftX: x as f32,
-                TopLeftY: y as f32,
-                Width: w as f32,
-                Height: h as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
             unsafe {
                 ctx.context.RSSetViewports(Some(&[vp]));
             }

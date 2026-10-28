@@ -867,6 +867,79 @@ impl HikariEffect {
             raster_preset: pass.raster_preset.clone(),
         })
     }
+
+    pub fn find_technique_for_pass(&self, current_tech: i32) -> Option<usize> {
+        let pass_name = match current_tech {
+            0 => "object",
+            1 => "object_ss",
+            2 => "edge",
+            3 => "shadow",
+            _ => "object",
+        };
+
+        // 1. Check technique annotations for MMDPass matching pass_name (case-insensitive)
+        for (idx, tech) in self.techniques.iter().enumerate() {
+            if let Some(val) = tech.annotations.get("MMDPass") {
+                if val.eq_ignore_ascii_case(pass_name) {
+                    if idx < self.compiled_techniques.len() && !self.compiled_techniques[idx].is_empty() {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+
+        // 2. Check technique name containing pass_name
+        for (idx, tech) in self.techniques.iter().enumerate() {
+            let name_lower = tech.name.to_lowercase();
+            if name_lower == pass_name || name_lower.contains(pass_name) {
+                if idx < self.compiled_techniques.len() && !self.compiled_techniques[idx].is_empty() {
+                    return Some(idx);
+                }
+            }
+        }
+
+        // 3. Fallbacks
+        if current_tech == 1 {
+            // Fallback object_ss to object
+            return self.find_technique_for_pass(0);
+        }
+
+        if current_tech == 0 {
+            // For standard object pass, fallback to active_tech_idx or first valid technique
+            if self.active_tech_idx < self.compiled_techniques.len() && !self.compiled_techniques[self.active_tech_idx].is_empty() {
+                return Some(self.active_tech_idx);
+            }
+            for (idx, passes) in self.compiled_techniques.iter().enumerate() {
+                if !passes.is_empty() {
+                    return Some(idx);
+                }
+            }
+        }
+
+        // Edge or shadow pass: if effect does not define an edge/shadow technique, return None
+        None
+    }
+
+    pub fn get_technique_pass_info(&mut self, current_tech: i32) -> Option<ActivePassInfo> {
+        self.update_gpu_constants();
+        let tech_idx = self.find_technique_for_pass(current_tech)?;
+        let tech = self.compiled_techniques.get(tech_idx)?;
+        if tech.is_empty() {
+            return None;
+        }
+        let pass_idx = self.active_pass_idx.min(tech.len() - 1);
+        let pass = &tech[pass_idx];
+        let bc = pass.vs_bytecode.as_ref()?;
+        Some(ActivePassInfo {
+            vs_bytecode: bc.clone(),
+            vs: pass.vs.clone(),
+            ps: pass.ps.clone(),
+            constant_buffer: self.constant_buffer.clone(),
+            blend_preset: pass.blend_preset.clone(),
+            depth_preset: pass.depth_preset.clone(),
+            raster_preset: pass.raster_preset.clone(),
+        })
+    }
 }
 
 pub fn parse_and_write_default_val(val_str: &str, ty: &str, out: &mut [u8]) -> bool {
@@ -1063,7 +1136,7 @@ impl ModelAssignmentRegistry {
     pub fn assign_default_effect(&mut self, path: &str) -> Result<(), String> {
         if path.is_empty() {
             if let Some(old) = self.default_effect.take() {
-                unsafe { drop(Box::from_raw(old)); }
+                defer_drop_effect(old);
             }
             self.default_effect_path.clear();
             self.update_has_assigned();
@@ -1072,7 +1145,7 @@ impl ModelAssignmentRegistry {
 
         let new_effect = create_effect_instance(path)?;
         if let Some(old) = self.default_effect.replace(new_effect) {
-            unsafe { drop(Box::from_raw(old)); }
+            defer_drop_effect(old);
         }
         self.default_effect_path = path.to_string();
         HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
@@ -1092,7 +1165,7 @@ impl ModelAssignmentRegistry {
 
         if path.is_empty() {
             if let Some(old) = model.effect.take() {
-                unsafe { drop(Box::from_raw(old)); }
+                defer_drop_effect(old);
             }
             model.effect_path.clear();
             self.update_has_assigned();
@@ -1101,7 +1174,7 @@ impl ModelAssignmentRegistry {
 
         let new_effect = create_effect_instance(path)?;
         if let Some(old) = model.effect.replace(new_effect) {
-            unsafe { drop(Box::from_raw(old)); }
+            defer_drop_effect(old);
         }
         model.effect_path = path.to_string();
         model.enabled = true;
@@ -1123,7 +1196,7 @@ impl ModelAssignmentRegistry {
         if path.is_empty() {
             if let Some(sub) = model.subsets.get_mut(&subset) {
                 if let Some(old) = sub.effect.take() {
-                    unsafe { drop(Box::from_raw(old)); }
+                    defer_drop_effect(old);
                 }
                 sub.effect_path.clear();
             }
@@ -1139,7 +1212,7 @@ impl ModelAssignmentRegistry {
         });
 
         if let Some(old) = sub.effect.replace(new_effect) {
-            unsafe { drop(Box::from_raw(old)); }
+            defer_drop_effect(old);
         }
         sub.effect_path = path.to_string();
         sub.enabled = true;
@@ -1219,6 +1292,48 @@ impl ModelAssignmentRegistry {
         // Fallback to default effect
         self.default_effect
     }
+
+    pub fn is_effect_alive(&self, ptr: *mut HikariEffect) -> bool {
+        if ptr.is_null() {
+            return false;
+        }
+        if self.default_effect == Some(ptr) {
+            return true;
+        }
+        for model in self.models.values() {
+            if model.effect == Some(ptr) {
+                return true;
+            }
+            for sub in model.subsets.values() {
+                if sub.effect == Some(ptr) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+static DEFERRED_EFFECTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub fn defer_drop_effect(eff: *mut HikariEffect) {
+    if !eff.is_null() {
+        DEFERRED_EFFECTS.lock().unwrap().push(eff as usize);
+    }
+}
+
+pub fn drain_deferred_effects() {
+    let list = {
+        let mut guard = DEFERRED_EFFECTS.lock().unwrap();
+        std::mem::take(&mut *guard)
+    };
+    for eff_addr in list {
+        if eff_addr != 0 {
+            unsafe {
+                drop(Box::from_raw(eff_addr as *mut HikariEffect));
+            }
+        }
+    }
 }
 
 pub static HAS_ASSIGNED_EFFECTS: AtomicBool = AtomicBool::new(false);
@@ -1226,7 +1341,7 @@ pub static HAS_ASSIGNED_EFFECTS: AtomicBool = AtomicBool::new(false);
 pub static ASSIGNMENT_REGISTRY: std::sync::LazyLock<Mutex<ModelAssignmentRegistry>> =
     std::sync::LazyLock::new(|| Mutex::new(ModelAssignmentRegistry::new()));
 
-pub fn get_assigned_effect_pass(object_order: i32, subset_index: i32) -> Option<ActivePassInfo> {
+pub fn get_assigned_effect_pass(object_order: i32, subset_index: i32, current_tech: i32) -> Option<ActivePassInfo> {
     if !HAS_ASSIGNED_EFFECTS.load(Ordering::Relaxed) {
         return None;
     }
@@ -1237,7 +1352,7 @@ pub fn get_assigned_effect_pass(object_order: i32, subset_index: i32) -> Option<
                 let eff = &mut *eff_ptr;
                 crate::backend::update_effect_standard_matrices(eff);
                 eff.update_gpu_constants();
-                return eff.get_first_pass_info();
+                return eff.get_technique_pass_info(current_tech);
             }
         }
     }

@@ -66,6 +66,13 @@ fn test_model_assignment_resolution_hierarchy() {
     reg.toggle_subset_expand(model_id);
     assert!(!reg.is_subset_expanded(model_id));
 
+    // 5. Test is_effect_alive validation
+    assert!(reg.is_effect_alive(dummy_default));
+    assert!(reg.is_effect_alive(dummy_model_a));
+    assert!(reg.is_effect_alive(dummy_subset_1));
+    assert!(!reg.is_effect_alive(0x9999 as *mut hikari_core::effect::HikariEffect));
+    assert!(!reg.is_effect_alive(std::ptr::null_mut()));
+
     // Prevent Drop on fake pointers
     reg.default_effect = None;
     if let Some(m) = reg.models.get_mut(&model_id) {
@@ -74,4 +81,8 @@ fn test_model_assignment_resolution_hierarchy() {
             s.effect = None;
         }
     }
+
+    assert!(!reg.is_effect_alive(dummy_default));
+    assert!(!reg.is_effect_alive(dummy_model_a));
+    assert!(!reg.is_effect_alive(dummy_subset_1));
 }

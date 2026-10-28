@@ -696,9 +696,9 @@ unsafe fn draw_model_layer_d3d9(
 ) -> Result<(), String> {
     use windows::Win32::Graphics::Direct3D9::{
         D3DRS_ALPHABLENDENABLE, D3DRS_ALPHATESTENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
-        D3DRS_ZENABLE, D3DRS_LIGHTING, D3DRS_CLIPPING,
+        D3DRS_ZENABLE, D3DRS_LIGHTING, D3DRS_CLIPPING, D3DRS_CULLMODE, D3DCULL_NONE,
         D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA,
-        D3DTSS_ALPHAOP, D3DTSS_COLOROP, D3DTOP_SELECTARG1,
+        D3DTSS_ALPHAOP, D3DTSS_COLOROP, D3DTOP_SELECTARG1, D3DTOP_DISABLE,
         D3DTSS_COLORARG1, D3DTSS_ALPHAARG1, D3DTA_TEXTURE,
         D3DFVF_XYZRHW, D3DFVF_TEX1, D3DPT_TRIANGLELIST,
     };
@@ -730,6 +730,8 @@ unsafe fn draw_model_layer_d3d9(
         Direct3D9::IDirect3DDevice9::GetRenderState(device, *state, &mut v).ok();
         old[slot] = v;
     }
+    let mut old_cull = 0u32;
+    Direct3D9::IDirect3DDevice9::GetRenderState(device, D3DRS_CULLMODE, &mut old_cull).ok();
     let mut rs_blend = 0u32;
     Direct3D9::IDirect3DDevice9::GetRenderState(device, D3DRS_ALPHABLENDENABLE, &mut rs_blend).ok();
     let mut rs_src = 0u32;
@@ -744,6 +746,10 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 0, D3DTSS_ALPHAOP, &mut ts_alpha).ok();
     let mut ts_alpha_arg1 = 0u32;
     Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 0, D3DTSS_ALPHAARG1, &mut ts_alpha_arg1).ok();
+    let mut ts1_color = 0u32;
+    Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 1, D3DTSS_COLOROP, &mut ts1_color).ok();
+    let mut ts1_alpha = 0u32;
+    Direct3D9::IDirect3DDevice9::GetTextureStageState(device, 1, D3DTSS_ALPHAOP, &mut ts1_alpha).ok();
     let mut old_fvf = 0u32;
     Direct3D9::IDirect3DDevice9::GetFVF(device, &mut old_fvf).ok();
     let old_decl = Direct3D9::IDirect3DDevice9::GetVertexDeclaration(device).ok();
@@ -758,6 +764,7 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_LIGHTING, 0).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_CLIPPING, 0).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_ALPHATESTENABLE, 0).ok();
+    Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_CULLMODE, D3DCULL_NONE.0 as u32).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_ALPHABLENDENABLE, 1)
         .map_err(|e| format!("SetRenderState(blend) failed: {}", e.code()))?;
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA.0 as u32).ok();
@@ -766,6 +773,8 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1.0 as u32).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 1, D3DTSS_COLOROP, D3DTOP_DISABLE.0 as u32).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 1, D3DTSS_ALPHAOP, D3DTOP_DISABLE.0 as u32).ok();
 
     Direct3D9::IDirect3DDevice9::SetFVF(device, D3DFVF_XYZRHW | D3DFVF_TEX1)
         .map_err(|e| format!("SetFVF failed: {}", e.code()))?;
@@ -788,6 +797,7 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_LIGHTING, old[1]).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_CLIPPING, old[2]).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_ALPHATESTENABLE, old[3]).ok();
+    Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_CULLMODE, old_cull).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_ALPHABLENDENABLE, rs_blend).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_SRCBLEND, rs_src).ok();
     Direct3D9::IDirect3DDevice9::SetRenderState(device, D3DRS_DESTBLEND, rs_dst).ok();
@@ -795,6 +805,8 @@ unsafe fn draw_model_layer_d3d9(
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_COLORARG1, ts_color_arg1).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAOP, ts_alpha).ok();
     Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 0, D3DTSS_ALPHAARG1, ts_alpha_arg1).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 1, D3DTSS_COLOROP, ts1_color).ok();
+    Direct3D9::IDirect3DDevice9::SetTextureStageState(device, 1, D3DTSS_ALPHAOP, ts1_alpha).ok();
     Ok(())
 }
 
@@ -1594,9 +1606,8 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     let current_tech = crate::mmd_host::get_current_technic();
 
     // When there is no explicit MME active pass, only intercept model mesh passes:
-    // Technic == 0 means non-mesh objects (bones, bone select boxes, axis guides, UI handles).
-    // Material < 0 means no model subset is active.
-    if active_pass.is_none() && (current_tech == 0 || current_mat < 0) {
+    // Material < 0 indicates non-mesh objects (bones, bone select boxes, axis guides, UI handles).
+    if active_pass.is_none() && current_mat < 0 {
         return false;
     }
 
@@ -1644,7 +1655,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
             p
         }
         None => {
-            if let Some(p) = crate::effect::get_assigned_effect_pass(current_obj, current_mat) {
+            if let Some(p) = crate::effect::get_assigned_effect_pass(current_obj, current_mat, current_tech) {
                 DRAW_INDEXED_ACTIVE.fetch_add(1, Ordering::Relaxed);
                 if !PASS_STATE_LOG.swap(true, Ordering::Relaxed) {
                     crate::log_msg(&format!(
@@ -1813,7 +1824,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         ctx.context.VSSetShader(pass_info.vs.as_ref(), None);
         ctx.context.PSSetShader(pass_info.ps.as_ref(), None);
         if let Some(ref cb) = pass_info.constant_buffer {
-            let cbs = [Some(cb.clone())];
+            let cbs = [Some(cb.clone()), Some(cb.clone()), Some(cb.clone()), Some(cb.clone())];
             ctx.context.VSSetConstantBuffers(0, Some(&cbs));
             ctx.context.PSSetConstantBuffers(0, Some(&cbs));
         }
@@ -1848,14 +1859,16 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
             ctx.context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), ctx.depth_stencil_view.as_ref());
         }
 
-        let vp = windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
-            Width: ctx.width as f32,
-            Height: ctx.height as f32,
-            MinDepth: 0.0,
-            MaxDepth: 1.0,
-        };
+        let vp = crate::backend::CURRENT_VIEWPORT.lock().unwrap().unwrap_or(
+            windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: ctx.width as f32,
+                Height: ctx.height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }
+        );
         ctx.context.RSSetViewports(Some(&[vp]));
 
         ctx.context.DrawIndexed(index_count, start_index, base_vertex_index);

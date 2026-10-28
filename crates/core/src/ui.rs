@@ -879,6 +879,9 @@ fn pick_and_assign_effect_path(row_idx: usize, path: &str) {
 }
 
 fn remove_assigned_effect(row_idx: usize) {
+    *ACTIVE_TARGET_EFFECT.lock().unwrap() = None;
+    ACTIVE_PARAM_CONTROLS.lock().unwrap().clear();
+
     let row = {
         let rows = UI_ROWS.lock().unwrap();
         if row_idx >= rows.len() {
@@ -900,6 +903,15 @@ fn remove_assigned_effect(row_idx: usize) {
     };
     drop(reg);
 
+    let target_row = {
+        let rows = UI_ROWS.lock().unwrap();
+        if rows.is_empty() {
+            None
+        } else {
+            Some(row_idx.min(rows.len() - 1))
+        }
+    };
+
     set_status_text("Эффект снят.");
     if let Some(h) = *MANAGER_HWND.lock().unwrap() {
         let parent = HWND(h as *mut c_void);
@@ -907,7 +919,9 @@ fn remove_assigned_effect(row_idx: usize) {
             refresh_assignment_list(lv);
         }
     }
-    on_row_selected(row_idx);
+    if let Some(idx) = target_row {
+        on_row_selected(idx);
+    }
 }
 
 fn toggle_selected_subset_expand(row_idx: usize) {
@@ -935,15 +949,18 @@ fn toggle_selected_subset_expand(row_idx: usize) {
 
 fn rebuild_param_controls(container: HWND, target_effect: Option<*mut HikariEffect>) {
     unsafe {
-        // Destroy existing controls in container
+        // Destroy existing controls in container safely
+        ACTIVE_PARAM_CONTROLS.lock().unwrap().clear();
+
+        let mut children = Vec::new();
         let mut child = GetWindow(container, GW_CHILD).unwrap_or_default();
         while !child.0.is_null() {
-            let next = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
-            let _ = DestroyWindow(child);
-            child = next;
+            children.push(child);
+            child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
         }
-
-        ACTIVE_PARAM_CONTROLS.lock().unwrap().clear();
+        for c in children {
+            let _ = DestroyWindow(c);
+        }
 
         let (font, bold) = get_or_create_fonts();
 
@@ -1273,7 +1290,8 @@ unsafe fn effects_manager_wndproc_inner(
 
             match cmd_id {
                 ID_SET_EFFECT_BTN => {
-                    if let Some(row_idx) = *SELECTED_ROW.lock().unwrap() {
+                    let sel = *SELECTED_ROW.lock().unwrap();
+                    if let Some(row_idx) = sel {
                         pick_and_assign_effect(row_idx);
                     } else {
                         set_status_text("Сначала выберите объект в списке слева.");
@@ -1281,13 +1299,15 @@ unsafe fn effects_manager_wndproc_inner(
                     return LRESULT(0);
                 }
                 ID_REMOVE_EFFECT_BTN => {
-                    if let Some(row_idx) = *SELECTED_ROW.lock().unwrap() {
+                    let sel = *SELECTED_ROW.lock().unwrap();
+                    if let Some(row_idx) = sel {
                         remove_assigned_effect(row_idx);
                     }
                     return LRESULT(0);
                 }
                 ID_EXTRACT_SUBSETS_BTN => {
-                    if let Some(row_idx) = *SELECTED_ROW.lock().unwrap() {
+                    let sel = *SELECTED_ROW.lock().unwrap();
+                    if let Some(row_idx) = sel {
                         toggle_selected_subset_expand(row_idx);
                     }
                     return LRESULT(0);
@@ -1309,68 +1329,75 @@ unsafe fn effects_manager_wndproc_inner(
             if cmd_id >= PARAM_CONTROL_ID_BASE {
                 let eff_addr = *ACTIVE_TARGET_EFFECT.lock().unwrap();
                 if let Some(addr) = eff_addr {
-                    if addr != 0 {
-                        let eff = &mut *(addr as *mut HikariEffect);
-                        let controls = ACTIVE_PARAM_CONTROLS.lock().unwrap().clone();
-                        for ctrl in controls {
-                            if ctrl.widget == UIWidgetKind::Checkbox {
-                                let btn_hwnd = HWND(lparam.0 as *mut c_void);
-                                if btn_hwnd == ctrl.checkbox_hwnd {
-                                    let is_checked = send_msg(btn_hwnd, BM_GETCHECK, 0, 0) == (BST_CHECKED.0 as isize);
-                                    let _ = eff.set_param_value_bool(ctrl.param_idx, is_checked);
-                                    break;
+                    let is_alive = addr != 0
+                        && ASSIGNMENT_REGISTRY
+                            .lock()
+                            .map(|r| r.is_effect_alive(addr as *mut HikariEffect))
+                            .unwrap_or(false);
+                    if !is_alive {
+                        *ACTIVE_TARGET_EFFECT.lock().unwrap() = None;
+                        return LRESULT(0);
+                    }
+                    let eff = &mut *(addr as *mut HikariEffect);
+                    let controls = ACTIVE_PARAM_CONTROLS.lock().unwrap().clone();
+                    for ctrl in controls {
+                        if ctrl.widget == UIWidgetKind::Checkbox {
+                            let btn_hwnd = HWND(lparam.0 as *mut c_void);
+                            if btn_hwnd == ctrl.checkbox_hwnd {
+                                let is_checked = send_msg(btn_hwnd, BM_GETCHECK, 0, 0) == (BST_CHECKED.0 as isize);
+                                let _ = eff.set_param_value_bool(ctrl.param_idx, is_checked);
+                                break;
+                            }
+                        } else if ctrl.widget == UIWidgetKind::Combo {
+                            let combo_hwnd = HWND(lparam.0 as *mut c_void);
+                            if combo_hwnd == ctrl.combo_hwnd && notify_code == CBN_SELCHANGE {
+                                let cur_sel = send_msg(combo_hwnd, CB_GETCURSEL, 0, 0);
+                                if cur_sel >= 0 {
+                                    let _ = eff.set_param_value_f32(ctrl.param_idx, cur_sel as f32);
                                 }
-                            } else if ctrl.widget == UIWidgetKind::Combo {
-                                let combo_hwnd = HWND(lparam.0 as *mut c_void);
-                                if combo_hwnd == ctrl.combo_hwnd && notify_code == CBN_SELCHANGE {
-                                    let cur_sel = send_msg(combo_hwnd, CB_GETCURSEL, 0, 0);
-                                    if cur_sel >= 0 {
-                                        let _ = eff.set_param_value_f32(ctrl.param_idx, cur_sel as f32);
-                                    }
-                                    break;
-                                }
-                            } else if ctrl.widget == UIWidgetKind::Color {
-                                let btn_hwnd = HWND(lparam.0 as *mut c_void);
-                                if btn_hwnd == ctrl.color_btn_hwnd {
-                                    let vals = eff.get_param_value_float3(ctrl.param_idx).unwrap_or([1.0, 1.0, 1.0]);
-                                    let init_r = (vals[0].clamp(0.0, 1.0) * 255.0) as u32;
-                                    let init_g = (vals[1].clamp(0.0, 1.0) * 255.0) as u32;
-                                    let init_b = (vals[2].clamp(0.0, 1.0) * 255.0) as u32;
-                                    let mut custom_colors = [COLORREF(0); 16];
+                                break;
+                            }
+                        } else if ctrl.widget == UIWidgetKind::Color {
+                            let btn_hwnd = HWND(lparam.0 as *mut c_void);
+                            if btn_hwnd == ctrl.color_btn_hwnd {
+                                let vals = eff.get_param_value_float3(ctrl.param_idx).unwrap_or([1.0, 1.0, 1.0]);
+                                let init_r = (vals[0].clamp(0.0, 1.0) * 255.0) as u32;
+                                let init_g = (vals[1].clamp(0.0, 1.0) * 255.0) as u32;
+                                let init_b = (vals[2].clamp(0.0, 1.0) * 255.0) as u32;
+                                let mut custom_colors = [COLORREF(0); 16];
 
-                                    let mut cc = CHOOSECOLORW::default();
-                                    cc.lStructSize = std::mem::size_of::<CHOOSECOLORW>() as u32;
-                                    cc.hwndOwner = hwnd;
-                                    cc.rgbResult = COLORREF(init_r | (init_g << 8) | (init_b << 16));
-                                    cc.lpCustColors = custom_colors.as_mut_ptr();
-                                    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+                                let mut cc = CHOOSECOLORW::default();
+                                cc.lStructSize = std::mem::size_of::<CHOOSECOLORW>() as u32;
+                                cc.hwndOwner = hwnd;
+                                cc.rgbResult = COLORREF(init_r | (init_g << 8) | (init_b << 16));
+                                cc.lpCustColors = custom_colors.as_mut_ptr();
+                                cc.Flags = CC_FULLOPEN | CC_RGBINIT;
 
-                                    if ChooseColorW(&mut cc).as_bool() {
-                                        let r = (cc.rgbResult.0 & 0xFF) as f32 / 255.0;
-                                        let g = ((cc.rgbResult.0 >> 8) & 0xFF) as f32 / 255.0;
-                                        let b = ((cc.rgbResult.0 >> 16) & 0xFF) as f32 / 255.0;
-                                        eff.set_param_value_float3(ctrl.param_idx, [r, g, b]);
+                                if ChooseColorW(&mut cc).as_bool() {
+                                    let r = (cc.rgbResult.0 & 0xFF) as f32 / 255.0;
+                                    let g = ((cc.rgbResult.0 >> 8) & 0xFF) as f32 / 255.0;
+                                    let b = ((cc.rgbResult.0 >> 16) & 0xFF) as f32 / 255.0;
+                                    eff.set_param_value_float3(ctrl.param_idx, [r, g, b]);
 
-                                        let rgb_str = format!("RGB: {:.2}, {:.2}, {:.2}", r, g, b);
-                                        let w_rgb: Vec<u16> = rgb_str.encode_utf16().chain(std::iter::once(0)).collect();
-                                        let _ = SetWindowTextW(ctrl.color_label_hwnd, PCWSTR(w_rgb.as_ptr()));
-                                    }
-                                    break;
+                                    let rgb_str = format!("RGB: {:.2}, {:.2}, {:.2}", r, g, b);
+                                    let w_rgb: Vec<u16> = rgb_str.encode_utf16().chain(std::iter::once(0)).collect();
+                                    let _ = SetWindowTextW(ctrl.color_label_hwnd, PCWSTR(w_rgb.as_ptr()));
                                 }
-                            } else if notify_code == EN_KILLFOCUS {
-                                let edit_hwnd = HWND(lparam.0 as *mut c_void);
-                                if edit_hwnd == ctrl.edit_hwnd {
-                                    let mut text_buf = [0u16; 64];
-                                    let len = GetWindowTextW(edit_hwnd, &mut text_buf);
-                                    let text = String::from_utf16_lossy(&text_buf[..len as usize]);
-                                    if let Ok(v) = text.parse::<f32>() {
-                                        let clamped = v.clamp(ctrl.min_val, ctrl.max_val);
-                                        let _ = eff.set_param_value_f32(ctrl.param_idx, clamped);
-                                        let pos = (((clamped - ctrl.min_val) / (ctrl.max_val - ctrl.min_val)) * 1000.0) as isize;
-                                        let _ = send_msg(ctrl.trackbar_hwnd, TBM_SETPOS, 1, pos);
-                                    }
-                                    break;
+                                break;
+                            }
+                        } else if notify_code == EN_KILLFOCUS {
+                            let edit_hwnd = HWND(lparam.0 as *mut c_void);
+                            if edit_hwnd == ctrl.edit_hwnd {
+                                let mut text_buf = [0u16; 64];
+                                let len = GetWindowTextW(edit_hwnd, &mut text_buf);
+                                let text = String::from_utf16_lossy(&text_buf[..len as usize]);
+                                if let Ok(v) = text.parse::<f32>() {
+                                    let clamped = v.clamp(ctrl.min_val, ctrl.max_val);
+                                    let _ = eff.set_param_value_f32(ctrl.param_idx, clamped);
+                                    let pos = (((clamped - ctrl.min_val) / (ctrl.max_val - ctrl.min_val)) * 1000.0) as isize;
+                                    let _ = send_msg(ctrl.trackbar_hwnd, TBM_SETPOS, 1, pos);
                                 }
+                                break;
                             }
                         }
                     }
@@ -1383,20 +1410,27 @@ unsafe fn effects_manager_wndproc_inner(
 
             let eff_addr = *ACTIVE_TARGET_EFFECT.lock().unwrap();
             if let Some(addr) = eff_addr {
-                if addr != 0 {
-                    let eff = &mut *(addr as *mut HikariEffect);
-                    let controls = ACTIVE_PARAM_CONTROLS.lock().unwrap().clone();
-                    for ctrl in controls {
-                        if ctrl.trackbar_hwnd == trackbar {
-                            let frac = (pos as f32) / 1000.0;
-                            let val = ctrl.min_val + frac * (ctrl.max_val - ctrl.min_val);
-                            let _ = eff.set_param_value_f32(ctrl.param_idx, val);
+                let is_alive = addr != 0
+                    && ASSIGNMENT_REGISTRY
+                        .lock()
+                        .map(|r| r.is_effect_alive(addr as *mut HikariEffect))
+                        .unwrap_or(false);
+                if !is_alive {
+                    *ACTIVE_TARGET_EFFECT.lock().unwrap() = None;
+                    return LRESULT(0);
+                }
+                let eff = &mut *(addr as *mut HikariEffect);
+                let controls = ACTIVE_PARAM_CONTROLS.lock().unwrap().clone();
+                for ctrl in controls {
+                    if ctrl.trackbar_hwnd == trackbar {
+                        let frac = (pos as f32) / 1000.0;
+                        let val = ctrl.min_val + frac * (ctrl.max_val - ctrl.min_val);
+                        let _ = eff.set_param_value_f32(ctrl.param_idx, val);
 
-                            let val_str = format!("{:.3}", val);
-                            let w_val: Vec<u16> = val_str.encode_utf16().chain(std::iter::once(0)).collect();
-                            let _ = SetWindowTextW(ctrl.edit_hwnd, PCWSTR(w_val.as_ptr()));
-                            break;
-                        }
+                        let val_str = format!("{:.3}", val);
+                        let w_val: Vec<u16> = val_str.encode_utf16().chain(std::iter::once(0)).collect();
+                        let _ = SetWindowTextW(ctrl.edit_hwnd, PCWSTR(w_val.as_ptr()));
+                        break;
                     }
                 }
             }
