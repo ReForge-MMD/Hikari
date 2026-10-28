@@ -61,10 +61,11 @@ static DRAW_SUCCESS_LOGGED: AtomicBool = AtomicBool::new(false);
 static DRAW_WAIT_LOGGED: AtomicBool = AtomicBool::new(false);
 static FRAME_CLEAR_LOGGED: AtomicBool = AtomicBool::new(false);
 
-fn clear_frame_targets_once(ctx: &D3D11Context) {
+fn clear_frame_targets_once(ctx: &mut D3D11Context) {
     if !DX11_FRAME_CLEARED.swap(true, Ordering::AcqRel) {
         // Transparent black (alpha = 0.0) so untouched pixels let the native MMD scene show through
         ctx.clear([0.0, 0.0, 0.0, 0.0], 1.0, 0);
+        ctx.current_bound_srvs = [None; 8];
         if !FRAME_CLEAR_LOGGED.swap(true, Ordering::Relaxed) {
             crate::log_msg("Cleared DX11 overlay color/depth targets before the first model draw");
         }
@@ -509,52 +510,6 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         return false;
     }
 
-    // Synchronize live camera and world matrices from the real D3D9 device
-    let raw_dev = if !_this.is_null() {
-        _this
-    } else {
-        resolve_d3d9_device().map(|d| d.as_raw()).unwrap_or(std::ptr::null_mut())
-    };
-    if !raw_dev.is_null() {
-        let dev = std::mem::ManuallyDrop::new(std::mem::transmute::<*mut c_void, Direct3D9::IDirect3DDevice9>(raw_dev));
-        let id_mat = [
-            1.0f32, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        let mut w_mat = id_mat;
-        let mut v_mat = id_mat;
-        let mut p_mat = id_mat;
-
-        let hr_w = dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(256), w_mat.as_mut_ptr() as *mut _);
-        if hr_w.is_ok() {
-            *crate::backend::CURRENT_WORLD_MATRIX.lock().unwrap() = w_mat;
-        }
-        let hr_v = dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(2), v_mat.as_mut_ptr() as *mut _);
-        if hr_v.is_ok() {
-            *crate::backend::CURRENT_VIEW_MATRIX.lock().unwrap() = v_mat;
-        }
-        let hr_p = dev.GetTransform(Direct3D9::D3DTRANSFORMSTATETYPE(3), p_mat.as_mut_ptr() as *mut _);
-        if hr_p.is_ok() {
-            *crate::backend::CURRENT_PROJ_MATRIX.lock().unwrap() = p_mat;
-        }
-
-        static MATRIX_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !MATRIX_LOGGED.swap(true, Ordering::Relaxed) {
-            let w = *crate::backend::CURRENT_WORLD_MATRIX.lock().unwrap();
-            let v = *crate::backend::CURRENT_VIEW_MATRIX.lock().unwrap();
-            let p = *crate::backend::CURRENT_PROJ_MATRIX.lock().unwrap();
-            crate::log_msg(&format!(
-                "Captured live D3D9 transforms: W_ok={} V_ok={} P_ok={} | W_trans=({:.2},{:.2},{:.2}) V_trans=({:.2},{:.2},{:.2}) P_diag=({:.3},{:.3},{:.3})",
-                hr_w.is_ok(), hr_v.is_ok(), hr_p.is_ok(),
-                w[12], w[13], w[14],
-                v[12], v[13], v[14],
-                p[0], p[5], p[10]
-            ));
-        }
-    }
-
     static PASS_STATE_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let total = DRAW_INDEXED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
     let pass_info = match active_pass {
@@ -676,13 +631,23 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     let textures = *BOUND_TEXTURES.lock().unwrap();
     for (slot, tex_opt) in textures.iter().enumerate() {
         if let Some(tex_addr) = *tex_opt {
-            if let Ok(srv) = ctx.upload_d3d9_texture_to_srv(tex_addr as *mut c_void) {
-                let srvs = [Some(srv)];
-                unsafe {
-                    ctx.context.PSSetShaderResources(slot as u32, Some(&srvs));
-                    ctx.context.VSSetShaderResources(slot as u32, Some(&srvs));
+            if ctx.current_bound_srvs[slot] != Some(tex_addr) {
+                if let Ok(srv) = ctx.upload_d3d9_texture_to_srv(tex_addr as *mut c_void) {
+                    let srvs = [Some(srv)];
+                    unsafe {
+                        ctx.context.PSSetShaderResources(slot as u32, Some(&srvs));
+                        ctx.context.VSSetShaderResources(slot as u32, Some(&srvs));
+                    }
+                    ctx.current_bound_srvs[slot] = Some(tex_addr);
                 }
             }
+        } else if ctx.current_bound_srvs[slot].is_some() {
+            let srvs: [Option<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView>; 1] = [None];
+            unsafe {
+                ctx.context.PSSetShaderResources(slot as u32, Some(&srvs));
+                ctx.context.VSSetShaderResources(slot as u32, Some(&srvs));
+            }
+            ctx.current_bound_srvs[slot] = None;
         }
     }
 

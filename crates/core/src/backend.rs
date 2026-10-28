@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 use windows::Win32::Foundation::HWND;
@@ -106,34 +107,26 @@ pub fn update_effect_standard_matrices(eff: &mut crate::effect::HikariEffect) {
     let wv = mul_mat4(&w, &v);
     let wvp = mul_mat4(&wv, &p);
 
-    let mut write_mat = |sem: &str, alt_names: &[&str], mat: &[f32; 16]| {
-        let idx_opt = eff.param_by_semantic.get(sem)
-            .copied()
-            .or_else(|| {
-                for name in alt_names {
-                    if let Some(&idx) = eff.param_by_name.get(&name.to_lowercase()) {
-                        return Some(idx);
-                    }
-                }
-                None
-            });
-        if let Some(idx) = idx_opt {
-            let param = &eff.parameters[idx];
-            if param.offset + 64 <= eff.constant_data.len() {
-                let slice = unsafe {
-                    std::slice::from_raw_parts(mat.as_ptr() as *const u8, 64)
-                };
-                eff.constant_data[param.offset..param.offset + 64].copy_from_slice(slice);
-                eff.constant_dirty = true;
+    let o = eff.std_offsets;
+    let cdata = &mut eff.constant_data;
+
+    let write_mat = |cdata: &mut Vec<u8>, off_opt: Option<usize>, mat: &[f32; 16]| -> bool {
+        if let Some(off) = off_opt {
+            if off + 64 <= cdata.len() {
+                let slice = unsafe { std::slice::from_raw_parts(mat.as_ptr() as *const u8, 64) };
+                cdata[off..off + 64].copy_from_slice(slice);
+                return true;
             }
         }
+        false
     };
 
-    write_mat("WORLD", &["World", "WorldMatrix"], &w);
-    write_mat("VIEW", &["View", "ViewMatrix"], &v);
-    write_mat("PROJECTION", &["Projection", "Proj", "ProjMatrix"], &p);
-    write_mat("WORLDVIEW", &["WorldView", "WorldViewMatrix"], &wv);
-    write_mat("WORLDVIEWPROJECTION", &["WorldViewProj", "WorldViewProjection", "wvp"], &wvp);
+    let mut dirty = false;
+    dirty |= write_mat(cdata, o.world, &w);
+    dirty |= write_mat(cdata, o.view, &v);
+    dirty |= write_mat(cdata, o.proj, &p);
+    dirty |= write_mat(cdata, o.world_view, &wv);
+    dirty |= write_mat(cdata, o.world_view_proj, &wvp);
 
     // Compute CameraPosition from View matrix
     let cam_x = -(v[12] * v[0] + v[13] * v[4] + v[14] * v[8]);
@@ -141,36 +134,26 @@ pub fn update_effect_standard_matrices(eff: &mut crate::effect::HikariEffect) {
     let cam_z = -(v[12] * v[2] + v[13] * v[6] + v[14] * v[10]);
     let cam_pos = [cam_x, cam_y, cam_z, 1.0f32];
 
-    let mut write_vec4 = |sem: &str, alt_names: &[&str], vec: &[f32; 4]| {
-        let idx_opt = eff.param_by_semantic.get(sem)
-            .copied()
-            .or_else(|| {
-                for name in alt_names {
-                    if let Some(&idx) = eff.param_by_name.get(&name.to_lowercase()) {
-                        return Some(idx);
-                    }
-                }
-                None
-            });
-        if let Some(idx) = idx_opt {
-            let param = &eff.parameters[idx];
-            if param.offset + 16 <= eff.constant_data.len() {
-                let slice = unsafe {
-                    std::slice::from_raw_parts(vec.as_ptr() as *const u8, 16)
-                };
-                eff.constant_data[param.offset..param.offset + 16].copy_from_slice(slice);
-                eff.constant_dirty = true;
+    let write_vec4 = |cdata: &mut Vec<u8>, off_opt: Option<usize>, vec: &[f32; 4]| -> bool {
+        if let Some(off) = off_opt {
+            if off + 16 <= cdata.len() {
+                let slice = unsafe { std::slice::from_raw_parts(vec.as_ptr() as *const u8, 16) };
+                cdata[off..off + 16].copy_from_slice(slice);
+                return true;
             }
         }
+        false
     };
 
-    write_vec4("POSITION", &["CameraPosition", "CameraPos"], &cam_pos);
-    write_vec4("CAMERAPOSITION", &["CameraPosition", "CameraPos"], &cam_pos);
-    write_vec4("DIRECTION", &["LightDirection", "LightDir"], &[0.5, 1.0, -0.5, 0.0]);
-    write_vec4("LIGHTDIRECTION", &["LightDirection", "LightDir"], &[0.5, 1.0, -0.5, 0.0]);
-    write_vec4("DIFFUSE", &["MaterialDiffuse"], &[1.0, 1.0, 1.0, 1.0]);
-    write_vec4("AMBIENT", &["MaterialAmbient"], &[0.5, 0.5, 0.5, 1.0]);
-    write_vec4("SPECULAR", &["MaterialSpecular"], &[0.0, 0.0, 0.0, 1.0]);
+    dirty |= write_vec4(cdata, o.camera_pos, &cam_pos);
+    dirty |= write_vec4(cdata, o.light_dir, &[0.5, 1.0, -0.5, 0.0]);
+    dirty |= write_vec4(cdata, o.mat_diffuse, &[1.0, 1.0, 1.0, 1.0]);
+    dirty |= write_vec4(cdata, o.mat_ambient, &[0.5, 0.5, 0.5, 1.0]);
+    dirty |= write_vec4(cdata, o.mat_specular, &[0.0, 0.0, 0.0, 1.0]);
+
+    if dirty {
+        eff.constant_dirty = true;
+    }
 }
 
 pub static CURRENT_VIEWPORT: Mutex<Option<windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT>> = Mutex::new(None);
@@ -266,4 +249,86 @@ pub fn on_draw_indexed_primitive_dx11(
             this, prim_type, base_vertex_index, min_vertex_index, num_vertices, start_index, prim_count
         )
     }
+}
+
+pub struct ShadowVertexBuffer {
+    pub data: Vec<u8>,
+    pub version: u64,
+    pub lock_state: Option<(u32, usize, u32)>,
+}
+
+static SHADOW_BUFFERS: Mutex<Option<HashMap<usize, ShadowVertexBuffer>>> = Mutex::new(None);
+
+pub fn register_shadow_vertex_buffer(addr: usize, length: usize) {
+    if let Ok(mut guard) = SHADOW_BUFFERS.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        map.insert(addr, ShadowVertexBuffer {
+            data: vec![0u8; length],
+            version: 1,
+            lock_state: None,
+        });
+    }
+}
+
+pub fn unregister_shadow_vertex_buffer(addr: usize) {
+    if let Ok(mut guard) = SHADOW_BUFFERS.lock() {
+        if let Some(ref mut map) = *guard {
+            map.remove(&addr);
+        }
+    }
+}
+
+pub fn lock_shadow_vertex_buffer(
+    addr: usize,
+    offset: u32,
+    size: u32,
+    flags: u32,
+) -> Option<*mut c_void> {
+    let mut guard = SHADOW_BUFFERS.lock().ok()?;
+    let map = guard.as_mut()?;
+    let shadow = map.get_mut(&addr)?;
+    let actual_size = if size == 0 {
+        shadow.data.len().saturating_sub(offset as usize)
+    } else {
+        size as usize
+    };
+    if actual_size == 0 || (offset as usize) + actual_size > shadow.data.len() {
+        return None;
+    }
+    shadow.lock_state = Some((offset, actual_size, flags));
+    unsafe {
+        Some(shadow.data.as_mut_ptr().add(offset as usize) as *mut c_void)
+    }
+}
+
+pub fn unlock_shadow_vertex_buffer_prepare(
+    addr: usize,
+) -> Option<(u32, usize, u32, *const u8)> {
+    let mut guard = SHADOW_BUFFERS.lock().ok()?;
+    let map = guard.as_mut()?;
+    let shadow = map.get_mut(&addr)?;
+    let (offset, actual_size, flags) = shadow.lock_state?;
+    let ptr = unsafe { shadow.data.as_ptr().add(offset as usize) };
+    Some((offset, actual_size, flags, ptr))
+}
+
+pub fn unlock_shadow_vertex_buffer_commit(addr: usize) {
+    if let Ok(mut guard) = SHADOW_BUFFERS.lock() {
+        if let Some(ref mut map) = *guard {
+            if let Some(shadow) = map.get_mut(&addr) {
+                shadow.lock_state = None;
+                shadow.version = shadow.version.wrapping_add(1);
+            }
+        }
+    }
+}
+
+pub fn copy_shadow_vertex_buffer<R, F>(addr: usize, f: F) -> Option<R>
+where
+    F: FnOnce(u64, &[u8]) -> R,
+{
+    let guard = SHADOW_BUFFERS.lock().ok()?;
+    let map = guard.as_ref()?;
+    let shadow = map.get(&addr)?;
+    Some(f(shadow.version, &shadow.data))
 }

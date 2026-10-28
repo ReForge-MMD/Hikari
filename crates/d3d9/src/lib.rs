@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use windows::core::{HRESULT, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND, S_OK};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+use windows::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 
 fn get_system_d3d9() -> HMODULE {
@@ -684,6 +684,59 @@ unsafe extern "system" fn proxy_CreateCubeTexture(
     f(real_dev(this), edge_length, levels, usage, format, pool, pp_cube_texture, p_shared_handle)
 }
 
+static mut REAL_VB_VTBL: [usize; 14] = [0; 14];
+static mut HOOKED_VB_VTBL: [usize; 14] = [0; 14];
+static VB_VTBL_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "system" fn hook_vb_Release(this: *mut c_void) -> u32 {
+    type F = unsafe extern "system" fn(*mut c_void) -> u32;
+    let f: F = std::mem::transmute(REAL_VB_VTBL[2]);
+    let ref_count = f(this);
+    if ref_count == 0 {
+        hikari_core::backend::unregister_shadow_vertex_buffer(this as usize);
+    }
+    ref_count
+}
+
+unsafe extern "system" fn hook_vb_Lock(
+    this: *mut c_void,
+    offset_to_lock: u32,
+    size_to_lock: u32,
+    ppb_data: *mut *mut c_void,
+    flags: u32,
+) -> HRESULT {
+    if ppb_data.is_null() {
+        return windows::Win32::Foundation::E_POINTER;
+    }
+    if let Some(ptr) = hikari_core::backend::lock_shadow_vertex_buffer(this as usize, offset_to_lock, size_to_lock, flags) {
+        *ppb_data = ptr;
+        return windows::core::HRESULT(0); // S_OK
+    }
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void, u32) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_VB_VTBL[11]);
+    f(this, offset_to_lock, size_to_lock, ppb_data, flags)
+}
+
+unsafe extern "system" fn hook_vb_Unlock(this: *mut c_void) -> HRESULT {
+    if let Some((offset, actual_size, flags, shadow_ptr)) = hikari_core::backend::unlock_shadow_vertex_buffer_prepare(this as usize) {
+        type PfnLock = unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void, u32) -> HRESULT;
+        type PfnUnlock = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+        let real_lock: PfnLock = std::mem::transmute(REAL_VB_VTBL[11]);
+        let real_unlock: PfnUnlock = std::mem::transmute(REAL_VB_VTBL[12]);
+        let mut real_ptr: *mut c_void = std::ptr::null_mut();
+        let hr = real_lock(this, offset, actual_size as u32, &mut real_ptr, flags);
+        if hr.is_ok() && !real_ptr.is_null() {
+            std::ptr::copy_nonoverlapping(shadow_ptr, real_ptr as *mut u8, actual_size);
+            let _ = real_unlock(this);
+        }
+        hikari_core::backend::unlock_shadow_vertex_buffer_commit(this as usize);
+        return windows::core::HRESULT(0); // S_OK
+    }
+    type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(REAL_VB_VTBL[12]);
+    f(this)
+}
+
 unsafe extern "system" fn proxy_CreateVertexBuffer(
     this: *mut c_void,
     length: u32,
@@ -703,6 +756,27 @@ unsafe extern "system" fn proxy_CreateVertexBuffer(
     ) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[26]);
     let hr = f(real_dev(this), length, usage, fvf, pool, pp_vertex_buffer, p_shared_handle);
+    if hr.is_ok() && !pp_vertex_buffer.is_null() && !(*pp_vertex_buffer).is_null() {
+        let vb = *pp_vertex_buffer;
+        if !VB_VTBL_INIT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let orig_vtbl = *(vb as *const *const usize);
+            std::ptr::copy_nonoverlapping(orig_vtbl, REAL_VB_VTBL.as_mut_ptr(), 14);
+            std::ptr::copy_nonoverlapping(orig_vtbl, HOOKED_VB_VTBL.as_mut_ptr(), 14);
+            HOOKED_VB_VTBL[2] = hook_vb_Release as usize;
+            HOOKED_VB_VTBL[11] = hook_vb_Lock as usize;
+            HOOKED_VB_VTBL[12] = hook_vb_Unlock as usize;
+            hikari_core::log_msg("[d3d9] IDirect3DVertexBuffer9 vtable hooked (Release=2, Lock=11, Unlock=12)");
+        }
+        let mut old_protect = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS::default();
+        let _ = VirtualProtect(
+            vb,
+            8,
+            PAGE_READWRITE,
+            &mut old_protect,
+        );
+        *(vb as *mut *const usize) = HOOKED_VB_VTBL.as_ptr();
+        hikari_core::backend::register_shadow_vertex_buffer(vb as usize, length as usize);
+    }
     static LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < 30 || hr.0 != 0 {
@@ -839,12 +913,22 @@ unsafe extern "system" fn proxy_SetRenderState(
     f(real_dev(this), state, value)
 }
 
+static STAGE0_COLOROP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4 /* D3DTOP_MODULATE */);
+static STAGE0_ALPHAOP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4 /* D3DTOP_MODULATE */);
+
 unsafe extern "system" fn proxy_SetTextureStageState(
     this: *mut c_void,
     stage: u32,
     state: u32,
     value: u32,
 ) -> HRESULT {
+    if stage == 0 {
+        if state == 1 /* D3DTSS_COLOROP */ {
+            STAGE0_COLOROP.store(value, std::sync::atomic::Ordering::Relaxed);
+        } else if state == 4 /* D3DTSS_ALPHAOP */ {
+            STAGE0_ALPHAOP.store(value, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
     let f: F = std::mem::transmute(REAL_DEV_VTBL[67]);
     if stage == 0 && (state == 1 || state == 4) {
@@ -878,7 +962,7 @@ static DRAW_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 
 unsafe fn log_d3d9_draw_state(dev: *mut c_void, call_name: &str, prim_type: u32, count: u32) {
     let n = DRAW_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n < 40 || n % 1000 == 0 {
+    if n < 20 {
         let ps = BOUND_PIXEL_SHADER.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
         let vs = BOUND_VERTEX_SHADER.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
         let tex0 = BOUND_TEXTURE_0.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void;
@@ -923,18 +1007,13 @@ unsafe fn ensure_fixed_function_stage0(dev: *mut c_void) {
         return;
     }
 
-    type PfnGetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, *mut u32) -> HRESULT;
-    type PfnSetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
-
-    let get_tss: PfnGetTSS = std::mem::transmute(REAL_DEV_VTBL[66]);
-    let set_tss: PfnSetTSS = std::mem::transmute(REAL_DEV_VTBL[67]);
-
-    let mut colorop = 0u32;
-    let mut alphaop = 0u32;
-    let _ = get_tss(dev, 0, 1 /* D3DTSS_COLOROP */, &mut colorop);
-    let _ = get_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, &mut alphaop);
+    let colorop = STAGE0_COLOROP.load(std::sync::atomic::Ordering::Relaxed);
+    let alphaop = STAGE0_ALPHAOP.load(std::sync::atomic::Ordering::Relaxed);
 
     if colorop == 1 /* D3DTOP_DISABLE */ || alphaop == 1 /* D3DTOP_DISABLE */ {
+        type PfnSetTSS = unsafe extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
+        let set_tss: PfnSetTSS = std::mem::transmute(REAL_DEV_VTBL[67]);
+
         // Restore standard fixed-function stage 0 modulation
         let _ = set_tss(dev, 0, 1 /* D3DTSS_COLOROP */, 4 /* D3DTOP_MODULATE */);
         let _ = set_tss(dev, 0, 2 /* D3DTSS_COLORARG1 */, 2 /* D3DTA_TEXTURE */);
@@ -942,6 +1021,9 @@ unsafe fn ensure_fixed_function_stage0(dev: *mut c_void) {
         let _ = set_tss(dev, 0, 4 /* D3DTSS_ALPHAOP */, 4 /* D3DTOP_MODULATE */);
         let _ = set_tss(dev, 0, 5 /* D3DTSS_ALPHAARG1 */, 2 /* D3DTA_TEXTURE */);
         let _ = set_tss(dev, 0, 6 /* D3DTSS_ALPHAARG2 */, 0 /* D3DTA_DIFFUSE */);
+
+        STAGE0_COLOROP.store(4, std::sync::atomic::Ordering::Relaxed);
+        STAGE0_ALPHAOP.store(4, std::sync::atomic::Ordering::Relaxed);
 
         static RESTORE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = RESTORE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

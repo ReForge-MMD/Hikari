@@ -88,6 +88,7 @@ pub struct D3D11Context {
     pub frame_counter: u64,
     pub input_layout_cache: HashMap<(usize, u32), ID3D11InputLayout>,
     pub texture_cache: HashMap<usize, ID3D11ShaderResourceView>,
+    pub current_bound_srvs: [Option<usize>; 8],
     pub state_manager: StateManager,
     pub render_targets: RenderTargetManager,
 
@@ -252,6 +253,7 @@ impl D3D11Context {
             frame_counter: 0,
             input_layout_cache: HashMap::new(),
             texture_cache: HashMap::new(),
+            current_bound_srvs: [None; 8],
             state_manager,
             render_targets,
             model_tex: None,
@@ -650,6 +652,7 @@ float4 BlitPS(VOut input) : SV_Target {
             self.context.PSSetShaderResources(0, Some(&none_slice));
             self.context.PSSetShader(None, None);
             self.context.VSSetShader(None, None);
+            self.current_bound_srvs = [None; 8];
         }
         Ok(())
     }
@@ -1057,6 +1060,51 @@ float4 BlitPS(VOut input) : SV_Target {
         vb_addr: usize,
         vb9: &windows::Win32::Graphics::Direct3D9::IDirect3DVertexBuffer9,
     ) -> Result<ID3D11Buffer> {
+        if let Some(res) = crate::backend::copy_shadow_vertex_buffer(vb_addr, |version, slice| -> Result<ID3D11Buffer> {
+            let size = slice.len();
+            let (existing_buf, last_version, cap) = if let Some((ver, b, cap)) = self.vb_cache.get(&vb_addr) {
+                (Some(b.clone()), *ver, *cap)
+            } else {
+                (None, 0, 0)
+            };
+
+            if let Some(buf) = existing_buf {
+                if last_version == version {
+                    return Ok(buf);
+                }
+                if cap >= size {
+                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                    unsafe {
+                        self.context.Map(&buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+                        std::ptr::copy_nonoverlapping(slice.as_ptr(), mapped.pData as *mut u8, size);
+                        self.context.Unmap(&buf, 0);
+                    }
+                    self.vb_cache.insert(vb_addr, (version, buf.clone(), cap));
+                    return Ok(buf);
+                }
+            }
+
+            let new_cap = size.next_power_of_two().max(65536);
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: new_cap as u32,
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+                ..Default::default()
+            };
+            let new_buf = self.create_buffer(&desc, None)?;
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            unsafe {
+                self.context.Map(&new_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+                std::ptr::copy_nonoverlapping(slice.as_ptr(), mapped.pData as *mut u8, size);
+                self.context.Unmap(&new_buf, 0);
+            }
+            self.vb_cache.insert(vb_addr, (version, new_buf.clone(), new_cap));
+            Ok(new_buf)
+        }) {
+            return res;
+        }
+
         let current_frame = self.frame_counter;
         if let Some((last_frame, vb, _cap)) = self.vb_cache.get(&vb_addr) {
             if *last_frame == current_frame {

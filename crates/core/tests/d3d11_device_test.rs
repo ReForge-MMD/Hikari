@@ -73,3 +73,19 @@ fn test_verify_d3d9_vtable_layout() {
     check_slot!(GetPixelShader, 108);
 }
 
+#[test]
+fn test_verify_d3d9_vertex_buffer_vtable_layout() {
+    use windows::Win32::Graphics::Direct3D9::IDirect3DVertexBuffer9_Vtbl;
+    let size = std::mem::size_of::<IDirect3DVertexBuffer9_Vtbl>();
+    let slot_count = size / std::mem::size_of::<usize>();
+    assert_eq!(slot_count, 14);
+
+    let lock_offset = std::mem::offset_of!(IDirect3DVertexBuffer9_Vtbl, Lock) / std::mem::size_of::<usize>();
+    assert_eq!(lock_offset, 11);
+
+    let unlock_offset = std::mem::offset_of!(IDirect3DVertexBuffer9_Vtbl, Unlock) / std::mem::size_of::<usize>();
+    assert_eq!(unlock_offset, 12);
+
+    let desc_offset = std::mem::offset_of!(IDirect3DVertexBuffer9_Vtbl, GetDesc) / std::mem::size_of::<usize>();
+    assert_eq!(desc_offset, 13);
+}

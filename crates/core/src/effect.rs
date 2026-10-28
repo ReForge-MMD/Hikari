@@ -124,6 +124,21 @@ pub struct EffectParameter {
     pub ui: Option<ParameterUIDesc>,
 }
 
+/// Pre-resolved byte offsets for standard MME matrix and vector semantics.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StandardMatrixOffsets {
+    pub world: Option<usize>,
+    pub view: Option<usize>,
+    pub proj: Option<usize>,
+    pub world_view: Option<usize>,
+    pub world_view_proj: Option<usize>,
+    pub camera_pos: Option<usize>,
+    pub light_dir: Option<usize>,
+    pub mat_diffuse: Option<usize>,
+    pub mat_ambient: Option<usize>,
+    pub mat_specular: Option<usize>,
+}
+
 /// Synthetic ID3DXEffect implementation in Rust.
 #[repr(C)]
 pub struct HikariEffect {
@@ -143,6 +158,7 @@ pub struct HikariEffect {
     pub param_by_semantic: HashMap<String, usize>,
     pub name_to_texture_slot: HashMap<String, u32>,
     pub bound_texture_srvs: [Option<ID3D11ShaderResourceView>; 16],
+    pub std_offsets: StandardMatrixOffsets,
     pub constant_buffer: Option<ID3D11Buffer>,
     pub constant_data: Vec<u8>,
     pub constant_dirty: bool,
@@ -703,6 +719,40 @@ impl HikariEffect {
             SetRawValue: effect_set_raw_value,
         };
 
+        let find_offset = |sem: &str, alt_names: &[&str]| -> Option<usize> {
+            let idx_opt = param_by_semantic.get(sem)
+                .copied()
+                .or_else(|| {
+                    for name in alt_names {
+                        if let Some(&idx) = param_by_name.get(&name.to_lowercase()) {
+                            return Some(idx);
+                        }
+                    }
+                    None
+                });
+            idx_opt.and_then(|idx| {
+                let p = &parameters[idx];
+                if p.offset < constant_data.len() {
+                    Some(p.offset)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let std_offsets = StandardMatrixOffsets {
+            world: find_offset("WORLD", &["World", "WorldMatrix"]),
+            view: find_offset("VIEW", &["View", "ViewMatrix"]),
+            proj: find_offset("PROJECTION", &["Projection", "Proj", "ProjMatrix"]),
+            world_view: find_offset("WORLDVIEW", &["WorldView", "WorldViewMatrix"]),
+            world_view_proj: find_offset("WORLDVIEWPROJECTION", &["WorldViewProj", "WorldViewProjection", "wvp"]),
+            camera_pos: find_offset("POSITION", &["CameraPosition", "CameraPos"]).or_else(|| find_offset("CAMERAPOSITION", &["CameraPosition", "CameraPos"])),
+            light_dir: find_offset("DIRECTION", &["LightDirection", "LightDir"]).or_else(|| find_offset("LIGHTDIRECTION", &["LightDirection", "LightDir"])),
+            mat_diffuse: find_offset("DIFFUSE", &["MaterialDiffuse"]),
+            mat_ambient: find_offset("AMBIENT", &["MaterialAmbient"]),
+            mat_specular: find_offset("SPECULAR", &["MaterialSpecular"]),
+        };
+
         let effect = Box::new(HikariEffect {
             vtbl: &VTBL,
             ref_count: AtomicU32::new(1),
@@ -723,6 +773,7 @@ impl HikariEffect {
                 None, None, None, None, None, None, None, None,
                 None, None, None, None, None, None, None, None,
             ],
+            std_offsets,
             constant_buffer,
             constant_data,
             constant_dirty,
@@ -2471,6 +2522,7 @@ unsafe fn clone_hikari_effect(source: *mut HikariEffect) -> Result<*mut HikariEf
         param_by_semantic: effect.param_by_semantic.clone(),
         name_to_texture_slot: effect.name_to_texture_slot.clone(),
         bound_texture_srvs: effect.bound_texture_srvs.clone(),
+        std_offsets: effect.std_offsets,
         constant_buffer,
         constant_data: effect.constant_data.clone(),
         constant_dirty: true,
