@@ -236,7 +236,7 @@ fn test_compile_red_model_fx_file() {
         assert_eq!(eff.find_technique_for_pass(1), Some(0), "Tech 1 -> MainTec");
         assert_eq!(eff.find_technique_for_pass(2), Some(1), "Tech 2 (Camera mode) -> MainTecSS");
         assert_eq!(eff.find_technique_for_pass(0), Some(0), "Tech 0 -> MainTec");
-        assert_eq!(eff.find_technique_for_pass(4), None, "Tech 4 (Edge absent) -> None (fallback to D3D9)");
+        assert_eq!(eff.find_technique_for_pass(4), None, "Tech 4 (Edge absent) -> None");
         drop(Box::from_raw(eff_ptr));
     }
 }

@@ -1,25 +1,19 @@
-use std::collections::HashMap;
-use std::ffi::c_void;
 use std::sync::Mutex;
 use windows::Win32::Foundation::HWND;
 
 use crate::d3d11::D3D11Context;
 use crate::vtable::{
-    execute_dx11_composite, execute_dx11_draw_indexed, register_d3d9_device,
     BOUND_IB, BOUND_TEXTURES, BOUND_VB, GLOBAL_D3D11,
 };
 
 pub static GLOBAL_HWND: Mutex<Option<usize>> = Mutex::new(None);
 pub static ACTIVE_EFFECT: Mutex<Option<usize>> = Mutex::new(None);
 
-pub fn on_device_created(device: *mut c_void, hwnd: HWND) {
+pub fn on_device_created(hwnd: HWND) {
     crate::log_msg(&format!(
-        "[backend] IDirect3DDevice9 registered: {:p}, hwnd={:?}",
-        device, hwnd.0
+        "[backend] Window registered: hwnd={:?}",
+        hwnd.0
     ));
-    unsafe {
-        register_d3d9_device(device);
-    }
     *GLOBAL_HWND.lock().unwrap() = Some(hwnd.0 as usize);
 
     // Initialize D3D11 Context
@@ -41,13 +35,14 @@ pub fn on_device_created(device: *mut c_void, hwnd: HWND) {
 }
 
 pub fn on_device_reset_pre() {
-    crate::vtable::release_d3d9_resources();
+    crate::vtable::release_d3d11_resources();
 }
 
-pub fn on_device_reset_post(device: *mut c_void, _params: *mut c_void) {
-    unsafe {
-        crate::vtable::register_d3d9_device(device);
-        crate::vtable::ensure_composite_targets_initialized(device);
+pub fn on_device_reset_post(width: u32, height: u32) {
+    if let Ok(mut guard) = GLOBAL_D3D11.lock() {
+        if let Some(ref mut ctx) = *guard {
+            let _ = ctx.resize(width, height);
+        }
     }
 }
 
@@ -158,11 +153,11 @@ pub fn update_effect_standard_matrices(eff: &mut crate::effect::HikariEffect) {
 
 pub static CURRENT_VIEWPORT: Mutex<Option<windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT>> = Mutex::new(None);
 
-pub fn on_begin_scene(_device: *mut c_void) {
+pub fn on_begin_scene() {
     // BeginScene hook
 }
 
-pub fn on_end_scene(device: *mut c_void) {
+pub fn on_end_scene() {
     if let Ok(mut guard) = GLOBAL_D3D11.lock() {
         if let Some(ref mut ctx) = *guard {
             ctx.frame_counter = ctx.frame_counter.wrapping_add(1);
@@ -176,10 +171,6 @@ pub fn on_end_scene(device: *mut c_void) {
             reg.sync_host_objects();
         }
         crate::ui::notify_host_objects_changed();
-    }
-    unsafe {
-        crate::vtable::ensure_composite_targets_initialized(device);
-        execute_dx11_composite(device);
     }
     crate::effect::drain_deferred_effects();
 }
@@ -238,102 +229,4 @@ pub fn should_render_dx11() -> bool {
         || crate::effect::ACTIVE_EFFECT_PASS.lock().unwrap().is_some()
         || ACTIVE_EFFECT.lock().unwrap().is_some()
         || crate::effect::EFFECT_REGISTRY.lock().unwrap().iter().any(|e| e.enabled)
-}
-
-pub fn on_draw_indexed_primitive_dx11(
-    this: *mut c_void,
-    prim_type: u32,
-    base_vertex_index: i32,
-    min_vertex_index: u32,
-    num_vertices: u32,
-    start_index: u32,
-    prim_count: u32,
-) -> bool {
-    unsafe {
-        execute_dx11_draw_indexed(
-            this, prim_type, base_vertex_index, min_vertex_index, num_vertices, start_index, prim_count
-        )
-    }
-}
-
-pub struct ShadowVertexBuffer {
-    pub data: Vec<u8>,
-    pub version: u64,
-    pub lock_state: Option<(u32, usize, u32)>,
-}
-
-static SHADOW_BUFFERS: Mutex<Option<HashMap<usize, ShadowVertexBuffer>>> = Mutex::new(None);
-
-pub fn register_shadow_vertex_buffer(addr: usize, length: usize) {
-    if let Ok(mut guard) = SHADOW_BUFFERS.lock() {
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(addr, ShadowVertexBuffer {
-            data: vec![0u8; length],
-            version: 1,
-            lock_state: None,
-        });
-    }
-}
-
-pub fn unregister_shadow_vertex_buffer(addr: usize) {
-    if let Ok(mut guard) = SHADOW_BUFFERS.lock() {
-        if let Some(ref mut map) = *guard {
-            map.remove(&addr);
-        }
-    }
-}
-
-pub fn lock_shadow_vertex_buffer(
-    addr: usize,
-    offset: u32,
-    size: u32,
-    flags: u32,
-) -> Option<*mut c_void> {
-    let mut guard = SHADOW_BUFFERS.lock().ok()?;
-    let map = guard.as_mut()?;
-    let shadow = map.get_mut(&addr)?;
-    let actual_size = if size == 0 {
-        shadow.data.len().saturating_sub(offset as usize)
-    } else {
-        size as usize
-    };
-    if actual_size == 0 || (offset as usize) + actual_size > shadow.data.len() {
-        return None;
-    }
-    shadow.lock_state = Some((offset, actual_size, flags));
-    unsafe {
-        Some(shadow.data.as_mut_ptr().add(offset as usize) as *mut c_void)
-    }
-}
-
-pub fn unlock_shadow_vertex_buffer_prepare(
-    addr: usize,
-) -> Option<(u32, usize, u32, *const u8)> {
-    let mut guard = SHADOW_BUFFERS.lock().ok()?;
-    let map = guard.as_mut()?;
-    let shadow = map.get_mut(&addr)?;
-    let (offset, actual_size, flags) = shadow.lock_state?;
-    let ptr = unsafe { shadow.data.as_ptr().add(offset as usize) };
-    Some((offset, actual_size, flags, ptr))
-}
-
-pub fn unlock_shadow_vertex_buffer_commit(addr: usize) {
-    if let Ok(mut guard) = SHADOW_BUFFERS.lock() {
-        if let Some(ref mut map) = *guard {
-            if let Some(shadow) = map.get_mut(&addr) {
-                shadow.lock_state = None;
-                shadow.version = shadow.version.wrapping_add(1);
-            }
-        }
-    }
-}
-
-pub fn copy_shadow_vertex_buffer<R, F>(addr: usize, f: F) -> Option<R>
-where
-    F: FnOnce(u64, &[u8]) -> R,
-{
-    let guard = SHADOW_BUFFERS.lock().ok()?;
-    let map = guard.as_ref()?;
-    let shadow = map.get(&addr)?;
-    Some(f(shadow.version, &shadow.data))
 }

@@ -38,9 +38,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_DYNAMIC, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM,
-    DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_UINT,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_D24_UNORM_S8_UINT,
+    DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R16G16B16A16_UINT,
     DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
     DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_UNKNOWN,
     DXGI_MODE_SCALING_UNSPECIFIED, DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
@@ -83,23 +82,21 @@ pub struct D3D11Context {
     pub dynamic_vb_size: usize,
     pub dynamic_ib: Option<ID3D11Buffer>,
     pub dynamic_ib_size: usize,
-    pub ib_cache: HashMap<usize, (ID3D11Buffer, bool)>,
-    pub vb_cache: HashMap<usize, (u64, ID3D11Buffer, usize)>,
+
     pub frame_counter: u64,
     pub input_layout_cache: HashMap<(usize, u32), ID3D11InputLayout>,
-    pub texture_cache: HashMap<usize, ID3D11ShaderResourceView>,
+
     pub current_bound_srvs: [Option<usize>; 8],
     pub state_manager: StateManager,
     pub render_targets: RenderTargetManager,
 
-    /// Offscreen composite chain used to paint DX11 content into the native
-    /// D3D9 backbuffer: the model pass target (transparent background), the
+    /// Offscreen composite chain: the model pass target (transparent background), the
     /// composite canvas and a staging texture for CPU readback.
     pub model_tex: Option<ID3D11Texture2D>,
     pub model_rtv: Option<ID3D11RenderTargetView>,
     pub model_srv: Option<ID3D11ShaderResourceView>,
     pub model_depth: Option<ID3D11DepthStencilView>,
-    pub shared_target_tex: Option<ID3D11Texture2D>,
+
     pub composite_tex: Option<ID3D11Texture2D>,
     pub composite_rtv: Option<ID3D11RenderTargetView>,
     pub composite_staging: Option<ID3D11Texture2D>,
@@ -248,11 +245,10 @@ impl D3D11Context {
             dynamic_vb_size: 0,
             dynamic_ib: None,
             dynamic_ib_size: 0,
-            ib_cache: HashMap::new(),
-            vb_cache: HashMap::new(),
+
             frame_counter: 0,
             input_layout_cache: HashMap::new(),
-            texture_cache: HashMap::new(),
+
             current_bound_srvs: [None; 8],
             state_manager,
             render_targets,
@@ -260,7 +256,7 @@ impl D3D11Context {
             model_rtv: None,
             model_srv: None,
             model_depth: None,
-            shared_target_tex: None,
+
             composite_tex: None,
             composite_rtv: None,
             composite_staging: None,
@@ -442,7 +438,7 @@ impl D3D11Context {
         Ok(())
     }
 
-    /// Recreates the offscreen composite chain sized to the MMD backbuffer:
+    /// Recreates the offscreen composite chain:
     /// a model pass target with transparent background, a composite canvas
     /// and a CPU-readable staging texture. Binds the model target for draw
     /// hooks, replacing the swapchain backbuffer as the draw destination.
@@ -594,8 +590,7 @@ float4 BlitPS(VOut input) : SV_Target {
         Ok(())
     }
 
-    /// Draws the composite canvas: the captured D3D9 scene as background and
-    /// the DX11-effect model layer with straight alpha blending.
+    /// Draws the composite canvas with the DX11-effect model layer.
     pub fn render_composite(&mut self, scene_srv: Option<&ID3D11ShaderResourceView>) -> Result<()> {
         let model_srv = match self.model_srv.clone() {
             Some(srv) => srv,
@@ -634,7 +629,7 @@ float4 BlitPS(VOut input) : SV_Target {
                 windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
 
-            // Background pass: MMD's own scene.
+            // Background pass: scene texture if provided.
             if let Some(scene) = scene_srv {
                 let scene_slice = [Some(scene.clone()), None, None, None, None, None, None, None];
                 self.context.PSSetShaderResources(0, Some(&scene_slice));
@@ -686,22 +681,6 @@ float4 BlitPS(VOut input) : SV_Target {
             self.context.Unmap(&staging, 0);
             Ok(out)
         }
-    }
-
-    /// Opens an external D3D9 / D3D9Ex shared texture handle for zero-copy GPU composite.
-    pub fn open_shared_d3d9_resource(&mut self, handle: windows::Win32::Foundation::HANDLE) -> Result<()> {
-        let mut res: Option<windows::Win32::Graphics::Direct3D11::ID3D11Resource> = None;
-        unsafe {
-            self.device.OpenSharedResource(handle, &mut res)?;
-        }
-        let res = res.ok_or_else(|| windows::core::Error::from(HRESULT(-1)))?;
-        let tex: ID3D11Texture2D = windows::core::Interface::cast(&res)?;
-        self.shared_target_tex = Some(tex);
-        crate::log_msg(&format!(
-            "[d3d11] Successfully opened DXGI shared D3D9 texture: handle={:?}",
-            handle.0
-        ));
-        Ok(())
     }
 
     /// Resizes swap chain and views on window resize.
@@ -1004,181 +983,6 @@ float4 BlitPS(VOut input) : SV_Target {
         Ok(ib.clone())
     }
 
-    /// Returns the cached DX11 index buffer for a D3D9 index buffer pointer,
-    /// or uploads it once if not yet cached.
-    pub fn get_or_upload_index_buffer(
-        &mut self,
-        ib_addr: usize,
-        ib9: &windows::Win32::Graphics::Direct3D9::IDirect3DIndexBuffer9,
-    ) -> Result<(ID3D11Buffer, bool)> {
-        if let Some((ib, is_32)) = self.ib_cache.get(&ib_addr) {
-            return Ok((ib.clone(), *is_32));
-        }
-
-        let mut ib_desc = windows::Win32::Graphics::Direct3D9::D3DINDEXBUFFER_DESC::default();
-        let mut p_ib_data: *mut c_void = null_mut();
-        unsafe {
-            ib9.GetDesc(&mut ib_desc)?;
-            if ib_desc.Size == 0 {
-                return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
-            }
-            ib9.Lock(0, ib_desc.Size, &mut p_ib_data, windows::Win32::Graphics::Direct3D9::D3DLOCK_READONLY as u32)?;
-            if p_ib_data.is_null() {
-                let _ = ib9.Unlock();
-                return Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER));
-            }
-
-            let is_32 = ib_desc.Format == windows::Win32::Graphics::Direct3D9::D3DFMT_INDEX32;
-            let slice = std::slice::from_raw_parts(p_ib_data as *const u8, ib_desc.Size as usize);
-
-            let byte_width = (ib_desc.Size as u32 + 3) & !3;
-            let padded_data;
-            let p_data = if byte_width as usize == slice.len() {
-                slice.as_ptr()
-            } else {
-                let mut v = Vec::with_capacity(byte_width as usize);
-                v.extend_from_slice(slice);
-                v.resize(byte_width as usize, 0);
-                padded_data = v;
-                padded_data.as_ptr()
-            };
-
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: byte_width,
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_INDEX_BUFFER.0 as u32,
-                ..Default::default()
-            };
-            let subresource = D3D11_SUBRESOURCE_DATA {
-                pSysMem: p_data as *const c_void,
-                SysMemPitch: 0,
-                SysMemSlicePitch: 0,
-            };
-            let mut buf_opt = None;
-            let hr = self.device.CreateBuffer(&desc, Some(&subresource), Some(&mut buf_opt));
-            let _ = ib9.Unlock();
-            hr?;
-
-            let buf = buf_opt.unwrap();
-            self.ib_cache.insert(ib_addr, (buf.clone(), is_32));
-            Ok((buf, is_32))
-        }
-    }
-
-    /// Returns the cached DX11 vertex buffer for the current frame,
-    /// or uploads it once per frame if not yet updated.
-    pub fn get_or_upload_vertex_buffer(
-        &mut self,
-        vb_addr: usize,
-        vb9: &windows::Win32::Graphics::Direct3D9::IDirect3DVertexBuffer9,
-    ) -> Result<ID3D11Buffer> {
-        if let Some(res) = crate::backend::copy_shadow_vertex_buffer(vb_addr, |version, slice| -> Result<ID3D11Buffer> {
-            let size = slice.len();
-            let (existing_buf, last_version, cap) = if let Some((ver, b, cap)) = self.vb_cache.get(&vb_addr) {
-                (Some(b.clone()), *ver, *cap)
-            } else {
-                (None, 0, 0)
-            };
-
-            if let Some(buf) = existing_buf {
-                if last_version == version {
-                    return Ok(buf);
-                }
-                if cap >= size {
-                    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                    unsafe {
-                        self.context.Map(&buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
-                        std::ptr::copy_nonoverlapping(slice.as_ptr(), mapped.pData as *mut u8, size);
-                        self.context.Unmap(&buf, 0);
-                    }
-                    self.vb_cache.insert(vb_addr, (version, buf.clone(), cap));
-                    return Ok(buf);
-                }
-            }
-
-            let new_cap = size.next_power_of_two().max(65536);
-            let desc = D3D11_BUFFER_DESC {
-                ByteWidth: new_cap as u32,
-                Usage: D3D11_USAGE_DYNAMIC,
-                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
-                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-                ..Default::default()
-            };
-            let new_buf = self.create_buffer(&desc, None)?;
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            unsafe {
-                self.context.Map(&new_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
-                std::ptr::copy_nonoverlapping(slice.as_ptr(), mapped.pData as *mut u8, size);
-                self.context.Unmap(&new_buf, 0);
-            }
-            self.vb_cache.insert(vb_addr, (version, new_buf.clone(), new_cap));
-            Ok(new_buf)
-        }) {
-            return res;
-        }
-
-        let current_frame = self.frame_counter;
-        if let Some((last_frame, vb, _cap)) = self.vb_cache.get(&vb_addr) {
-            if *last_frame == current_frame {
-                return Ok(vb.clone());
-            }
-        }
-
-        let mut vb_desc = windows::Win32::Graphics::Direct3D9::D3DVERTEXBUFFER_DESC::default();
-        let mut p_vb_data: *mut c_void = null_mut();
-        unsafe {
-            vb9.GetDesc(&mut vb_desc)?;
-            if vb_desc.Size == 0 {
-                return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
-            }
-            vb9.Lock(0, vb_desc.Size, &mut p_vb_data, windows::Win32::Graphics::Direct3D9::D3DLOCK_READONLY as u32)?;
-            if p_vb_data.is_null() {
-                let _ = vb9.Unlock();
-                return Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER));
-            }
-
-            let size = vb_desc.Size as usize;
-            let slice = std::slice::from_raw_parts(p_vb_data as *const u8, size);
-
-            let (buf, cap) = if let Some((_, existing_buf, cap)) = self.vb_cache.get(&vb_addr) {
-                if *cap >= size {
-                    (existing_buf.clone(), *cap)
-                } else {
-                    let new_cap = size.next_power_of_two().max(65536);
-                    let desc = D3D11_BUFFER_DESC {
-                        ByteWidth: new_cap as u32,
-                        Usage: D3D11_USAGE_DYNAMIC,
-                        BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
-                        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-                        ..Default::default()
-                    };
-                    let new_buf = self.create_buffer(&desc, None)?;
-                    (new_buf, new_cap)
-                }
-            } else {
-                let new_cap = size.next_power_of_two().max(65536);
-                let desc = D3D11_BUFFER_DESC {
-                    ByteWidth: new_cap as u32,
-                    Usage: D3D11_USAGE_DYNAMIC,
-                    BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-                    ..Default::default()
-                };
-                let new_buf = self.create_buffer(&desc, None)?;
-                (new_buf, new_cap)
-            };
-
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context.Map(&buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping(slice.as_ptr(), mapped.pData as *mut u8, size);
-            self.context.Unmap(&buf, 0);
-
-            let _ = vb9.Unlock();
-            self.vb_cache.insert(vb_addr, (current_frame, buf.clone(), cap));
-            Ok(buf)
-        }
-    }
-
     /// Obtains or creates an ID3D11InputLayout matching the Vertex Shader and MMD vertex stride.
     pub fn get_or_create_input_layout(&mut self, vs_bytecode: &[u8], stride: u32) -> Result<ID3D11InputLayout> {
         let key = (vs_bytecode.as_ptr() as usize, stride);
@@ -1346,148 +1150,5 @@ float4 BlitPS(VOut input) : SV_Target {
         let layout = layout_opt.ok_or_else(|| windows::core::Error::from(windows::core::HRESULT(-1)))?;
         self.input_layout_cache.insert(key, layout.clone());
         Ok(layout)
-    }
-
-    /// Converts an incoming Direct3D 9 texture pointer to an ID3D11ShaderResourceView.
-    pub fn upload_d3d9_texture_to_srv(&mut self, tex9_ptr: *mut c_void) -> Result<ID3D11ShaderResourceView> {
-        self.upload_d3d9_texture_to_srv_ex(tex9_ptr, false)
-    }
-
-    /// Same as `upload_d3d9_texture_to_srv` with an optional cache bypass for
-    /// textures whose content changes every frame (frame captures).
-    pub fn upload_d3d9_texture_to_srv_ex(&mut self, tex9_ptr: *mut c_void, force: bool) -> Result<ID3D11ShaderResourceView> {
-        let key = tex9_ptr as usize;
-        static UPLOAD_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        static SCENE_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let log_no = UPLOAD_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let scene_log_no = SCENE_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let verbose = log_no <= 6 || (force && scene_log_no <= 10);
-        let stage = |s: &str, extra: String| {
-            if verbose {
-                crate::log_msg(&format!("d3d9_to_srv[{log_no}#{scene_log_no}] {s}: {extra}"));
-            }
-        };
-        stage("enter", format!("ptr={:p} force={force}", tex9_ptr));
-        if !force {
-            if let Some(srv) = self.texture_cache.get(&key) {
-                stage("cache_hit", String::new());
-                return Ok(srv.clone());
-            }
-        }
-
-        let tex9 = unsafe {
-            std::mem::ManuallyDrop::new(
-                windows::Win32::Graphics::Direct3D9::IDirect3DTexture9::from_raw(tex9_ptr)
-            )
-        };
-        let mut desc = windows::Win32::Graphics::Direct3D9::D3DSURFACE_DESC::default();
-        let mut locked_rect = windows::Win32::Graphics::Direct3D9::D3DLOCKED_RECT::default();
-
-        unsafe {
-            tex9.GetLevelDesc(0, &mut desc)?;
-            stage("getdesc", format!("{:?} {}x{}", desc.Format, desc.Width, desc.Height));
-            tex9.LockRect(
-                0,
-                &mut locked_rect,
-                null_mut(),
-                windows::Win32::Graphics::Direct3D9::D3DLOCK_READONLY as u32,
-            )?;
-            stage("lock", format!("pitch={}", locked_rect.Pitch));
-
-            if locked_rect.pBits.is_null() {
-                let _ = tex9.UnlockRect(0);
-                return Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER));
-            }
-
-            let width = desc.Width.max(1);
-            let height = desc.Height.max(1);
-            let pitch = locked_rect.Pitch as usize;
-
-            let fmt_val = desc.Format.0 as u32;
-            let (dxgi_fmt, row_bytes, num_rows) = match fmt_val {
-                // D3DFMT_A8R8G8B8 (21) | D3DFMT_X8R8G8B8 (22)
-                21 | 22 => (
-                    DXGI_FORMAT_B8G8R8A8_UNORM,
-                    width as usize * 4,
-                    height as usize,
-                ),
-                // D3DFMT_A8 (28)
-                28 => (
-                    DXGI_FORMAT_R8_UNORM,
-                    width as usize,
-                    height as usize,
-                ),
-                // D3DFMT_DXT1 (0x31545844)
-                0x31545844 => {
-                    let block_w = (width as usize + 3) / 4;
-                    let block_h = (height as usize + 3) / 4;
-                    (DXGI_FORMAT_BC1_UNORM, block_w * 8, block_h)
-                }
-                // D3DFMT_DXT2 / DXT3 (0x32545844, 0x33545844)
-                0x32545844 | 0x33545844 => {
-                    let block_w = (width as usize + 3) / 4;
-                    let block_h = (height as usize + 3) / 4;
-                    (DXGI_FORMAT_BC2_UNORM, block_w * 16, block_h)
-                }
-                // D3DFMT_DXT4 / DXT5 (0x34545844, 0x35545844)
-                0x34545844 | 0x35545844 => {
-                    let block_w = (width as usize + 3) / 4;
-                    let block_h = (height as usize + 3) / 4;
-                    (DXGI_FORMAT_BC3_UNORM, block_w * 16, block_h)
-                }
-                // D3DFMT_A8B8G8R8 (32)
-                32 => (
-                    DXGI_FORMAT_R8G8B8A8_UNORM,
-                    width as usize * 4,
-                    height as usize,
-                ),
-                // Fallback: 32-bit BGRA
-                _ => (
-                    DXGI_FORMAT_B8G8R8A8_UNORM,
-                    width as usize * 4,
-                    height as usize,
-                ),
-            };
-
-            let copy_row_bytes = row_bytes.min(pitch);
-            let mut cpu: Vec<u8> = vec![0u8; row_bytes * num_rows];
-            for y in 0..num_rows {
-                let src = std::slice::from_raw_parts(
-                    (locked_rect.pBits as *const u8).add(y * pitch),
-                    copy_row_bytes,
-                );
-                cpu[y * row_bytes..y * row_bytes + copy_row_bytes].copy_from_slice(src);
-            }
-            let _ = tex9.UnlockRect(0);
-            stage("unlock_copied", format!("{} bytes", cpu.len()));
-
-            let tex_desc = D3D11_TEXTURE2D_DESC {
-                Width: width,
-                Height: height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: dxgi_fmt,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                ..Default::default()
-            };
-            let subresource = D3D11_SUBRESOURCE_DATA {
-                pSysMem: cpu.as_ptr() as *const c_void,
-                SysMemPitch: row_bytes as u32,
-                SysMemSlicePitch: (row_bytes * num_rows) as u32,
-            };
-            let mut d3d11_tex = None;
-            let mut srv_opt = None;
-            self.device.CreateTexture2D(&tex_desc, Some(&subresource), Some(&mut d3d11_tex))?;
-            stage("d3d11_texture", String::new());
-            if let Some(ref t) = d3d11_tex {
-                self.device.CreateShaderResourceView(t, None, Some(&mut srv_opt))?;
-            }
-            stage("srv", String::new());
-            let srv = srv_opt.ok_or_else(|| windows::core::Error::from(windows::core::HRESULT(-1)))?;
-            self.texture_cache.insert(key, srv.clone());
-            Ok(srv)
-        }
     }
 }

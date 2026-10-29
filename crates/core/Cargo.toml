@@ -3,7 +3,7 @@ name = "hikari-core"
 version = "0.1.0"
 edition = "2021"
 authors = ["Hikari Contributors"]
-description = "High-performance DirectX 11 runtime and Direct3D 9 API replacement for MikuMikuDance"
+description = "High-performance DirectX 11 runtime for MikuMikuDance"
 license = "MIT"
 
 [lib]
@@ -14,7 +14,6 @@ crate-type = ["cdylib", "rlib"]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D9",
     "Win32_Graphics_Direct3D_Fxc",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",

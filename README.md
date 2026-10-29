@@ -1,8 +1,8 @@
 # Hikari (光)
 
-> High-performance Direct3D 11 runtime, Shader Model 5.0 pipeline, and Direct3D 9 interop bridge for MikuMikuDance (MMD) & MikuMikuEffect (MME), engineered in pure Rust.
+> High-performance Direct3D 11 runtime and Shader Model 5.0 engine for MikuMikuDance (MMD) & MikuMikuEffect (MME), engineered in pure Rust.
 
-Hikari acts as a drop-in runtime plugin that bridges legacy MMD/MME Direct3D 9 host applications to a native Direct3D 11 (Feature Level 11_0) backend. It unlocks full Shader Model 5.0 capabilities, hardware tessellation, 6-stage graphics pipelines, GPGPU Compute Shaders with Unordered Access Views (UAV), Multiple Render Targets (MRT) for deferred rendering, and a 64KB constant buffer reflection architecture.
+Hikari provides a pure Direct3D 11 (Feature Level 11_0) engine and runtime. It unlocks full Shader Model 5.0 capabilities, hardware tessellation, 6-stage graphics pipelines, GPGPU Compute Shaders with Unordered Access Views (UAV), Multiple Render Targets (MRT) for deferred rendering, and a 64KB constant buffer reflection architecture.
 
 ---
 
@@ -15,7 +15,7 @@ Hikari acts as a drop-in runtime plugin that bridges legacy MMD/MME Direct3D 9 h
   - [Multiple Render Targets (MRT) & UAV Compute](#4-multiple-render-targets-mrt--uav-compute)
   - [Pipeline State Object Management](#5-pipeline-state-object-management)
   - [PMX 2.0 Vertex Input Layouts](#6-pmx-20-vertex-input-layouts)
-  - [Extended Direct3D 9 Vtable Interception](#7-extended-direct3d-9-vtable-interception)
+  - [Standalone DirectX 11 Studio & Pipeline](#7-standalone-directx-11-studio--pipeline)
 - [Effect Porting Guide (D3D9 to D3D11)](#effect-porting-guide-d3d9-to-d3d11)
   - [1. Shifting Shader Compilation Profiles](#1-shifting-shader-compilation-profiles)
   - [2. Separating Textures and Samplers](#2-separating-textures-and-samplers)
@@ -34,7 +34,7 @@ Hikari acts as a drop-in runtime plugin that bridges legacy MMD/MME Direct3D 9 h
                           ┌───────────────────────────┐
                           │   MMD / MME Application   │
                           └─────────────┬─────────────┘
-                                        │ Intercept D3D9 / D3DX Vtable
+                                        │ DirectX 11 Host / Studio
                                         ▼
                           ┌───────────────────────────┐
                           │     Hikari Effect Engine  │
@@ -118,11 +118,11 @@ Hikari acts as a drop-in runtime plugin that bridges legacy MMD/MME Direct3D 9 h
   - **Static Model** (stride 32: Position, Normal, UV).
   - **Screen Quad / Post-Process** (stride 20: Position, UV).
 
-### 7. Direct3D 9 COM Proxy Interception
-Directly intercepts Direct3D 9 device calls via a custom COM wrapper (`d3d9.dll` proxy in the MMD root directory):
-- **Slot 16 (`CreateDevice`)**: Creates the proxy device wrapper and initializes the DirectX 11 runtime.
-- **Slot 41 (`BeginScene`) & Slot 42 (`EndScene`)**: Hooks scene boundaries and composites the DX11 rendered model layers into the native D3D9 backbuffer.
-- **Slot 82 (`DrawIndexedPrimitive`)**: Intercepts active SM 5.0 effect passes and renders models directly via DirectX 11.
+### 7. Standalone DirectX 11 Studio & Pipeline
+Directly runs as a standalone DirectX 11 runtime and viewer:
+- **Pure DX11**: Operates exclusively with Feature Level 11_0, eliminating all legacy D3D9 proxies and wrappers.
+- **Hikari Studio**: Interactive real-time PMX/VMD viewer with IK physics solver, facial morphs, and unthrottled GPU pipeline.
+- **SM 5.0 Effects**: Full HLSL SM 5.0 rendering with compute shaders, tessellation, and constant buffer reflection.
 
 ---
 
@@ -242,7 +242,7 @@ To build the optimized production binaries:
 ```bash
 cargo build --release
 ```
-The compiled libraries (`d3d9.dll`, `hikari_core.dll`, `HikariEffects.dll`) will be output to `target\release\`.
+The compiled binaries (`hikari_studio.exe`, `hikari_core.dll`, `HikariEffects.dll`) will be output to `target\release\`.
 
 ---
 
@@ -263,7 +263,7 @@ The compiled libraries (`d3d9.dll`, `hikari_core.dll`, `HikariEffects.dll`) will
 
 ## Known Behaviors & Technical Nuances
 
-- **Backbuffer Composite**: Hikari renders DirectX 11 model layers offscreen and seamlessly composites the result directly into the native D3D9 backbuffer at `EndScene`. MMD's internal D3D9 bone handles, coordinate axes, and GUI overlay cleanly above or blend with the DX11 output.
+- **DirectX 11 Native**: Hikari renders models and effects purely through native DirectX 11 without legacy DirectX 9 runtimes, proxies, or shared texture copies.
 - **Fixed-Function Removal**: Direct3D 9 fixed-function pipeline states (such as `LightEnable`, `TextureTransformFlags`, `Ambient`) are unsupported in Shader Model 5.0. Shaders must handle lighting and transformations entirely within the programmable stages.
 - **Include Files**: HLSL `#include` statements are supported natively via `D3D_COMPILE_STANDARD_FILE_INCLUDE`. Included files must be located relative to the shader file or the current working directory.
 

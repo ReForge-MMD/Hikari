@@ -3474,7 +3474,8 @@ unsafe extern "system" fn effect_set_texture(this: *mut c_void, hParameter: D3DX
         crate::vtable::BOUND_TEXTURES.lock().unwrap()[slot.min(7)] = Some(pTexture as usize);
         if let Ok(mut guard) = crate::vtable::GLOBAL_D3D11.lock() {
             if let Some(ref mut ctx) = *guard {
-                if let Ok(srv) = ctx.upload_d3d9_texture_to_srv(pTexture) {
+                let srv_res: windows::core::Result<windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView> = if let Some(unk) = (pTexture as *mut windows::core::IUnknown).as_ref() { windows::core::Interface::cast(unk) } else { Err(windows::core::Error::from(windows::Win32::Foundation::E_POINTER)) };
+                if let Ok(srv) = srv_res {
                     eff.bound_texture_srvs[slot] = Some(srv);
                 }
             }
