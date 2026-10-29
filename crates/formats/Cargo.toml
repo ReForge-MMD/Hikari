@@ -1,0 +1,10 @@
+[package]
+name = "hikari-formats"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hikari Contributors"]
+description = "High-performance PMX, VMD, and VPD asset parsers and encoders for Hikari"
+license = "MIT"
+
+[dependencies]
+encoding_rs = "0.8"

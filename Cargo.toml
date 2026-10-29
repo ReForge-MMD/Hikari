@@ -1,7 +1,10 @@
 [workspace]
 members = [
     "crates/core",
-    "crates/d3d9",
+    "crates/formats",
+    "crates/animation",
+    "crates/render",
+    "crates/studio",
     "crates/effects",
 ]
 resolver = "2"

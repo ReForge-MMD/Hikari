@@ -1,0 +1,10 @@
+[package]
+name = "hikari-animation"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hikari Contributors"]
+description = "Bézier curves, skeleton hierarchy, IK, and morph animation engine for Hikari"
+license = "MIT"
+
+[dependencies]
+hikari-formats = { path = "../formats" }

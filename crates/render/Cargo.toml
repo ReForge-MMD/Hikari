@@ -1,0 +1,20 @@
+[package]
+name = "hikari-render"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hikari Contributors"]
+description = "Pure DirectX 11 scene and skeletal model renderer for Hikari"
+license = "MIT"
+
+[dependencies]
+hikari-core = { path = "../core" }
+hikari-formats = { path = "../formats" }
+hikari-animation = { path = "../animation" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp", "tga", "dds"] }
