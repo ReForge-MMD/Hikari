@@ -242,3 +242,46 @@ fn test_compile_red_model_fx_file() {
 }
 
 
+
+#[test]
+fn test_compile_hikari_postprocess_fx_and_tabs() {
+    use hikari_core::d3d11::D3D11Context;
+    use hikari_core::effect::HikariEffect;
+    use windows::Win32::Foundation::HWND;
+    use std::ptr::null_mut;
+
+    let ctx = D3D11Context::new(HWND(null_mut()), 0, 0)
+        .expect("Failed to create D3D11Context");
+    let fx_path = if std::path::Path::new("hikari_postprocess.fx").exists() {
+        "hikari_postprocess.fx"
+    } else {
+        "../../hikari_postprocess.fx"
+    };
+    let fx_content = std::fs::read_to_string(fx_path)
+        .expect("Failed to read hikari_postprocess.fx");
+
+    let eff_ptr = HikariEffect::new(&fx_content, Some("hikari_postprocess.fx"), &ctx)
+        .expect("HikariEffect::new should compile hikari_postprocess.fx cleanly");
+    assert!(!eff_ptr.is_null());
+    unsafe {
+        let eff = &*eff_ptr;
+        assert!(eff.techniques.len() >= 5);
+        assert!(eff.param_by_name.contains_key("bloomthreshold"));
+        assert!(eff.param_by_name.contains_key("bloomintensity"));
+        assert!(eff.param_by_name.contains_key("vignettecolor"));
+        assert!(eff.param_by_name.contains_key("enablepostprocess"));
+        drop(Box::from_raw(eff_ptr));
+    }
+
+    // Verify offscreen tabs registration
+    let mut reg = hikari_core::effect::ModelAssignmentRegistry::new();
+    reg.scan_and_register_offscreen_tabs(&fx_content);
+    assert_eq!(reg.tabs.len(), 4); // Main + 3 offscreen tabs
+    assert_eq!(reg.tabs[0].name, "Main");
+    assert_eq!(reg.tabs[1].name, "DepthBuffer");
+    assert_eq!(reg.tabs[1].description, "Z-Buffer and Depth Stencil render target");
+    assert_eq!(reg.tabs[2].name, "NormalMap");
+    assert_eq!(reg.tabs[2].description, "World Normal and Geometric Specular buffer");
+    assert_eq!(reg.tabs[3].name, "BloomBuffer");
+    assert_eq!(reg.tabs[3].description, "HDR Bloom and Emission Extraction");
+}
