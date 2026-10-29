@@ -33,7 +33,14 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# MMD temporary files
+# MMD & Effect project and mapping files
+*.hmm
+*.hmd
+*.emm
+*.emd
+*.pmm
+*.hmm.bak
+*.hmd.bak
 *.pmm.bak
 *.emm.bak
 
@@ -43,3 +50,9 @@ mmdplugin_dev_ver0.41_x64/
 
 # Runtime logs
 *.log
+
+# Specification-driven development (Spec Kit)
+specs/
+.specify/
+.agents/
+

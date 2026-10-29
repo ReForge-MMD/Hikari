@@ -169,11 +169,13 @@ pub fn on_end_scene(device: *mut c_void) {
         }
     }
     crate::ui::ensure_ui_injected();
-    static SYNC_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SYNC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 60 == 0 {
+    static LAST_HOST_FINGERPRINT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let fp = crate::mmd_host::get_host_objects_fingerprint();
+    if fp != LAST_HOST_FINGERPRINT.swap(fp, std::sync::atomic::Ordering::Relaxed) {
         if let Ok(mut reg) = crate::effect::ASSIGNMENT_REGISTRY.lock() {
             reg.sync_host_objects();
         }
+        crate::ui::notify_host_objects_changed();
     }
     unsafe {
         crate::vtable::ensure_composite_targets_initialized(device);

@@ -1031,14 +1031,26 @@ float4 BlitPS(VOut input) : SV_Target {
             let is_32 = ib_desc.Format == windows::Win32::Graphics::Direct3D9::D3DFMT_INDEX32;
             let slice = std::slice::from_raw_parts(p_ib_data as *const u8, ib_desc.Size as usize);
 
+            let byte_width = (ib_desc.Size as u32 + 3) & !3;
+            let padded_data;
+            let p_data = if byte_width as usize == slice.len() {
+                slice.as_ptr()
+            } else {
+                let mut v = Vec::with_capacity(byte_width as usize);
+                v.extend_from_slice(slice);
+                v.resize(byte_width as usize, 0);
+                padded_data = v;
+                padded_data.as_ptr()
+            };
+
             let desc = D3D11_BUFFER_DESC {
-                ByteWidth: (ib_desc.Size as u32).next_power_of_two().max(32768),
+                ByteWidth: byte_width,
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11_BIND_INDEX_BUFFER.0 as u32,
                 ..Default::default()
             };
             let subresource = D3D11_SUBRESOURCE_DATA {
-                pSysMem: slice.as_ptr() as *const c_void,
+                pSysMem: p_data as *const c_void,
                 SysMemPitch: 0,
                 SysMemSlicePitch: 0,
             };

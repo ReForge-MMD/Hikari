@@ -244,3 +244,31 @@ pub fn enumerate_host_objects() -> Vec<HostObject> {
 
     objects
 }
+
+/// Returns true if MMD host exports were detected in the process.
+pub fn is_mmd_bound() -> bool {
+    let exports = get_exports();
+    exports.exp_get_pmd_num.is_some() && exports.exp_get_current_object.is_some()
+}
+
+/// Returns a lightweight 64-bit fingerprint of all currently loaded PMD/PMX models and accessories.
+/// Changes whenever models or accessories are loaded, unloaded, replaced, or reordered in MMD.
+pub fn get_host_objects_fingerprint() -> u64 {
+    let pmd_count = get_pmd_num();
+    let acs_count = get_acs_num();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&(pmd_count, acs_count), &mut hasher);
+    for i in 0..pmd_count {
+        std::hash::Hash::hash(&get_pmd_id(i), &mut hasher);
+        std::hash::Hash::hash(&get_pmd_order(i), &mut hasher);
+        std::hash::Hash::hash(&get_pmd_disp(i), &mut hasher);
+        std::hash::Hash::hash(&get_pmd_filename(i), &mut hasher);
+    }
+    for i in 0..acs_count {
+        std::hash::Hash::hash(&get_acs_id(i), &mut hasher);
+        std::hash::Hash::hash(&get_acs_order(i), &mut hasher);
+        std::hash::Hash::hash(&get_acs_disp(i), &mut hasher);
+        std::hash::Hash::hash(&get_acs_filename(i), &mut hasher);
+    }
+    std::hash::Hasher::finish(&hasher)
+}

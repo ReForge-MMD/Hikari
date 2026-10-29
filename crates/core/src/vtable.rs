@@ -574,7 +574,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
     }
     clear_frame_targets_once(ctx);
 
-    let (vb_addr, stride, _offset) = match *BOUND_VB.lock().unwrap() {
+    let (vb_addr, stride, offset) = match *BOUND_VB.lock().unwrap() {
         Some(v) => v,
         None => {
             log_draw_failure_once("no vertex buffer was captured before the indexed draw");
@@ -667,7 +667,7 @@ unsafe extern "system" fn hook_draw_indexed_primitive(
         ctx.context.IASetInputLayout(&input_layout);
         let vbs = [Some(d3d11_vb)];
         let strides = [stride];
-        let offsets = [0u32];
+        let offsets = [offset];
         ctx.context.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(strides.as_ptr()), Some(offsets.as_ptr()));
 
         let index_format = if is_32bit {

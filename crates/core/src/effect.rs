@@ -1302,21 +1302,34 @@ impl ModelAssignmentRegistry {
                 defer_drop_effect(old);
             }
             self.default_effect_path.clear();
+            self.prune_unused_tabs();
             self.update_has_assigned();
             return Ok(());
         }
 
-        let new_effect = create_effect_instance(path)?;
-        if let Some(old) = self.default_effect.replace(new_effect) {
-            defer_drop_effect(old);
-        }
         self.default_effect_path = path.to_string();
-        if let Ok(source) = std::fs::read_to_string(path) {
-            self.scan_and_register_offscreen_tabs(&source);
+        let compile_res = create_effect_instance(path);
+        match compile_res {
+            Ok(new_effect) => {
+                if let Some(old) = self.default_effect.replace(new_effect) {
+                    defer_drop_effect(old);
+                }
+                if let Ok(source) = std::fs::read_to_string(path) {
+                    self.scan_and_register_offscreen_tabs(&source);
+                }
+                HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
+                crate::log_msg(&format!("[Assignment] Set default effect: '{path}'"));
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(old) = self.default_effect.take() {
+                    defer_drop_effect(old);
+                }
+                self.update_has_assigned();
+                crate::log_msg(&format!("[Assignment] Recorded default effect path '{path}' (compilation deferred/failed: {e})"));
+                Err(e)
+            }
         }
-        HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
-        crate::log_msg(&format!("[Assignment] Set default effect: '{path}'"));
-        Ok(())
     }
 
     pub fn assign_model_effect(&mut self, object_id: usize, filename: &str, path: &str) -> Result<(), String> {
@@ -1329,27 +1342,44 @@ impl ModelAssignmentRegistry {
             enabled: true,
         });
 
+        if !filename.is_empty() {
+            model.filename = filename.to_string();
+        }
+
         if path.is_empty() {
             if let Some(old) = model.effect.take() {
                 defer_drop_effect(old);
             }
             model.effect_path.clear();
+            self.prune_unused_tabs();
             self.update_has_assigned();
             return Ok(());
         }
 
-        let new_effect = create_effect_instance(path)?;
-        if let Some(old) = model.effect.replace(new_effect) {
-            defer_drop_effect(old);
-        }
         model.effect_path = path.to_string();
         model.enabled = true;
-        if let Ok(source) = std::fs::read_to_string(path) {
-            self.scan_and_register_offscreen_tabs(&source);
+        let compile_res = create_effect_instance(path);
+        match compile_res {
+            Ok(new_effect) => {
+                if let Some(old) = model.effect.replace(new_effect) {
+                    defer_drop_effect(old);
+                }
+                if let Ok(source) = std::fs::read_to_string(path) {
+                    self.scan_and_register_offscreen_tabs(&source);
+                }
+                HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
+                crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) effect: '{path}'"));
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(old) = model.effect.take() {
+                    defer_drop_effect(old);
+                }
+                self.update_has_assigned();
+                crate::log_msg(&format!("[Assignment] Recorded model (id=0x{object_id:x}) effect path '{path}' (compilation deferred/failed: {e})"));
+                Err(e)
+            }
         }
-        HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
-        crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) effect: '{path}'"));
-        Ok(())
     }
 
     pub fn assign_subset_effect(&mut self, object_id: usize, filename: &str, subset: i32, path: &str) -> Result<(), String> {
@@ -1362,6 +1392,10 @@ impl ModelAssignmentRegistry {
             enabled: true,
         });
 
+        if !filename.is_empty() {
+            model.filename = filename.to_string();
+        }
+
         if path.is_empty() {
             if let Some(sub) = model.subsets.get_mut(&subset) {
                 if let Some(old) = sub.effect.take() {
@@ -1369,28 +1403,41 @@ impl ModelAssignmentRegistry {
                 }
                 sub.effect_path.clear();
             }
+            self.prune_unused_tabs();
             self.update_has_assigned();
             return Ok(());
         }
 
-        let new_effect = create_effect_instance(path)?;
         let sub = model.subsets.entry(subset).or_insert_with(|| ModelSubsetAssignment {
             effect_path: String::new(),
             effect: None,
             enabled: true,
         });
-
-        if let Some(old) = sub.effect.replace(new_effect) {
-            defer_drop_effect(old);
-        }
         sub.effect_path = path.to_string();
         sub.enabled = true;
-        if let Ok(source) = std::fs::read_to_string(path) {
-            self.scan_and_register_offscreen_tabs(&source);
+
+        let compile_res = create_effect_instance(path);
+        match compile_res {
+            Ok(new_effect) => {
+                if let Some(old) = sub.effect.replace(new_effect) {
+                    defer_drop_effect(old);
+                }
+                if let Ok(source) = std::fs::read_to_string(path) {
+                    self.scan_and_register_offscreen_tabs(&source);
+                }
+                HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
+                crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) subset #{subset} effect: '{path}'"));
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(old) = sub.effect.take() {
+                    defer_drop_effect(old);
+                }
+                self.update_has_assigned();
+                crate::log_msg(&format!("[Assignment] Recorded model (id=0x{object_id:x}) subset #{subset} effect path '{path}' (compilation deferred/failed: {e})"));
+                Err(e)
+            }
         }
-        HAS_ASSIGNED_EFFECTS.store(true, Ordering::Release);
-        crate::log_msg(&format!("[Assignment] Set model (id=0x{object_id:x}) subset #{subset} effect: '{path}'"));
-        Ok(())
     }
 
     pub fn toggle_subset_expand(&mut self, object_id: usize) {
@@ -1407,10 +1454,18 @@ impl ModelAssignmentRegistry {
 
     pub fn sync_host_objects(&mut self) {
         let host_objs = crate::mmd_host::enumerate_host_objects();
+        if crate::mmd_host::is_mmd_bound() {
+            let current_ids: std::collections::HashSet<usize> = host_objs.iter().map(|o| o.id).collect();
+            self.models.retain(|id, _| current_ids.contains(id));
+            for tab in &mut self.tabs {
+                tab.model_overrides.retain(|id, _| current_ids.contains(id));
+                tab.subset_overrides.retain(|(id, _), _| current_ids.contains(id));
+            }
+        }
         self.order_to_id.clear();
         for obj in host_objs {
             self.order_to_id.insert(obj.order, obj.id);
-            self.models.entry(obj.id).or_insert_with(|| ModelAssignment {
+            let entry = self.models.entry(obj.id).or_insert_with(|| ModelAssignment {
                 object_id: obj.id,
                 filename: obj.filename.clone(),
                 effect_path: String::new(),
@@ -1418,6 +1473,38 @@ impl ModelAssignmentRegistry {
                 subsets: HashMap::new(),
                 enabled: obj.disp,
             });
+
+            if entry.filename != obj.filename {
+                entry.filename = obj.filename.clone();
+                entry.effect_path.clear();
+                entry.effect = None;
+                entry.subsets.clear();
+            }
+            entry.enabled = obj.disp;
+
+            // Companion .fx auto-binding for accessories (.x)
+            if !obj.is_pmd && entry.effect_path.is_empty() && !obj.filename.is_empty() {
+                let p = std::path::Path::new(&obj.filename);
+                if let Some(ext) = p.extension() {
+                    if ext.eq_ignore_ascii_case("x") {
+                        let companion_fx = p.with_extension("fx");
+                        let companion_fxsub = p.with_extension("fxsub");
+                        let target_path = if companion_fx.exists() {
+                            Some(companion_fx)
+                        } else if companion_fxsub.exists() {
+                            Some(companion_fxsub)
+                        } else {
+                            None
+                        };
+                        if let Some(cp) = target_path {
+                            if let Some(str_path) = cp.to_str() {
+                                crate::log_msg(&format!("[Auto-Bind] Found companion effect for accessory '{}': '{str_path}'", obj.filename));
+                                let _ = self.assign_model_effect(obj.id, &obj.filename, str_path);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1572,15 +1659,19 @@ impl ModelAssignmentRegistry {
                         }
                     }
                 }
+                self.prune_unused_tabs();
                 return Ok(());
             }
 
-            let new_effect = create_effect_instance(path)?;
+            let compile_res = create_effect_instance(path);
+            let new_effect = compile_res.as_ref().ok().copied();
+
             match object_id {
                 None => {
-                    if let Some(old) = tab.default_effect.replace(new_effect) {
+                    if let Some(old) = tab.default_effect.take() {
                         defer_drop_effect(old);
                     }
+                    tab.default_effect = new_effect;
                     tab.default_effect_path = path.to_string();
                 }
                 Some(obj_id) => {
@@ -1590,9 +1681,10 @@ impl ModelAssignmentRegistry {
                             effect: None,
                             enabled: true,
                         });
-                        if let Some(old) = sub.effect.replace(new_effect) {
+                        if let Some(old) = sub.effect.take() {
                             defer_drop_effect(old);
                         }
+                        sub.effect = new_effect;
                         sub.effect_path = path.to_string();
                         sub.enabled = true;
                     } else {
@@ -1601,15 +1693,17 @@ impl ModelAssignmentRegistry {
                             effect: None,
                             enabled: true,
                         });
-                        if let Some(old) = m.effect.replace(new_effect) {
+                        if let Some(old) = m.effect.take() {
                             defer_drop_effect(old);
                         }
+                        m.effect = new_effect;
                         m.effect_path = path.to_string();
                         m.enabled = true;
                     }
                 }
             }
-            Ok(())
+
+            compile_res.map(|_| ())
         } else {
             Err("Invalid tab index".to_string())
         }
@@ -2014,6 +2108,463 @@ impl ModelAssignmentRegistry {
                 }
             }
         }
+        self.update_has_assigned();
+        Ok(())
+    }
+
+    pub fn prune_unused_tabs(&mut self) {
+        let mut referenced_tabs = HashSet::new();
+        let scan_file = |path: &str, tabs: &mut HashSet<String>| {
+            if !path.is_empty() {
+                if let Ok(source) = std::fs::read_to_string(path) {
+                    let vars = crate::shader::parse_global_variables(&source);
+                    for v in vars {
+                        if v.semantic.eq_ignore_ascii_case("OFFSCREENRENDERTARGET") {
+                            tabs.insert(v.name.to_lowercase());
+                        }
+                    }
+                }
+            }
+        };
+
+        scan_file(&self.default_effect_path, &mut referenced_tabs);
+        for m in self.models.values() {
+            scan_file(&m.effect_path, &mut referenced_tabs);
+            for s in m.subsets.values() {
+                scan_file(&s.effect_path, &mut referenced_tabs);
+            }
+        }
+
+        self.tabs.retain(|tab| {
+            if !tab.is_offscreen {
+                return true;
+            }
+            if referenced_tabs.contains(&tab.name.to_lowercase()) {
+                return true;
+            }
+            !tab.default_effect_path.is_empty()
+                || !tab.model_overrides.is_empty()
+                || !tab.subset_overrides.is_empty()
+        });
+
+        if self.current_tab_idx >= self.tabs.len() {
+            self.current_tab_idx = 0;
+        }
+    }
+
+    pub fn save_hmm(&self, path: &str) -> std::io::Result<()> {
+        let mut host_objs = crate::mmd_host::enumerate_host_objects();
+        if host_objs.is_empty() && !self.models.is_empty() {
+            let mut sorted_models: Vec<_> = self.models.values().collect();
+            sorted_models.sort_by_key(|m| m.object_id);
+            for (i, m) in sorted_models.into_iter().enumerate() {
+                let is_pmd = !m.filename.to_lowercase().ends_with(".x");
+                host_objs.push(crate::mmd_host::HostObject {
+                    id: m.object_id,
+                    is_pmd,
+                    index: i as i32,
+                    order: i as i32,
+                    filename: m.filename.clone(),
+                    mat_count: 0,
+                    disp: m.enabled,
+                });
+            }
+        }
+
+        let mut out = String::new();
+        out.push_str("[HikariMapping]\nVersion = 1.0\n\n");
+        out.push_str("[Object]\n");
+        for (i, obj) in host_objs.iter().enumerate() {
+            let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+            out.push_str(&format!("{key} = {}\n", obj.filename));
+        }
+
+        out.push_str("\n[Main]\n");
+        if !self.default_effect_path.is_empty() {
+            out.push_str(&format!("Default = {}\n", self.default_effect_path));
+        }
+        for (i, obj) in host_objs.iter().enumerate() {
+            let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+            if let Some(m) = self.models.get(&obj.id) {
+                if !m.effect_path.is_empty() {
+                    out.push_str(&format!("{key} = {}\n", m.effect_path));
+                }
+                out.push_str(&format!("{key}.show = {}\n", if m.enabled { "true" } else { "false" }));
+                let mut sorted_subsets: Vec<_> = m.subsets.iter().collect();
+                sorted_subsets.sort_by_key(|(&idx, _)| idx);
+                for (&sub_idx, sub) in sorted_subsets {
+                    if !sub.effect_path.is_empty() {
+                        out.push_str(&format!("{key}.Subset.{sub_idx} = {}\n", sub.effect_path));
+                    }
+                    out.push_str(&format!("{key}.Subset.{sub_idx}.show = {}\n", if sub.enabled { "true" } else { "false" }));
+                }
+            }
+        }
+
+        for tab in self.tabs.iter().skip(1) {
+            out.push_str(&format!("\n[{}]\n", tab.name));
+            if !tab.description.is_empty() {
+                out.push_str(&format!("Description = {}\n", tab.description));
+            }
+            if !tab.default_rules.is_empty() {
+                out.push_str(&format!("DefaultRules = {}\n", tab.default_rules));
+            }
+            if !tab.default_effect_path.is_empty() {
+                out.push_str(&format!("Default = {}\n", tab.default_effect_path));
+            }
+            for (i, obj) in host_objs.iter().enumerate() {
+                let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+                if let Some(m) = tab.model_overrides.get(&obj.id) {
+                    if !m.effect_path.is_empty() {
+                        out.push_str(&format!("{key} = {}\n", m.effect_path));
+                    }
+                    out.push_str(&format!("{key}.show = {}\n", if m.enabled { "true" } else { "false" }));
+                }
+                let mut sorted_subs: Vec<_> = tab.subset_overrides.iter().filter(|((id, _), _)| *id == obj.id).collect();
+                sorted_subs.sort_by_key(|((_, idx), _)| *idx);
+                for ((_, sub_idx), sub) in sorted_subs {
+                    if !sub.effect_path.is_empty() {
+                        out.push_str(&format!("{key}.Subset.{sub_idx} = {}\n", sub.effect_path));
+                    }
+                    out.push_str(&format!("{key}.Subset.{sub_idx}.show = {}\n", if sub.enabled { "true" } else { "false" }));
+                }
+            }
+        }
+
+        std::fs::write(path, out)
+    }
+
+    pub fn load_hmm(&mut self, path: &str) -> Result<(), String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        if !content.contains("[HikariMapping]") {
+            crate::log_msg(&format!("[HMM] Legacy .emm format detected in '{path}', falling back to load_emm"));
+            return self.load_emm(path);
+        }
+
+        let host_objs = crate::mmd_host::enumerate_host_objects();
+        let mut current_section = String::new();
+        let mut object_map: HashMap<String, usize> = HashMap::new();
+
+        for (i, obj) in host_objs.iter().enumerate() {
+            let key = if obj.is_pmd { format!("Pmd{i}") } else { format!("Acs{i}") };
+            object_map.insert(key, obj.id);
+        }
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                current_section = line[1..line.len() - 1].trim().to_string();
+                if current_section != "HikariMapping" && current_section != "Object" && current_section != "Main" {
+                    self.add_tab(&current_section, "", "");
+                }
+                continue;
+            }
+
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+
+                if current_section == "HikariMapping" {
+                    continue;
+                }
+
+                if current_section == "Object" {
+                    if !object_map.contains_key(key) {
+                        let is_pmd = key.starts_with("Pmd");
+                        let idx = key.trim_start_matches(|c: char| !c.is_numeric()).parse::<usize>().unwrap_or(0);
+                        let syn_id = if is_pmd { idx + 1 } else { idx + 1000 };
+                        object_map.insert(key.to_string(), syn_id);
+                        self.models.entry(syn_id).or_insert_with(|| ModelAssignment {
+                            object_id: syn_id,
+                            filename: val.to_string(),
+                            effect_path: String::new(),
+                            effect: None,
+                            subsets: HashMap::new(),
+                            enabled: true,
+                        });
+                    }
+                    continue;
+                }
+
+                if current_section == "Main" {
+                    if key.eq_ignore_ascii_case("Default") {
+                        let _ = self.assign_default_effect(val);
+                    } else {
+                        let parts: Vec<&str> = key.split('.').collect();
+                        match parts.len() {
+                            1 => {
+                                if let Some(&obj_id) = object_map.get(parts[0]) {
+                                    let _ = self.assign_model_effect(obj_id, "", val);
+                                }
+                            }
+                            2 => {
+                                if let Some(&obj_id) = object_map.get(parts[0]) {
+                                    if parts[1].eq_ignore_ascii_case("show") {
+                                        if let Some(m) = self.models.get_mut(&obj_id) {
+                                            m.enabled = val.eq_ignore_ascii_case("true");
+                                        }
+                                    } else if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                        let _ = self.assign_subset_effect(obj_id, "", sub_idx, val);
+                                    }
+                                }
+                            }
+                            3 => {
+                                if let Some(&obj_id) = object_map.get(parts[0]) {
+                                    if parts[1].eq_ignore_ascii_case("Subset") {
+                                        if let Ok(sub_idx) = parts[2].parse::<i32>() {
+                                            let _ = self.assign_subset_effect(obj_id, "", sub_idx, val);
+                                        }
+                                    } else if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                        if parts[2].eq_ignore_ascii_case("show") {
+                                            if let Some(m) = self.models.get_mut(&obj_id) {
+                                                if let Some(sub) = m.subsets.get_mut(&sub_idx) {
+                                                    sub.enabled = val.eq_ignore_ascii_case("true");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            4 => {
+                                if let Some(&obj_id) = object_map.get(parts[0]) {
+                                    if parts[1].eq_ignore_ascii_case("Subset") && parts[3].eq_ignore_ascii_case("show") {
+                                        if let Ok(sub_idx) = parts[2].parse::<i32>() {
+                                            if let Some(m) = self.models.get_mut(&obj_id) {
+                                                if let Some(sub) = m.subsets.get_mut(&sub_idx) {
+                                                    sub.enabled = val.eq_ignore_ascii_case("true");
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    let tab_idx = self.tabs.iter().position(|t| t.name.eq_ignore_ascii_case(&current_section));
+                    if let Some(idx) = tab_idx {
+                        if key.eq_ignore_ascii_case("Default") {
+                            let _ = self.assign_tab_effect(idx, None, "", -1, val);
+                        } else if key.eq_ignore_ascii_case("Description") {
+                            if let Some(t) = self.tabs.get_mut(idx) {
+                                t.description = val.to_string();
+                            }
+                        } else if key.eq_ignore_ascii_case("DefaultRules") {
+                            if let Some(t) = self.tabs.get_mut(idx) {
+                                t.default_rules = val.to_string();
+                            }
+                        } else {
+                            let parts: Vec<&str> = key.split('.').collect();
+                            match parts.len() {
+                                1 => {
+                                    if let Some(&obj_id) = object_map.get(parts[0]) {
+                                        let _ = self.assign_tab_effect(idx, Some(obj_id), "", -1, val);
+                                    }
+                                }
+                                2 => {
+                                    if let Some(&obj_id) = object_map.get(parts[0]) {
+                                        if parts[1].eq_ignore_ascii_case("show") {
+                                            self.set_tab_item_shown(idx, Some(obj_id), -1, val.eq_ignore_ascii_case("true"));
+                                        } else if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                            let _ = self.assign_tab_effect(idx, Some(obj_id), "", sub_idx, val);
+                                        }
+                                    }
+                                }
+                                3 => {
+                                    if let Some(&obj_id) = object_map.get(parts[0]) {
+                                        if parts[1].eq_ignore_ascii_case("Subset") {
+                                            if let Ok(sub_idx) = parts[2].parse::<i32>() {
+                                                let _ = self.assign_tab_effect(idx, Some(obj_id), "", sub_idx, val);
+                                            }
+                                        } else if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                            if parts[2].eq_ignore_ascii_case("show") {
+                                                self.set_tab_item_shown(idx, Some(obj_id), sub_idx, val.eq_ignore_ascii_case("true"));
+                                            }
+                                        }
+                                    }
+                                }
+                                4 => {
+                                    if let Some(&obj_id) = object_map.get(parts[0]) {
+                                        if parts[1].eq_ignore_ascii_case("Subset") && parts[3].eq_ignore_ascii_case("show") {
+                                            if let Ok(sub_idx) = parts[2].parse::<i32>() {
+                                                self.set_tab_item_shown(idx, Some(obj_id), sub_idx, val.eq_ignore_ascii_case("true"));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.update_has_assigned();
+        Ok(())
+    }
+
+    pub fn save_hmd(&self, object_id: usize, path: &str) -> std::io::Result<()> {
+        let mut out = String::new();
+        out.push_str("[HikariModelData]\nVersion = 1.0\n\n");
+        if let Some(m) = self.models.get(&object_id) {
+            out.push_str("[Main]\n");
+            if !m.effect_path.is_empty() {
+                out.push_str(&format!("Default = {}\n", m.effect_path));
+            }
+            out.push_str(&format!("show = {}\n", if m.enabled { "true" } else { "false" }));
+            let mut sorted_subsets: Vec<_> = m.subsets.iter().collect();
+            sorted_subsets.sort_by_key(|(&idx, _)| idx);
+            for (&sub_idx, sub) in sorted_subsets {
+                if !sub.effect_path.is_empty() {
+                    out.push_str(&format!("Subset.{sub_idx} = {}\n", sub.effect_path));
+                }
+                out.push_str(&format!("Subset.{sub_idx}.show = {}\n", if sub.enabled { "true" } else { "false" }));
+            }
+        }
+        for tab in self.tabs.iter().skip(1) {
+            let has_model = tab.model_overrides.contains_key(&object_id);
+            let has_sub = tab.subset_overrides.iter().any(|((id, _), _)| *id == object_id);
+            if has_model || has_sub {
+                out.push_str(&format!("\n[{}]\n", tab.name));
+                if let Some(m) = tab.model_overrides.get(&object_id) {
+                    if !m.effect_path.is_empty() {
+                        out.push_str(&format!("Default = {}\n", m.effect_path));
+                    }
+                    out.push_str(&format!("show = {}\n", if m.enabled { "true" } else { "false" }));
+                }
+                let mut sorted_subs: Vec<_> = tab.subset_overrides.iter().filter(|((id, _), _)| *id == object_id).collect();
+                sorted_subs.sort_by_key(|((_, idx), _)| *idx);
+                for ((_, sub_idx), sub) in sorted_subs {
+                    if !sub.effect_path.is_empty() {
+                        out.push_str(&format!("Subset.{sub_idx} = {}\n", sub.effect_path));
+                    }
+                    out.push_str(&format!("Subset.{sub_idx}.show = {}\n", if sub.enabled { "true" } else { "false" }));
+                }
+            }
+        }
+        std::fs::write(path, out)
+    }
+
+    pub fn load_hmd(&mut self, object_id: usize, path: &str) -> Result<(), String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        if !content.contains("[HikariModelData]") {
+            crate::log_msg(&format!("[HMD] Legacy .emd format detected in '{path}', falling back to load_emd"));
+            return self.load_emd(object_id, path);
+        }
+
+        let mut current_section = String::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') && line.ends_with(']') {
+                current_section = line[1..line.len() - 1].trim().to_string();
+                if current_section != "HikariModelData" && current_section != "Main" {
+                    self.add_tab(&current_section, "", "");
+                }
+                continue;
+            }
+
+            if let Some((k, v)) = line.split_once('=') {
+                let key = k.trim();
+                let val = v.trim();
+
+                if current_section == "HikariModelData" {
+                    continue;
+                }
+
+                if current_section == "Main" {
+                    if key.eq_ignore_ascii_case("Default") {
+                        let _ = self.assign_model_effect(object_id, "", val);
+                    } else if key.eq_ignore_ascii_case("show") {
+                        if let Some(m) = self.models.get_mut(&object_id) {
+                            m.enabled = val.eq_ignore_ascii_case("true");
+                        }
+                    } else {
+                        let parts: Vec<&str> = key.split('.').collect();
+                        match parts.len() {
+                            1 => {
+                                if let Ok(sub_idx) = parts[0].parse::<i32>() {
+                                    let _ = self.assign_subset_effect(object_id, "", sub_idx, val);
+                                }
+                            }
+                            2 => {
+                                if parts[0].eq_ignore_ascii_case("Subset") {
+                                    if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                        let _ = self.assign_subset_effect(object_id, "", sub_idx, val);
+                                    }
+                                } else if let Ok(sub_idx) = parts[0].parse::<i32>() {
+                                    if parts[1].eq_ignore_ascii_case("show") {
+                                        if let Some(m) = self.models.get_mut(&object_id) {
+                                            if let Some(sub) = m.subsets.get_mut(&sub_idx) {
+                                                sub.enabled = val.eq_ignore_ascii_case("true");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            3 => {
+                                if parts[0].eq_ignore_ascii_case("Subset") && parts[2].eq_ignore_ascii_case("show") {
+                                    if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                        if let Some(m) = self.models.get_mut(&object_id) {
+                                            if let Some(sub) = m.subsets.get_mut(&sub_idx) {
+                                                sub.enabled = val.eq_ignore_ascii_case("true");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    let tab_idx = self.tabs.iter().position(|t| t.name.eq_ignore_ascii_case(&current_section));
+                    if let Some(idx) = tab_idx {
+                        if key.eq_ignore_ascii_case("Default") {
+                            let _ = self.assign_tab_effect(idx, Some(object_id), "", -1, val);
+                        } else if key.eq_ignore_ascii_case("show") {
+                            self.set_tab_item_shown(idx, Some(object_id), -1, val.eq_ignore_ascii_case("true"));
+                        } else {
+                            let parts: Vec<&str> = key.split('.').collect();
+                            match parts.len() {
+                                1 => {
+                                    if let Ok(sub_idx) = parts[0].parse::<i32>() {
+                                        let _ = self.assign_tab_effect(idx, Some(object_id), "", sub_idx, val);
+                                    }
+                                }
+                                2 => {
+                                    if parts[0].eq_ignore_ascii_case("Subset") {
+                                        if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                            let _ = self.assign_tab_effect(idx, Some(object_id), "", sub_idx, val);
+                                        }
+                                    } else if let Ok(sub_idx) = parts[0].parse::<i32>() {
+                                        if parts[1].eq_ignore_ascii_case("show") {
+                                            self.set_tab_item_shown(idx, Some(object_id), sub_idx, val.eq_ignore_ascii_case("true"));
+                                        }
+                                    }
+                                }
+                                3 => {
+                                    if parts[0].eq_ignore_ascii_case("Subset") && parts[2].eq_ignore_ascii_case("show") {
+                                        if let Ok(sub_idx) = parts[1].parse::<i32>() {
+                                            self.set_tab_item_shown(idx, Some(object_id), sub_idx, val.eq_ignore_ascii_case("true"));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.update_has_assigned();
         Ok(())
     }

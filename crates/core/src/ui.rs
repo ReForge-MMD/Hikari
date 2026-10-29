@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR, PWSTR};
@@ -14,10 +14,13 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, REC
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Controls::Dialogs::*;
 use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetKeyState};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::effect::{HikariEffect, UIWidgetKind, ASSIGNMENT_REGISTRY};
+
+const WM_REFRESH_HOST_OBJECTS: u32 = WM_USER + 102;
+static LAST_DIALOG_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
 
 // Injected MMEffect Top Menu items (MikuMikuDance main menu bar)
 pub const ID_MENU_ROOT: u32 = 0x4800;
@@ -186,6 +189,59 @@ static MANAGER_HWND: Mutex<Option<usize>> = Mutex::new(None);
 static LOG_WINDOW_HWND: Mutex<Option<usize>> = Mutex::new(None);
 static PARAM_CONTAINER_HWND: Mutex<Option<usize>> = Mutex::new(None);
 static SHOW_PARAMS_PANEL: AtomicBool = AtomicBool::new(true);
+static IS_DIRTY: AtomicBool = AtomicBool::new(false);
+
+fn set_dirty_state(parent: HWND, dirty: bool) {
+    IS_DIRTY.store(dirty, Ordering::Release);
+    if !parent.0.is_null() {
+        if let Ok(apply_btn) = unsafe { GetDlgItem(Some(parent), ID_APPLY_BTN as i32) } {
+            unsafe {
+                let _ = EnableWindow(apply_btn, dirty);
+            }
+        }
+    }
+}
+
+fn sync_selection_controls(hwnd: HWND, listview: HWND) {
+    if hwnd.0.is_null() || listview.0.is_null() {
+        return;
+    }
+    let sel = unsafe { send_msg(listview, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) };
+    let has_sel = sel >= 0;
+    let is_default = sel == 0;
+
+    let is_model_row = if has_sel && !is_default {
+        let rows = UI_ROWS.lock().unwrap();
+        rows.get(sel as usize).map(|r| r.subset == -1).unwrap_or(false)
+    } else {
+        false
+    };
+
+    let enable_set = has_sel;
+    let enable_rem = has_sel;
+    let enable_hide_show = has_sel && !is_default;
+    let enable_extract = is_model_row;
+
+    unsafe {
+        if let Ok(btn) = GetDlgItem(Some(hwnd), ID_SET_EFFECT_BTN as i32) {
+            let _ = EnableWindow(btn, enable_set);
+        }
+        if let Ok(btn) = GetDlgItem(Some(hwnd), ID_REMOVE_EFFECT_BTN as i32) {
+            let _ = EnableWindow(btn, enable_rem);
+        }
+        if let Ok(btn) = GetDlgItem(Some(hwnd), ID_HIDE_SHOW_BTN as i32) {
+            let _ = EnableWindow(btn, enable_hide_show);
+        }
+
+        let hmenu = GetMenu(hwnd);
+        if !hmenu.0.is_null() {
+            let _ = EnableMenuItem(hmenu, ID_EDIT_SET_EFFECT, if enable_set { MF_ENABLED } else { MF_GRAYED });
+            let _ = EnableMenuItem(hmenu, ID_EDIT_REMOVE_EFFECT, if enable_rem { MF_ENABLED } else { MF_GRAYED });
+            let _ = EnableMenuItem(hmenu, ID_EDIT_HIDE_SHOW, if enable_hide_show { MF_ENABLED } else { MF_GRAYED });
+            let _ = EnableMenuItem(hmenu, ID_EDIT_SUBSET_EXTRACT, if enable_extract { MF_ENABLED } else { MF_GRAYED });
+        }
+    }
+}
 
 static UI_FONT: Mutex<Option<usize>> = Mutex::new(None);
 static BOLD_FONT: Mutex<Option<usize>> = Mutex::new(None);
@@ -474,6 +530,7 @@ pub fn toggle_effects_manager(parent: HWND) {
             if unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
             } else {
+                refresh_effects_manager_dialog(hwnd);
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_SHOW);
                     let _ = SetForegroundWindow(hwnd);
@@ -620,7 +677,6 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
         let skip_flags = MF_STRING | if skip_val { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(tool_menu, skip_flags, ID_TOOL_SKIP_VALIDATION as usize, w!("Skip Device Validation(S)"));
         let _ = AppendMenuW(tool_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(tool_menu, MF_STRING, ID_TOOL_ADD_TAB as usize, w!("Add Render Target Tab..."));
         let _ = AppendMenuW(tool_menu, MF_STRING | MF_CHECKED, ID_TOOL_TOGGLE_PARAMS as usize, w!("Show HLSL Parameters Panel"));
         let _ = AppendMenuW(main_menu, MF_POPUP, tool_menu.0 as usize, w!("Tool(T)"));
 
@@ -794,6 +850,8 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
             Some(ID_APPLY_BTN),
         );
         set_control_font(apply_btn, font);
+        let _ = EnableWindow(apply_btn, false);
+        IS_DIRTY.store(false, Ordering::Release);
 
         // 6. Right panel: Parameter tweaks container
         let param_lbl = make_child(
@@ -823,6 +881,7 @@ fn create_effects_manager_window(parent: HWND) -> HWND {
         // 7. Rebuild tabs & populate list
         rebuild_tab_control(tab_ctrl);
         refresh_assignment_list(listview);
+        sync_selection_controls(hwnd, listview);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
@@ -881,6 +940,40 @@ fn update_caption_for_current_tab(parent: HWND) {
 
 fn set_status_text(text: &str) {
     crate::log_msg(&format!("[UI Status] {text}"));
+}
+
+/// Fully refreshes the host objects, tab control, and assignment list in the Effects Manager dialog.
+pub fn refresh_effects_manager_dialog(hwnd: HWND) {
+    if hwnd.0.is_null() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return;
+    }
+    if let Ok(mut reg) = ASSIGNMENT_REGISTRY.lock() {
+        reg.sync_host_objects();
+    }
+    LAST_DIALOG_FINGERPRINT.store(crate::mmd_host::get_host_objects_fingerprint(), Ordering::Relaxed);
+    unsafe {
+        if let Ok(tc) = GetDlgItem(Some(hwnd), ID_TAB_CONTROL as i32) {
+            rebuild_tab_control(tc);
+        }
+        if let Ok(lv) = GetDlgItem(Some(hwnd), ID_LISTVIEW as i32) {
+            refresh_assignment_list(lv);
+            sync_selection_controls(hwnd, lv);
+        }
+        update_caption_for_current_tab(hwnd);
+    }
+}
+
+/// Asynchronously notifies the Effects Manager dialog to refresh if visible when host models change.
+pub fn notify_host_objects_changed() {
+    let lock = MANAGER_HWND.lock().unwrap();
+    if let Some(h) = *lock {
+        let hwnd = HWND(h as *mut c_void);
+        if unsafe { IsWindow(Some(hwnd)) }.as_bool() && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_REFRESH_HOST_OBJECTS, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
 }
 
 fn refresh_assignment_list(listview: HWND) {
@@ -1061,6 +1154,13 @@ fn refresh_assignment_list(listview: HWND) {
     }
     IS_REFRESHING.store(false, Ordering::SeqCst);
     crate::log_msg(&format!("[UI] refresh_assignment_list completed: {} items loaded", display_rows.len()));
+    unsafe {
+        if let Ok(parent) = GetParent(listview) {
+            if !parent.0.is_null() {
+                sync_selection_controls(parent, listview);
+            }
+        }
+    }
 }
 
 unsafe fn insert_list_item(listview: HWND, row_idx: i32, col0_text: &str, col1_text: &str) {
@@ -1142,6 +1242,12 @@ fn on_row_selected(row_idx: usize) {
         let container = HWND(c as *mut c_void);
         rebuild_param_controls(container, effect_ptr);
     }
+    if let Some(h) = *MANAGER_HWND.lock().unwrap() {
+        let parent = HWND(h as *mut c_void);
+        if let Ok(lv) = unsafe { GetDlgItem(Some(parent), ID_LISTVIEW as i32) } {
+            sync_selection_controls(parent, lv);
+        }
+    }
 }
 
 fn handle_row_check_toggle(row_idx: usize, is_checked: bool) {
@@ -1159,7 +1265,12 @@ fn handle_row_check_toggle(row_idx: usize, is_checked: bool) {
     let cur_tab = reg.current_tab_idx;
     reg.set_tab_item_shown(cur_tab, row.object_id, row.subset, is_checked);
     if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
-        let _ = reg.save_emm("hikari_mapping.emm");
+        let _ = reg.save_hmm("hikari_mapping.hmm");
+    }
+    drop(reg);
+    if let Some(h) = *MANAGER_HWND.lock().unwrap() {
+        let parent = HWND(h as *mut c_void);
+        set_dirty_state(parent, true);
     }
 }
 
@@ -1248,7 +1359,7 @@ fn pick_and_assign_effect_path(row_idx: usize, path: &str) {
     let cur_tab = reg.current_tab_idx;
     let res = reg.assign_tab_effect(cur_tab, row.object_id, &row.filename, row.subset, path);
     if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
-        let _ = reg.save_emm("hikari_mapping.emm");
+        let _ = reg.save_hmm("hikari_mapping.hmm");
     }
     drop(reg);
 
@@ -1257,14 +1368,29 @@ fn pick_and_assign_effect_path(row_idx: usize, path: &str) {
             set_status_text(&format!("Effect assigned: {path}"));
             if let Some(h) = *MANAGER_HWND.lock().unwrap() {
                 let parent = HWND(h as *mut c_void);
+                if let Ok(tc) = unsafe { GetDlgItem(Some(parent), ID_TAB_CONTROL as i32) } {
+                    rebuild_tab_control(tc);
+                }
                 if let Ok(lv) = unsafe { GetDlgItem(Some(parent), ID_LISTVIEW as i32) } {
                     refresh_assignment_list(lv);
                 }
+                set_dirty_state(parent, true);
             }
             on_row_selected(row_idx);
         }
         Err(e) => {
             set_status_text(&format!("Effect compilation error: {e}"));
+            if let Some(h) = *MANAGER_HWND.lock().unwrap() {
+                let parent = HWND(h as *mut c_void);
+                if let Ok(tc) = unsafe { GetDlgItem(Some(parent), ID_TAB_CONTROL as i32) } {
+                    rebuild_tab_control(tc);
+                }
+                if let Ok(lv) = unsafe { GetDlgItem(Some(parent), ID_LISTVIEW as i32) } {
+                    refresh_assignment_list(lv);
+                }
+                set_dirty_state(parent, true);
+            }
+            on_row_selected(row_idx);
         }
     }
 }
@@ -1285,16 +1411,20 @@ fn remove_assigned_effect(row_idx: usize) {
     let cur_tab = reg.current_tab_idx;
     let _ = reg.assign_tab_effect(cur_tab, row.object_id, &row.filename, row.subset, "");
     if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
-        let _ = reg.save_emm("hikari_mapping.emm");
+        let _ = reg.save_hmm("hikari_mapping.hmm");
     }
     drop(reg);
 
     set_status_text("Effect removed.");
     if let Some(h) = *MANAGER_HWND.lock().unwrap() {
         let parent = HWND(h as *mut c_void);
+        if let Ok(tc) = unsafe { GetDlgItem(Some(parent), ID_TAB_CONTROL as i32) } {
+            rebuild_tab_control(tc);
+        }
         if let Ok(lv) = unsafe { GetDlgItem(Some(parent), ID_LISTVIEW as i32) } {
             refresh_assignment_list(lv);
         }
+        set_dirty_state(parent, true);
     }
     on_row_selected(row_idx);
 }
@@ -1318,14 +1448,15 @@ fn toggle_selected_subset_expand(row_idx: usize) {
             if let Ok(lv) = unsafe { GetDlgItem(Some(parent), ID_LISTVIEW as i32) } {
                 refresh_assignment_list(lv);
             }
+            set_dirty_state(parent, true);
         }
     }
 }
 
-fn file_open_emm(parent: HWND, listview: HWND) {
+fn file_open_hmm(parent: HWND, listview: HWND) {
     let mut file_buf = [0u16; 512];
-    let filter = w!("MME Mapping Files (*.emm)\0*.emm\0All Files (*.*)\0*.*\0\0");
-    let title = w!("Open MME Effect Mapping (.emm)");
+    let filter = w!("Hikari Mapping Files (*.hmm)\0*.hmm\0MME Mapping Files (*.emm)\0*.emm\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Open Hikari Effect Mapping (.hmm / .emm)");
 
     let mut ofn = OPENFILENAMEW::default();
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
@@ -1341,7 +1472,7 @@ fn file_open_emm(parent: HWND, listview: HWND) {
         let path = String::from_utf16_lossy(&file_buf[..end]);
         if !path.is_empty() {
             let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
-            match reg.load_emm(&path) {
+            match reg.load_hmm(&path) {
                 Ok(()) => {
                     drop(reg);
                     if let Ok(tab_ctrl) = unsafe { GetDlgItem(Some(parent), ID_TAB_CONTROL as i32) } {
@@ -1349,20 +1480,22 @@ fn file_open_emm(parent: HWND, listview: HWND) {
                     }
                     update_caption_for_current_tab(parent);
                     refresh_assignment_list(listview);
+                    sync_selection_controls(parent, listview);
+                    set_dirty_state(parent, true);
                     set_status_text(&format!("Loaded mapping: {path}"));
                 }
                 Err(e) => {
-                    set_status_text(&format!("Error loading .emm: {e}"));
+                    set_status_text(&format!("Error loading mapping: {e}"));
                 }
             }
         }
     }
 }
 
-fn file_save_emm(parent: HWND) {
+fn file_save_hmm(parent: HWND) {
     let mut file_buf = [0u16; 512];
-    let filter = w!("MME Mapping Files (*.emm)\0*.emm\0All Files (*.*)\0*.*\0\0");
-    let title = w!("Save MME Effect Mapping (.emm)");
+    let filter = w!("Hikari Mapping Files (*.hmm)\0*.hmm\0MME Mapping Files (*.emm)\0*.emm\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Save Hikari Effect Mapping (.hmm / .emm)");
 
     let mut ofn = OPENFILENAMEW::default();
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
@@ -1376,31 +1509,36 @@ fn file_save_emm(parent: HWND) {
     if unsafe { GetSaveFileNameW(&mut ofn) }.as_bool() {
         let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
         let mut path = String::from_utf16_lossy(&file_buf[..end]);
-        if !path.ends_with(".emm") {
-            path.push_str(".emm");
+        if !path.ends_with(".hmm") && !path.ends_with(".emm") {
+            path.push_str(".hmm");
         }
         let reg = ASSIGNMENT_REGISTRY.lock().unwrap();
-        match reg.save_emm(&path) {
+        let save_res = if path.ends_with(".emm") {
+            reg.save_emm(&path)
+        } else {
+            reg.save_hmm(&path)
+        };
+        match save_res {
             Ok(()) => set_status_text(&format!("Saved mapping: {path}")),
-            Err(e) => set_status_text(&format!("Error saving .emm: {e}")),
+            Err(e) => set_status_text(&format!("Error saving mapping: {e}")),
         }
     }
 }
 
-fn file_open_emd(parent: HWND, listview: HWND) {
+fn file_open_hmd(parent: HWND, listview: HWND) {
     let sel = *SELECTED_ROW.lock().unwrap();
     let rows = UI_ROWS.lock().unwrap();
     let obj_id = sel.and_then(|idx| rows.get(idx).and_then(|r| r.object_id));
     drop(rows);
 
     let Some(id) = obj_id else {
-        set_status_text("Select a model row first to load .emd.");
+        set_status_text("Select a model row first to load .hmd / .emd.");
         return;
     };
 
     let mut file_buf = [0u16; 512];
-    let filter = w!("MME Model Mapping Files (*.emd)\0*.emd\0All Files (*.*)\0*.*\0\0");
-    let title = w!("Open Model Effect Mapping (.emd)");
+    let filter = w!("Hikari Model Data (*.hmd)\0*.hmd\0MME Model Data (*.emd)\0*.emd\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Open Model Effect Mapping (.hmd / .emd)");
 
     let mut ofn = OPENFILENAMEW::default();
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
@@ -1416,34 +1554,36 @@ fn file_open_emd(parent: HWND, listview: HWND) {
         let path = String::from_utf16_lossy(&file_buf[..end]);
         if !path.is_empty() {
             let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
-            match reg.load_emd(id, &path) {
+            match reg.load_hmd(id, &path) {
                 Ok(()) => {
                     drop(reg);
                     refresh_assignment_list(listview);
+                    sync_selection_controls(parent, listview);
+                    set_dirty_state(parent, true);
                     set_status_text(&format!("Loaded model mapping: {path}"));
                 }
                 Err(e) => {
-                    set_status_text(&format!("Error loading .emd: {e}"));
+                    set_status_text(&format!("Error loading model mapping: {e}"));
                 }
             }
         }
     }
 }
 
-fn file_save_emd(parent: HWND) {
+fn file_save_hmd(parent: HWND) {
     let sel = *SELECTED_ROW.lock().unwrap();
     let rows = UI_ROWS.lock().unwrap();
     let obj_id = sel.and_then(|idx| rows.get(idx).and_then(|r| r.object_id));
     drop(rows);
 
     let Some(id) = obj_id else {
-        set_status_text("Select a model row first to save .emd.");
+        set_status_text("Select a model row first to save .hmd / .emd.");
         return;
     };
 
     let mut file_buf = [0u16; 512];
-    let filter = w!("MME Model Mapping Files (*.emd)\0*.emd\0All Files (*.*)\0*.*\0\0");
-    let title = w!("Save Model Effect Mapping (.emd)");
+    let filter = w!("Hikari Model Data (*.hmd)\0*.hmd\0MME Model Data (*.emd)\0*.emd\0All Files (*.*)\0*.*\0\0");
+    let title = w!("Save Model Effect Mapping (.hmd / .emd)");
 
     let mut ofn = OPENFILENAMEW::default();
     ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
@@ -1457,13 +1597,18 @@ fn file_save_emd(parent: HWND) {
     if unsafe { GetSaveFileNameW(&mut ofn) }.as_bool() {
         let end = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
         let mut path = String::from_utf16_lossy(&file_buf[..end]);
-        if !path.ends_with(".emd") {
-            path.push_str(".emd");
+        if !path.ends_with(".hmd") && !path.ends_with(".emd") {
+            path.push_str(".hmd");
         }
         let reg = ASSIGNMENT_REGISTRY.lock().unwrap();
-        match reg.save_emd(id, &path) {
+        let save_res = if path.ends_with(".emd") {
+            reg.save_emd(id, &path)
+        } else {
+            reg.save_hmd(id, &path)
+        };
+        match save_res {
             Ok(()) => set_status_text(&format!("Saved model mapping: {path}")),
-            Err(e) => set_status_text(&format!("Error saving .emd: {e}")),
+            Err(e) => set_status_text(&format!("Error saving model mapping: {e}")),
         }
     }
 }
@@ -1499,25 +1644,6 @@ fn tool_disassemble_effect(parent: HWND) {
             }
         }
     }
-}
-
-fn tool_add_render_target_tab(parent: HWND, tab_ctrl: HWND, listview: HWND) {
-    let mut reg = ASSIGNMENT_REGISTRY.lock().unwrap();
-    let count = reg.tabs.len();
-    let name = format!("MaterialMap{}", if count == 0 { "".to_string() } else { format!("_{}", count + 1) });
-    reg.add_tab(
-        &name,
-        "Material buffer render target for deferred shading (MaterialMap)",
-        "self=hide; *controller*.pmx=hide; sky*box*.*=./materials/material_skybox.fx; *.pmx=./materials/material_2.0.fx; *=hide;",
-    );
-    let new_idx = reg.tabs.len(); // 1-based index (0 is Main)
-    reg.current_tab_idx = new_idx;
-    drop(reg);
-
-    rebuild_tab_control(tab_ctrl);
-    update_caption_for_current_tab(parent);
-    refresh_assignment_list(listview);
-    set_status_text(&format!("Added offscreen render target tab '{name}'."));
 }
 
 fn tool_toggle_params_panel(parent: HWND) {
@@ -1943,24 +2069,24 @@ unsafe fn effects_manager_wndproc_inner(
                     }
                     return LRESULT(0);
                 }
-                // Menu File -> Open (.emm)
+                // Menu File -> Open (.hmm / .emm)
                 ID_FILE_OPEN => {
-                    file_open_emm(hwnd, listview);
+                    file_open_hmm(hwnd, listview);
                     return LRESULT(0);
                 }
-                // Menu File -> Save (.emm)
+                // Menu File -> Save (.hmm / .emm)
                 ID_FILE_SAVE => {
-                    file_save_emm(hwnd);
+                    file_save_hmm(hwnd);
                     return LRESULT(0);
                 }
-                // Menu File -> Open by Model (.emd)
+                // Menu File -> Open by Model (.hmd / .emd)
                 ID_FILE_OPEN_MODEL => {
-                    file_open_emd(hwnd, listview);
+                    file_open_hmd(hwnd, listview);
                     return LRESULT(0);
                 }
-                // Menu File -> Save by Model (.emd)
+                // Menu File -> Save by Model (.hmd / .emd)
                 ID_FILE_SAVE_MODEL => {
-                    file_save_emd(hwnd);
+                    file_save_hmd(hwnd);
                     return LRESULT(0);
                 }
                 // Menu File -> Close
@@ -1986,11 +2112,6 @@ unsafe fn effects_manager_wndproc_inner(
                     set_status_text(&format!("Skip Device Validation: {new_val}"));
                     return LRESULT(0);
                 }
-                // Menu Tool -> Add Render Target Tab...
-                ID_TOOL_ADD_TAB => {
-                    tool_add_render_target_tab(hwnd, tab_ctrl, listview);
-                    return LRESULT(0);
-                }
                 // Menu Tool -> Show HLSL Parameters Panel
                 ID_TOOL_TOGGLE_PARAMS => {
                     tool_toggle_params_panel(hwnd);
@@ -1999,16 +2120,18 @@ unsafe fn effects_manager_wndproc_inner(
                 // Button OK
                 ID_OK_BTN => {
                     if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
-                        let _ = ASSIGNMENT_REGISTRY.lock().unwrap().save_emm("hikari_mapping.emm");
+                        let _ = ASSIGNMENT_REGISTRY.lock().unwrap().save_hmm("hikari_mapping.hmm");
                     }
+                    set_dirty_state(hwnd, false);
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     return LRESULT(0);
                 }
                 // Button Apply
                 ID_APPLY_BTN => {
                     if crate::effect::AUTO_SAVE_MAPPING.load(Ordering::Acquire) {
-                        let _ = ASSIGNMENT_REGISTRY.lock().unwrap().save_emm("hikari_mapping.emm");
+                        let _ = ASSIGNMENT_REGISTRY.lock().unwrap().save_hmm("hikari_mapping.hmm");
                     }
+                    set_dirty_state(hwnd, false);
                     set_status_text("Mapping applied.");
                     return LRESULT(0);
                 }
@@ -2125,6 +2248,23 @@ unsafe fn effects_manager_wndproc_inner(
                 }
             }
             return LRESULT(0);
+        }
+        WM_REFRESH_HOST_OBJECTS => {
+            refresh_effects_manager_dialog(hwnd);
+            return LRESULT(0);
+        }
+        WM_SHOWWINDOW => {
+            if wparam.0 != 0 {
+                refresh_effects_manager_dialog(hwnd);
+            }
+        }
+        WM_ACTIVATE => {
+            if (wparam.0 & 0xFFFF) != 0 {
+                let current_fp = crate::mmd_host::get_host_objects_fingerprint();
+                if current_fp != LAST_DIALOG_FINGERPRINT.swap(current_fp, Ordering::Relaxed) {
+                    refresh_effects_manager_dialog(hwnd);
+                }
+            }
         }
         WM_CLOSE => {
             let _ = ShowWindow(hwnd, SW_HIDE);
