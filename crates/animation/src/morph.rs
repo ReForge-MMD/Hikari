@@ -30,7 +30,7 @@ impl MorphEvaluator {
     }
 
     pub fn set_weight(&mut self, name: &str, weight: f32) {
-        self.morph_weights.insert(name.to_string(), weight.clamp(0.0, 1.0));
+        self.morph_weights.insert(name.to_string(), weight);
     }
 
     pub fn get_weight(&self, name: &str) -> f32 {
