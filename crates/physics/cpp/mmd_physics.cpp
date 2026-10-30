@@ -157,7 +157,7 @@ MmdWorld *mmd_world_create(const MmdWorldSettings *settings, uint32_t max_bodies
     physics.mNumPositionSteps = std::max<uint32_t>(settings->position_steps, 1);
     // MMD rigs never rest: hair and cloth follow the dancer every frame.
     physics.mAllowSleeping = false;
-    physics.mBaumgarte = 0.2f;
+    physics.mBaumgarte = 0.55f;
     physics.mConstraintWarmStart = false; // Disable contact impulse warm starting to avoid Source-style jitter in chattering skirt contacts
     physics.mUseBodyPairContactCache = true;
     // Larger slop avoids micro-jitter on resting contacts while still resolving real penetrations.

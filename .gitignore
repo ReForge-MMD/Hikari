@@ -57,6 +57,8 @@ $RECYCLE.BIN/
 
 # Local model & motion assets (prevent accidental checkin of large copyrighted media)
 /assets/
+/models/
+/motions/
 /records/
 /captures/
 *.pmx

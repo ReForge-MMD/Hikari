@@ -40,7 +40,7 @@ impl Default for PhysicsSettings {
             max_frame: 0.25,
             collision_steps: 1,
             velocity_steps: 8,
-            position_steps: 2,
+            position_steps: 4,
             spring_damping_ratio: 0.30,
             spring_scale: 1.0,
             extra_damping: 0.02,
@@ -65,9 +65,17 @@ struct RigBody {
     offset: BodyTransform,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ChainDistanceConstraint {
+    parent: usize,
+    child: usize,
+    max_distance: f32,
+}
+
 pub struct PhysicsRig {
     world: World,
     bodies: Vec<RigBody>,
+    distance_constraints: Vec<ChainDistanceConstraint>,
     /// Bone index -> rigid body driving it (for Mode 1 and Mode 2).
     drivers: Vec<Option<usize>>,
     previous_targets: Vec<BodyTransform>,
@@ -130,7 +138,39 @@ impl PhysicsRig {
         let mut names = Vec::new();
         let extra = damping_rate(settings.extra_damping);
 
-        for rb in &model.rigid_bodies {
+        // Compute chain depth from nearest kinematic anchor for all rigid bodies
+        let num_rbs = model.rigid_bodies.len();
+        let mut depths = vec![u32::MAX; num_rbs];
+        let mut queue = std::collections::VecDeque::new();
+
+        for (i, rb) in model.rigid_bodies.iter().enumerate() {
+            if rb.mode == 0 {
+                depths[i] = 0;
+                queue.push_back(i);
+            }
+        }
+
+        let mut adj = vec![Vec::new(); num_rbs];
+        for j in &model.joints {
+            let a = j.body_a;
+            let b = j.body_b;
+            if a >= 0 && b >= 0 && (a as usize) < num_rbs && (b as usize) < num_rbs && a != b {
+                adj[a as usize].push(b as usize);
+                adj[b as usize].push(a as usize);
+            }
+        }
+
+        while let Some(u) = queue.pop_front() {
+            let next = depths[u].saturating_add(1);
+            for &v in &adj[u] {
+                if next < depths[v] {
+                    depths[v] = next;
+                    queue.push_back(v);
+                }
+            }
+        }
+
+        for (rb_idx, rb) in model.rigid_bodies.iter().enumerate() {
             let bone = if rb.bone_index >= 0 && (rb.bone_index as usize) < num_bones {
                 Some(rb.bone_index as usize)
             } else {
@@ -148,6 +188,18 @@ impl PhysicsRig {
             });
 
             let mode = rb.mode;
+            let depth = depths[rb_idx];
+            let (mass, move_damp) = if mode != 0 && depth > 0 && depth != u32::MAX {
+                // Taper mass down long chains to avoid cumulative over-constraint elongation
+                let mass_scale = 1.0 / (1.0 + 0.25 * (depth - 1) as f32);
+                let mass = (if rb.mass > 0.0 { rb.mass } else { 1.0 } * mass_scale).max(0.01);
+                // Ensure deep chains (cloth/hair skirts) have sufficient aerodynamic damping
+                let move_damp = if depth >= 2 { rb.move_damping.max(0.96) } else { rb.move_damping };
+                (mass, move_damp)
+            } else {
+                (if rb.mass > 0.0 { rb.mass } else { 1.0 }, rb.move_damping)
+            };
+
             let desc = MmdBodyDesc {
                 shape: match rb.shape {
                     0 => ffi::SHAPE_SPHERE,
@@ -158,8 +210,8 @@ impl PhysicsRig {
                 size: [rb.size[0].abs(), rb.size[1].abs(), rb.size[2].abs()],
                 position: world_tf.position.to_array(),
                 rotation: world_tf.rotation.to_array(),
-                mass: if rb.mass > 0.0 { rb.mass } else { 1.0 },
-                linear_damping: damping_rate(rb.move_damping) + extra,
+                mass,
+                linear_damping: damping_rate(move_damp) + extra,
                 angular_damping: damping_rate(rb.rot_damping) + extra,
                 restitution: rb.restitution.clamp(0.0, 1.0),
                 friction: rb.friction.max(0.0),
@@ -189,6 +241,7 @@ impl PhysicsRig {
             }
         }
 
+        let mut distance_constraints = Vec::new();
         for j in &model.joints {
             let get_body = |i: i32| -> Option<usize> {
                 if i >= 0 && (i as usize) < ids.len() {
@@ -201,6 +254,23 @@ impl PhysicsRig {
             let (Some(a), Some(b)) = (get_body(j.body_a), get_body(j.body_b)) else {
                 continue;
             };
+
+            let da = depths.get(j.body_a as usize).copied().unwrap_or(u32::MAX);
+            let db = depths.get(j.body_b as usize).copied().unwrap_or(u32::MAX);
+
+            if da != db && da != u32::MAX && db != u32::MAX {
+                let (parent, child) = if da < db { (a, b) } else { (b, a) };
+                let pos_a = coords::position(model.rigid_bodies[j.body_a as usize].position);
+                let pos_b = coords::position(model.rigid_bodies[j.body_b as usize].position);
+                let rest_distance = (pos_b - pos_a).length();
+                if rest_distance > 1e-4 {
+                    distance_constraints.push(ChainDistanceConstraint {
+                        parent,
+                        child,
+                        max_distance: rest_distance * 1.15,
+                    });
+                }
+            }
 
             let (linear_lower, linear_upper) = coords::linear_range(j.pos_min, j.pos_max);
             let (angular_lower, angular_upper) = coords::angular_range(j.rot_min, j.rot_max);
@@ -235,6 +305,7 @@ impl PhysicsRig {
         Some(Self {
             world,
             bodies,
+            distance_constraints,
             drivers,
             previous_targets: vec![BodyTransform::IDENTITY; n],
             targets: vec![BodyTransform::IDENTITY; n],
@@ -318,6 +389,18 @@ impl PhysicsRig {
         }
 
         self.world.read(&mut self.current);
+
+        // Project maximum chain length to guarantee non-elastic cloth behavior
+        for c in &self.distance_constraints {
+            let pa = self.current[c.parent].position;
+            let pb = self.current[c.child].position;
+            let delta = pb - pa;
+            let dist = delta.length();
+            if dist > c.max_distance && dist > 1e-4 {
+                self.current[c.child].position = pa + delta * (c.max_distance / dist);
+            }
+        }
+
         self.overrides.fill(None);
 
         for (bone, driver) in self.drivers.iter().enumerate() {
