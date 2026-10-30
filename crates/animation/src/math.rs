@@ -147,6 +147,32 @@ impl Quat {
     }
 
     #[inline]
+    pub fn conjugate(self) -> Self {
+        Self {
+            x: -self.x,
+            y: -self.y,
+            z: -self.z,
+            w: self.w,
+        }
+    }
+
+    #[inline]
+    pub fn inverse(self) -> Self {
+        let len_sq = self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w;
+        if len_sq > 1e-6 {
+            let inv = 1.0 / len_sq;
+            Self {
+                x: -self.x * inv,
+                y: -self.y * inv,
+                z: -self.z * inv,
+                w: self.w * inv,
+            }
+        } else {
+            Self::IDENTITY
+        }
+    }
+
+    #[inline]
     pub fn slerp(self, mut other: Self, t: f32) -> Self {
         let mut dot = self.x * other.x + self.y * other.y + self.z * other.z + self.w * other.w;
         if dot < 0.0 {
@@ -183,16 +209,6 @@ impl Quat {
             z: self.z * s0 + other.z * s1,
             w: self.w * s0 + other.w * s1,
         }.normalize()
-    }
-
-    #[inline]
-    pub fn conjugate(self) -> Self {
-        Self {
-            x: -self.x,
-            y: -self.y,
-            z: -self.z,
-            w: self.w,
-        }
     }
 
     #[inline]

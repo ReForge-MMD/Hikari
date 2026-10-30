@@ -8,8 +8,10 @@ pub struct BoneNode {
     pub name: String,
     pub parent_index: Option<usize>,
     pub initial_position: Vec3,
+    pub offset: Vec3,
     pub deform_layer: i32,
     pub flags: u16,
+    pub after_physics: bool,
     pub append_parent: Option<(usize, f32)>, // (parent_bone, ratio)
     pub fixed_axis: Option<Vec3>,
     pub ik: Option<IkData>,
@@ -36,6 +38,8 @@ pub struct Skeleton {
     pub inv_bind_matrices: Vec<Mat4>,
     pub local_translations: Vec<Vec3>,
     pub local_rotations: Vec<Quat>,
+    pub world_positions: Vec<Vec3>,
+    pub world_rotations: Vec<Quat>,
     pub world_matrices: Vec<Mat4>,
     pub skinning_palette: Vec<Mat4>,
     pub sorted_eval_order: Vec<usize>,
@@ -48,6 +52,8 @@ impl Skeleton {
         let mut inv_bind_matrices = Vec::with_capacity(count);
         let local_translations = vec![Vec3::ZERO; count];
         let local_rotations = vec![Quat::IDENTITY; count];
+        let world_positions = vec![Vec3::ZERO; count];
+        let world_rotations = vec![Quat::IDENTITY; count];
         let world_matrices = vec![Mat4::IDENTITY; count];
         let skinning_palette = vec![Mat4::IDENTITY; count];
 
@@ -89,12 +95,17 @@ impl Skeleton {
             });
 
             let pos = Vec3::from_array(b.position);
+            let offset = parent_index.map_or(pos, |p| pos - Vec3::from_array(pmx.bones[p].position));
+            let after_physics = (b.flags & 0x1000) != 0;
+
             bones.push(BoneNode {
                 name: b.name_local.clone(),
                 parent_index,
                 initial_position: pos,
+                offset,
                 deform_layer: b.deform_layer,
                 flags: b.flags,
+                after_physics,
                 append_parent,
                 fixed_axis,
                 ik,
@@ -112,17 +123,30 @@ impl Skeleton {
             }
         }
 
-        // Topological sort order respecting parent hierarchy and deform layer
-        let mut sorted_eval_order: Vec<usize> = (0..count).collect();
-        sorted_eval_order.sort_by(|&a, &b| {
-            let layer_a = bones[a].deform_layer;
-            let layer_b = bones[b].deform_layer;
-            if layer_a != layer_b {
-                layer_a.cmp(&layer_b)
-            } else {
-                a.cmp(&b)
+        // Topological sort order respecting after_physics, deform layer, and parent hierarchy
+        let mut sorted: Vec<usize> = (0..count).collect();
+        sorted.sort_by_key(|&i| (bones[i].after_physics, bones[i].deform_layer, i));
+        let mut placed = vec![false; count];
+        let mut sorted_eval_order = Vec::with_capacity(count);
+        while sorted_eval_order.len() < count {
+            let before = sorted_eval_order.len();
+            for &i in &sorted {
+                if !placed[i] && bones[i].parent_index.map_or(true, |p| placed[p]) {
+                    placed[i] = true;
+                    sorted_eval_order.push(i);
+                }
             }
-        });
+            if sorted_eval_order.len() == before {
+                // Break cycle if malformed parent indices exist
+                for &i in &sorted {
+                    if !placed[i] {
+                        placed[i] = true;
+                        sorted_eval_order.push(i);
+                        break;
+                    }
+                }
+            }
+        }
 
         let mut skel = Self {
             bones,
@@ -130,6 +154,8 @@ impl Skeleton {
             inv_bind_matrices,
             local_translations,
             local_rotations,
+            world_positions,
+            world_rotations,
             world_matrices,
             skinning_palette,
             sorted_eval_order,
@@ -158,36 +184,37 @@ impl Skeleton {
 
     /// Evaluates forward kinematics, Append/Grant bones, and IK solving.
     pub fn update_transforms(&mut self) {
+        self.update_transforms_stage(false);
+        self.update_skinning_palette();
+    }
+
+    /// Evaluates one deformation stage: false = before physics, true = after physics.
+    pub fn update_transforms_stage(&mut self, after_physics: bool) {
         let order = self.sorted_eval_order.clone();
 
-        // Step 1: Forward Kinematics
         for &idx in &order {
-            self.compute_world_matrix(idx);
-        }
+            if self.bones[idx].after_physics != after_physics {
+                continue;
+            }
 
-        // Step 2: Append / Grant (Fuyo) Bones (Rotation / Translation inheritance)
-        for &idx in &order {
+            // Append / Grant (Fuyo) Bones (Rotation / Translation inheritance)
             if let Some((p_idx, ratio)) = self.bones[idx].append_parent {
                 if (self.bones[idx].flags & 0x0100) != 0 {
-                    // Append rotation
                     let parent_rot = self.local_rotations[p_idx];
                     let grant_rot = Quat::IDENTITY.slerp(parent_rot, ratio);
                     self.local_rotations[idx] = (grant_rot * self.local_rotations[idx]).normalize();
                 }
                 if (self.bones[idx].flags & 0x0200) != 0 {
-                    // Append translation
                     let parent_trans = self.local_translations[p_idx];
                     self.local_translations[idx] = self.local_translations[idx] + parent_trans * ratio;
                 }
-                self.compute_world_matrix(idx);
             }
+
+            self.compute_world_matrix(idx);
         }
 
-        // Step 3: Solve IK Chains
-        self.solve_ik();
-
-        // Step 4: Final Matrix Palette for GPU Skinning
-        self.update_skinning_palette();
+        // Solve IK Chains for this stage
+        self.solve_ik(after_physics);
     }
 
     /// Recomputes final bone skinning matrix palette for GPU: Palette[i] = World[i] * InvBind[i]
@@ -202,8 +229,8 @@ impl Skeleton {
         let count = self.bones.len();
         let mut transforms = Vec::with_capacity(count);
         for i in 0..count {
-            let pos = self.world_matrices[i].translation();
-            let rot = self.world_matrices[i].rotation();
+            let pos = self.world_positions[i];
+            let rot = self.world_rotations[i];
             transforms.push(hikari_physics::world::BodyTransform {
                 position: hikari_physics::glam::Vec3::new(pos.x, pos.y, -pos.z),
                 rotation: hikari_physics::glam::Quat::from_xyzw(-rot.x, -rot.y, rot.z, rot.w).normalize(),
@@ -217,59 +244,106 @@ impl Skeleton {
         let bone_transforms = self.get_bone_world_transforms();
         let overrides = rig.step(&bone_transforms, dt);
 
-        let mut affected = vec![false; self.bones.len()];
         let order = self.sorted_eval_order.clone();
 
         for idx in order {
-            if let Some(ovr) = overrides.get(idx).copied().flatten() {
-                affected[idx] = true;
-                match ovr {
-                    hikari_physics::rig::BoneOverride::Full(jolt_pos, jolt_rot) => {
-                        let mmd_pos = Vec3::new(jolt_pos.x, jolt_pos.y, -jolt_pos.z);
-                        let mmd_rot = Quat {
-                            x: -jolt_rot.x,
-                            y: -jolt_rot.y,
-                            z: jolt_rot.z,
-                            w: jolt_rot.w,
-                        }.normalize();
-                        self.world_matrices[idx] = Mat4::from_translation_rotation(mmd_pos, mmd_rot);
-                    }
-                    hikari_physics::rig::BoneOverride::Rotation(jolt_rot) => {
-                        let mmd_rot = Quat {
-                            x: -jolt_rot.x,
-                            y: -jolt_rot.y,
-                            z: jolt_rot.z,
-                            w: jolt_rot.w,
-                        }.normalize();
-                        let current_pos = self.world_matrices[idx].translation();
-                        self.world_matrices[idx] = Mat4::from_translation_rotation(current_pos, mmd_rot);
-                    }
+            if self.bones[idx].after_physics {
+                continue;
+            }
+
+            let (pp, pr) = match self.bones[idx].parent_index {
+                Some(p) => (self.world_positions[p], self.world_rotations[p]),
+                None => (Vec3::ZERO, Quat::IDENTITY),
+            };
+
+            match overrides.get(idx).copied().flatten() {
+                Some(hikari_physics::rig::BoneOverride::Full(jolt_pos, jolt_rot)) => {
+                    let mmd_pos = Vec3::new(jolt_pos.x, jolt_pos.y, -jolt_pos.z);
+                    let mmd_rot = Quat {
+                        x: -jolt_rot.x,
+                        y: -jolt_rot.y,
+                        z: jolt_rot.z,
+                        w: jolt_rot.w,
+                    }.normalize();
+
+                    let inv_pr = pr.inverse();
+                    self.local_rotations[idx] = (inv_pr * mmd_rot).normalize();
+                    self.local_translations[idx] = inv_pr.rotate_vec3(mmd_pos - pp) - self.bones[idx].offset;
+                    self.world_positions[idx] = mmd_pos;
+                    self.world_rotations[idx] = mmd_rot;
+                    self.world_matrices[idx] = Mat4::from_translation_rotation(mmd_pos, mmd_rot);
                 }
-            } else if let Some(parent_idx) = self.bones[idx].parent_index {
-                if affected[parent_idx] {
-                    // Propagate parent physics transform down to child bones without direct physics
+                Some(hikari_physics::rig::BoneOverride::Rotation(jolt_rot)) => {
+                    let mmd_rot = Quat {
+                        x: -jolt_rot.x,
+                        y: -jolt_rot.y,
+                        z: jolt_rot.z,
+                        w: jolt_rot.w,
+                    }.normalize();
+
+                    let inv_pr = pr.inverse();
+                    self.local_rotations[idx] = (inv_pr * mmd_rot).normalize();
+                    let wp = pp + pr.rotate_vec3(self.bones[idx].offset + self.local_translations[idx]);
+                    self.world_positions[idx] = wp;
+                    self.world_rotations[idx] = mmd_rot;
+                    self.world_matrices[idx] = Mat4::from_translation_rotation(wp, mmd_rot);
+                }
+                None => {
                     self.compute_world_matrix(idx);
-                    affected[idx] = true;
                 }
             }
         }
 
+        // Evaluate after-physics stage (e.g. post-physics IK)
+        self.update_transforms_stage(true);
         self.update_skinning_palette();
+    }
+
+    /// Applies secondary soft-tissue jiggle (chest / hips) to the skeleton.
+    pub fn apply_jiggle(
+        &mut self,
+        jiggle: &mut crate::jiggle::Jiggle,
+        dt: f32,
+        settings: &crate::jiggle::JiggleSettings,
+    ) {
+        if let Some(offsets) = jiggle.step(&self.world_positions, &self.world_rotations, dt, settings) {
+            let eval_order = self.sorted_eval_order.clone();
+            for idx in eval_order {
+                if let Some(offset) = offsets.get(idx).copied().flatten() {
+                    self.world_positions[idx] = self.world_positions[idx] + offset;
+                    self.world_matrices[idx] = Mat4::from_translation_rotation(
+                        self.world_positions[idx],
+                        self.world_rotations[idx],
+                    );
+                    let children = self.children[idx].clone();
+                    for child_idx in children {
+                        self.update_subtree(child_idx);
+                    }
+                }
+            }
+            self.update_skinning_palette();
+        }
     }
 
     fn compute_world_matrix(&mut self, idx: usize) {
         let bone = &self.bones[idx];
-        let local_rot = self.local_rotations[idx];
+        let local_t = bone.offset + self.local_translations[idx];
+        let local_r = self.local_rotations[idx];
 
         if let Some(parent_idx) = bone.parent_index {
-            let parent_initial = self.bones[parent_idx].initial_position;
-            let relative_offset = bone.initial_position - parent_initial;
-            let local_pos = relative_offset + self.local_translations[idx];
-            let local_m = Mat4::from_translation_rotation(local_pos, local_rot);
-            self.world_matrices[idx] = local_m * self.world_matrices[parent_idx];
+            let pp = self.world_positions[parent_idx];
+            let pr = self.world_rotations[parent_idx];
+            let wp = pp + pr.rotate_vec3(local_t);
+            let wr = (pr * local_r).normalize();
+            self.world_positions[idx] = wp;
+            self.world_rotations[idx] = wr;
+            self.world_matrices[idx] = Mat4::from_translation_rotation(wp, wr);
         } else {
-            let local_pos = bone.initial_position + self.local_translations[idx];
-            self.world_matrices[idx] = Mat4::from_translation_rotation(local_pos, local_rot);
+            let wp = local_t;
+            let wr = local_r.normalize();
+            self.world_positions[idx] = wp;
+            self.world_rotations[idx] = wr;
+            self.world_matrices[idx] = Mat4::from_translation_rotation(wp, wr);
         }
     }
 
@@ -283,8 +357,11 @@ impl Skeleton {
     }
 
     /// Iterative CCD-IK (Cyclic Coordinate Descent) solver with angle limits and branch hierarchy updates.
-    fn solve_ik(&mut self) {
+    fn solve_ik(&mut self, after_physics: bool) {
         for i in 0..self.bones.len() {
+            if self.bones[i].after_physics != after_physics {
+                continue;
+            }
             let ik_data = match self.bones[i].ik.clone() {
                 Some(ik) => ik,
                 None => continue,

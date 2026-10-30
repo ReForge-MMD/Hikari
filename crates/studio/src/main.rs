@@ -2,7 +2,7 @@
 
 use hikari_animation::math::Vec3;
 use hikari_animation::physics::{PhysicsRig, PhysicsSettings};
-use hikari_animation::{MorphEvaluator, MotionPlayer, Skeleton};
+use hikari_animation::{Jiggle, JiggleSettings, MorphEvaluator, MotionPlayer, Skeleton};
 use hikari_core::d3d11::D3D11Context;
 use hikari_formats::{PmxModel, VmdMotion};
 use hikari_render::{Camera, GpuMaterial, GpuMesh, GpuTexture, SceneRenderer};
@@ -26,6 +26,9 @@ struct StudioApp {
     skeleton: Option<Skeleton>,
     physics_rig: Option<PhysicsRig>,
     physics_enabled: bool,
+    jiggle: Option<Jiggle>,
+    jiggle_settings: JiggleSettings,
+    jiggle_enabled: bool,
     last_frame_instant: Instant,
     last_frame_number: f32,
     morphs: MorphEvaluator,
@@ -141,6 +144,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     app.physics_enabled = !app.physics_enabled;
                     println!("[Studio] Physics simulation toggled: {}", if app.physics_enabled { "ON" } else { "OFF" });
                 }
+                // 'J' key (0x4A) toggles Jiggle secondary dynamics
+                if wparam.0 == 0x4A {
+                    app.jiggle_enabled = !app.jiggle_enabled;
+                    println!("[Studio] Jiggle secondary dynamics toggled: {}", if app.jiggle_enabled { "ON" } else { "OFF" });
+                }
                 // 'R' key (0x52) resets physics simulation
                 if wparam.0 == 0x52 {
                     if let Some(ref mut rig) = app.physics_rig {
@@ -225,6 +233,9 @@ fn main() {
             skeleton: None,
             physics_rig: None,
             physics_enabled: true,
+            jiggle: None,
+            jiggle_settings: JiggleSettings::default(),
+            jiggle_enabled: true,
             last_frame_instant: Instant::now(),
             last_frame_number: 0.0,
             morphs: MorphEvaluator::new(),
@@ -303,6 +314,12 @@ fn main() {
                         app.physics_rig = PhysicsRig::new(&pmx, &bone_rests, &phys_settings);
                         if let Some(ref rig) = app.physics_rig {
                             println!("[Studio] Initialized Jolt Physics: {} bodies ({} dynamic)", rig.body_count(), rig.dynamic_count());
+                        }
+
+                        let jiggle = Jiggle::new(&pmx);
+                        if jiggle.body_count() > 0 {
+                            println!("[Studio] Initialized Jiggle dynamics: {} soft-tissue targets", jiggle.body_count());
+                            app.jiggle = Some(jiggle);
                         }
 
                         app.mesh = Some(mesh);
@@ -398,6 +415,13 @@ fn main() {
                 }
             }
 
+            // Apply soft-tissue secondary dynamics (Jiggle)
+            if app.jiggle_enabled {
+                if let (Some(ref mut skel), Some(ref mut jiggle)) = (&mut app.skeleton, &mut app.jiggle) {
+                    skel.apply_jiggle(jiggle, dt, &app.jiggle_settings);
+                }
+            }
+
             // Apply dynamic facial and vertex morphs to mesh
             if let Some(ref mut mesh) = app.mesh {
                 let (pos_offsets, uv_offsets) = app.morphs.compute_offsets();
@@ -451,12 +475,20 @@ fn main() {
                 } else {
                     "No Phys"
                 };
+                let jiggle_str = if app.jiggle_enabled && app.jiggle.is_some() {
+                    "Jiggle: ON"
+                } else if app.jiggle.is_some() {
+                    "Jiggle: OFF"
+                } else {
+                    "No Jiggle"
+                };
                 let title = format!(
-                    "Hikari Studio [DX11] | {:.1} FPS ({:.2} ms) [{}] [{}] | '{}' ({} vtx, {} tris, {} bones) | {} | Cam: {:.1}m\0",
+                    "Hikari Studio [DX11] | {:.1} FPS ({:.2} ms) [{}] [{}] [{}] | '{}' ({} vtx, {} tris, {} bones) | {} | Cam: {:.1}m\0",
                     app.current_fps,
                     app.current_frame_time_ms,
                     vsync_str,
                     phys_str,
+                    jiggle_str,
                     if app.model_name.is_empty() { "Empty" } else { &app.model_name },
                     app.vertex_count,
                     app.index_count / 3,

@@ -89,6 +89,17 @@ fn test_skeleton_fk_and_matrix_palette() {
 }
 
 #[test]
+fn test_mat4_rotation_extraction() {
+    let q = Quat::from_axis_angle(Vec3::new(0.0, 1.0, 0.0), 0.7).normalize();
+    let m = Mat4::from_translation_rotation(Vec3::new(1.0, 2.0, 3.0), q);
+    let extracted = m.rotation();
+    assert!((extracted.x - q.x).abs() < 1e-4, "x: {} vs {}", extracted.x, q.x);
+    assert!((extracted.y - q.y).abs() < 1e-4, "y: {} vs {}", extracted.y, q.y);
+    assert!((extracted.z - q.z).abs() < 1e-4, "z: {} vs {}", extracted.z, q.z);
+    assert!((extracted.w - q.w).abs() < 1e-4, "w: {} vs {}", extracted.w, q.w);
+}
+
+#[test]
 fn test_euler_round_trip() {
     let euler = Vec3::new(0.3, 0.2, -0.4);
     let q = Quat::from_euler_xyz(euler);
