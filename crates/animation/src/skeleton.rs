@@ -254,7 +254,7 @@ impl Skeleton {
         // Reuse the scratch buffer to avoid a per-frame heap allocation.
         let mut scratch = std::mem::take(&mut self.bone_transform_scratch);
         self.fill_bone_world_transforms(&mut scratch);
-        let overrides_vec: Vec<_> = rig.step(scratch.as_slice(), dt).to_vec();
+        let overrides = rig.step(scratch.as_slice(), dt);
         self.bone_transform_scratch = scratch;
 
         for i in 0..self.sorted_eval_order.len() {
@@ -268,7 +268,7 @@ impl Skeleton {
                 None => (Vec3::ZERO, Quat::IDENTITY),
             };
 
-            match overrides_vec.get(idx).copied().flatten() {
+            match overrides.get(idx).copied().flatten() {
                 Some(hikari_physics::rig::BoneOverride::Full(jolt_pos, jolt_rot)) => {
                     let mmd_pos = Vec3::new(jolt_pos.x, jolt_pos.y, -jolt_pos.z);
                     let mmd_rot = Quat {
@@ -319,16 +319,16 @@ impl Skeleton {
         settings: &crate::jiggle::JiggleSettings,
     ) {
         if let Some(offsets) = jiggle.step(&self.world_positions, &self.world_rotations, dt, settings) {
-            let eval_order = self.sorted_eval_order.clone();
-            for idx in eval_order {
+            for i in 0..self.sorted_eval_order.len() {
+                let idx = self.sorted_eval_order[i];
                 if let Some(offset) = offsets.get(idx).copied().flatten() {
                     self.world_positions[idx] = self.world_positions[idx] + offset;
                     self.world_matrices[idx] = Mat4::from_translation_rotation(
                         self.world_positions[idx],
                         self.world_rotations[idx],
                     );
-                    let children = self.children[idx].clone();
-                    for child_idx in children {
+                    for c in 0..self.children[idx].len() {
+                        let child_idx = self.children[idx][c];
                         self.update_subtree(child_idx);
                     }
                 }

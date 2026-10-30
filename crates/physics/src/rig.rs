@@ -35,12 +35,12 @@ impl Default for PhysicsSettings {
     fn default() -> Self {
         Self {
             gravity: 98.0,
-            max_substep: 1.0 / 120.0,
-            max_substeps: 6,
+            max_substep: 1.0 / 60.0,
+            max_substeps: 3,
             max_frame: 0.25,
             collision_steps: 1,
-            velocity_steps: 10,
-            position_steps: 4,
+            velocity_steps: 8,
+            position_steps: 2,
             spring_damping_ratio: 0.30,
             spring_scale: 1.0,
             extra_damping: 0.02,

@@ -11,7 +11,7 @@
 #include <Jolt/Jolt.h>
 
 #include <Jolt/Core/Factory.h>
-#include <Jolt/Core/JobSystemSingleThreaded.h>
+#include <Jolt/Core/JobSystemThreadPool.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Collision/CollideShape.h>
@@ -90,9 +90,10 @@ public:
     }
 };
 
-// Jolt's factory and type registry are process-wide; worlds may come and go on any thread.
+// Jolt's factory, type registry, and thread pool are process-wide; worlds may come and go on any thread.
 std::mutex g_jolt_lock;
 int g_jolt_users = 0;
+JobSystemThreadPool *g_job_system = nullptr;
 
 void jolt_acquire() {
     std::lock_guard<std::mutex> guard(g_jolt_lock);
@@ -100,12 +101,15 @@ void jolt_acquire() {
         RegisterDefaultAllocator();
         Factory::sInstance = new Factory();
         RegisterTypes();
+        g_job_system = new JobSystemThreadPool(cMaxPhysicsJobs, cMaxPhysicsBarriers);
     }
 }
 
 void jolt_release() {
     std::lock_guard<std::mutex> guard(g_jolt_lock);
     if (--g_jolt_users == 0) {
+        delete g_job_system;
+        g_job_system = nullptr;
         UnregisterTypes();
         delete Factory::sInstance;
         Factory::sInstance = nullptr;
@@ -132,7 +136,6 @@ struct MmdWorld {
     ObjectVsBroadPhase object_vs_bp;
     ObjectPairs object_pairs;
     TempAllocatorImpl temp{8 * 1024 * 1024};
-    JobSystemSingleThreaded jobs{cMaxPhysicsJobs};
     PhysicsSystem system;
     Ref<MmdGroupFilter> groups = new MmdGroupFilter();
     std::vector<BodyID> bodies;
@@ -226,8 +229,9 @@ int32_t mmd_world_add_body(MmdWorld *world, const MmdBodyDesc *desc) {
     settings.mMaxLinearVelocity = kinematic ? 500.0f : 120.0f;
     // Small MMD bodies spin fast when a dancer turns; keep Jolt's cap out of the way.
     settings.mMaxAngularVelocity = 4.0f * JPH_PI * 60.0f;
-    // Both kinematic limbs and dynamic clothing use LinearCast so rapid limb motions never tunnel through thin cloth panels
-    settings.mMotionQuality = EMotionQuality::LinearCast;
+    // Kinematic limbs sweep with LinearCast so rapid kicks and steps never tunnel through cloth.
+    // Dynamic cloth and hair use Discrete collision for high solver performance.
+    settings.mMotionQuality = kinematic ? EMotionQuality::LinearCast : EMotionQuality::Discrete;
     settings.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
     settings.mMassPropertiesOverride.mMass = desc->mass > 0.0f ? desc->mass : 1.0f;
     settings.mCollisionGroup = CollisionGroup(world->groups, CollisionGroup::GroupID(index), 0);
@@ -380,7 +384,7 @@ void mmd_world_move_kinematic(MmdWorld *world, const float *transforms, uint32_t
 void mmd_world_step(MmdWorld *world, float dt, uint32_t collision_steps) {
     if (!world || !(dt > 0.0f))
         return;
-    world->system.Update(dt, int(std::max<uint32_t>(collision_steps, 1)), &world->temp, &world->jobs);
+    world->system.Update(dt, int(std::max<uint32_t>(collision_steps, 1)), &world->temp, g_job_system);
 }
 
 void mmd_world_read(const MmdWorld *world, float *transforms, uint32_t count) {
