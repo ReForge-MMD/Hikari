@@ -13,12 +13,19 @@
 Debug/
 Release/
 x64/
+Build/
 *.pdb
 *.ilk
 *.exp
 *.lib
 *.obj
 *.idb
+*.tlog
+*.lastbuildstate
+*.ipch
+*.aps
+*.dmp
+*.crash
 
 # IDE & Editor files
 .idea/
@@ -26,6 +33,10 @@ x64/
 *.swp
 *.swo
 *~
+.DS_Store
+*.orig
+*.rej
+*.bak
 
 # Windows OS generated files
 Thumbs.db
@@ -44,12 +55,27 @@ $RECYCLE.BIN/
 *.pmm.bak
 *.emm.bak
 
+# Local model & motion assets (prevent accidental checkin of large copyrighted media)
+/assets/
+/records/
+/captures/
+*.pmx
+*.pmd
+*.vmd
+*.vpd
+*.wav
+*.mp3
+*.mp4
+*.avi
+
 # Reference & 3rd-party dev packages
 ref-code/
 mmdplugin_dev_ver0.41_x64/
 
-# Runtime logs
+# Runtime logs & temp
 *.log
+/tmp/
+/temp/
 
 # Specification-driven development (Spec Kit)
 specs/

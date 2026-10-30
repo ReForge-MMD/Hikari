@@ -340,6 +340,59 @@ impl Mat4 {
     pub fn translation(self) -> Vec3 {
         Vec3::new(self.m[3][0], self.m[3][1], self.m[3][2])
     }
+
+    /// Extracts rotation quaternion from an orthonormal rotation/translation matrix.
+    #[inline]
+    pub fn rotation(self) -> Quat {
+        let m00 = self.m[0][0];
+        let m01 = self.m[0][1];
+        let m02 = self.m[0][2];
+        let m10 = self.m[1][0];
+        let m11 = self.m[1][1];
+        let m12 = self.m[1][2];
+        let m20 = self.m[2][0];
+        let m21 = self.m[2][1];
+        let m22 = self.m[2][2];
+
+        let trace = m00 + m11 + m22;
+        if trace > 0.0 {
+            let s = (trace + 1.0).sqrt() * 2.0;
+            let inv_s = 1.0 / s;
+            Quat {
+                x: (m12 - m21) * inv_s,
+                y: (m20 - m02) * inv_s,
+                z: (m01 - m10) * inv_s,
+                w: 0.25 * s,
+            }.normalize()
+        } else if (m00 > m11) && (m00 > m22) {
+            let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+            let inv_s = 1.0 / s;
+            Quat {
+                x: 0.25 * s,
+                y: (m01 + m10) * inv_s,
+                z: (m20 + m02) * inv_s,
+                w: (m12 - m21) * inv_s,
+            }.normalize()
+        } else if m11 > m22 {
+            let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+            let inv_s = 1.0 / s;
+            Quat {
+                x: (m01 + m10) * inv_s,
+                y: 0.25 * s,
+                z: (m12 + m21) * inv_s,
+                w: (m20 - m02) * inv_s,
+            }.normalize()
+        } else {
+            let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+            let inv_s = 1.0 / s;
+            Quat {
+                x: (m20 + m02) * inv_s,
+                y: (m12 + m21) * inv_s,
+                z: 0.25 * s,
+                w: (m01 - m10) * inv_s,
+            }.normalize()
+        }
+    }
 }
 
 impl Mul for Mat4 {

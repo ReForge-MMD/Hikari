@@ -186,10 +186,75 @@ impl Skeleton {
         // Step 3: Solve IK Chains
         self.solve_ik();
 
-        // Step 4: Final Matrix Palette for GPU Skinning: Palette[i] = World[i] * InvBind[i]
+        // Step 4: Final Matrix Palette for GPU Skinning
+        self.update_skinning_palette();
+    }
+
+    /// Recomputes final bone skinning matrix palette for GPU: Palette[i] = World[i] * InvBind[i]
+    pub fn update_skinning_palette(&mut self) {
         for i in 0..self.bones.len() {
             self.skinning_palette[i] = self.inv_bind_matrices[i] * self.world_matrices[i];
         }
+    }
+
+    /// Extracts bone transforms in Jolt physics world space.
+    pub fn get_bone_world_transforms(&self) -> Vec<hikari_physics::world::BodyTransform> {
+        let count = self.bones.len();
+        let mut transforms = Vec::with_capacity(count);
+        for i in 0..count {
+            let pos = self.world_matrices[i].translation();
+            let rot = self.world_matrices[i].rotation();
+            transforms.push(hikari_physics::world::BodyTransform {
+                position: hikari_physics::glam::Vec3::new(pos.x, pos.y, -pos.z),
+                rotation: hikari_physics::glam::Quat::from_xyzw(-rot.x, -rot.y, rot.z, rot.w).normalize(),
+            });
+        }
+        transforms
+    }
+
+    /// Steps the physics rig and applies physics body overrides to dynamic and aligned bones.
+    pub fn apply_physics(&mut self, rig: &mut hikari_physics::PhysicsRig, dt: f32) {
+        let bone_transforms = self.get_bone_world_transforms();
+        let overrides = rig.step(&bone_transforms, dt);
+
+        let mut affected = vec![false; self.bones.len()];
+        let order = self.sorted_eval_order.clone();
+
+        for idx in order {
+            if let Some(ovr) = overrides.get(idx).copied().flatten() {
+                affected[idx] = true;
+                match ovr {
+                    hikari_physics::rig::BoneOverride::Full(jolt_pos, jolt_rot) => {
+                        let mmd_pos = Vec3::new(jolt_pos.x, jolt_pos.y, -jolt_pos.z);
+                        let mmd_rot = Quat {
+                            x: -jolt_rot.x,
+                            y: -jolt_rot.y,
+                            z: jolt_rot.z,
+                            w: jolt_rot.w,
+                        }.normalize();
+                        self.world_matrices[idx] = Mat4::from_translation_rotation(mmd_pos, mmd_rot);
+                    }
+                    hikari_physics::rig::BoneOverride::Rotation(jolt_rot) => {
+                        let mmd_rot = Quat {
+                            x: -jolt_rot.x,
+                            y: -jolt_rot.y,
+                            z: jolt_rot.z,
+                            w: jolt_rot.w,
+                        }.normalize();
+                        let current_pos = self.world_matrices[idx].translation();
+                        self.world_matrices[idx] = Mat4::from_translation_rotation(current_pos, mmd_rot);
+                    }
+                }
+            } else if let Some(parent_idx) = self.bones[idx].parent_index {
+                if affected[parent_idx] {
+                    // Propagate parent physics transform down to child bones without direct physics
+                    self.compute_world_matrix(idx);
+                    affected[idx] = true;
+                }
+            }
+        }
+
+        self.update_skinning_palette();
     }
 
     fn compute_world_matrix(&mut self, idx: usize) {

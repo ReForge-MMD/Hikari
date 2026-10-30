@@ -2,7 +2,7 @@
 
 use std::io::{self, Cursor, Read};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct PmxModel {
     pub version: f32,
     pub header: PmxHeader,
@@ -34,6 +34,21 @@ pub struct PmxHeader {
     pub bone_index_size: u8,
     pub morph_index_size: u8,
     pub rigid_body_index_size: u8,
+}
+
+impl Default for PmxHeader {
+    fn default() -> Self {
+        Self {
+            encoding: PmxEncoding::Utf8,
+            additional_vec4_count: 0,
+            vertex_index_size: 4,
+            texture_index_size: 4,
+            material_index_size: 4,
+            bone_index_size: 4,
+            morph_index_size: 4,
+            rigid_body_index_size: 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

@@ -1,6 +1,7 @@
 //! Hikari Studio - Modern standalone 3D animation runtime and studio on pure DirectX 11.
 
 use hikari_animation::math::Vec3;
+use hikari_animation::physics::{PhysicsRig, PhysicsSettings};
 use hikari_animation::{MorphEvaluator, MotionPlayer, Skeleton};
 use hikari_core::d3d11::D3D11Context;
 use hikari_formats::{PmxModel, VmdMotion};
@@ -23,6 +24,10 @@ struct StudioApp {
     materials: Vec<GpuMaterial>,
     textures: Vec<Option<GpuTexture>>,
     skeleton: Option<Skeleton>,
+    physics_rig: Option<PhysicsRig>,
+    physics_enabled: bool,
+    last_frame_instant: Instant,
+    last_frame_number: f32,
     morphs: MorphEvaluator,
     motion_player: Option<MotionPlayer>,
     model_name: String,
@@ -131,6 +136,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     app.vsync = !app.vsync;
                     println!("[Studio] VSync toggled: {}", if app.vsync { "ON" } else { "OFF" });
                 }
+                // 'P' key (0x50) toggles Physics simulation
+                if wparam.0 == 0x50 {
+                    app.physics_enabled = !app.physics_enabled;
+                    println!("[Studio] Physics simulation toggled: {}", if app.physics_enabled { "ON" } else { "OFF" });
+                }
+                // 'R' key (0x52) resets physics simulation
+                if wparam.0 == 0x52 {
+                    if let Some(ref mut rig) = app.physics_rig {
+                        rig.request_reset();
+                        println!("[Studio] Physics simulation reset requested");
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -206,6 +223,10 @@ fn main() {
             materials: Vec::new(),
             textures: Vec::new(),
             skeleton: None,
+            physics_rig: None,
+            physics_enabled: true,
+            last_frame_instant: Instant::now(),
+            last_frame_number: 0.0,
             morphs: MorphEvaluator::new(),
             motion_player: None,
             model_name: String::new(),
@@ -277,6 +298,13 @@ fn main() {
                             }
                         }
                         let skel = Skeleton::from_pmx(&pmx);
+                        let bone_rests: Vec<[f32; 3]> = pmx.bones.iter().map(|b| b.position).collect();
+                        let phys_settings = PhysicsSettings::default();
+                        app.physics_rig = PhysicsRig::new(&pmx, &bone_rests, &phys_settings);
+                        if let Some(ref rig) = app.physics_rig {
+                            println!("[Studio] Initialized Jolt Physics: {} bodies ({} dynamic)", rig.body_count(), rig.dynamic_count());
+                        }
+
                         app.mesh = Some(mesh);
                         app.materials = mats;
                         app.textures = textures;
@@ -339,6 +367,10 @@ fn main() {
             let _ = app.renderer.render_grid(&app.ctx, &app.camera);
 
             // Animate and render
+            let now = Instant::now();
+            let dt = now.duration_since(app.last_frame_instant).as_secs_f32().clamp(0.0001, 0.1);
+            app.last_frame_instant = now;
+
             let elapsed_secs = app.start_time.elapsed().as_secs_f32();
             let current_frame = elapsed_secs * 30.0; // MMD standard 30 FPS timeline
 
@@ -348,7 +380,22 @@ fn main() {
                 } else {
                     current_frame
                 };
+
+                if looped_frame < app.last_frame_number {
+                    if let Some(ref mut rig) = app.physics_rig {
+                        rig.request_reset();
+                    }
+                }
+                app.last_frame_number = looped_frame;
+
                 player.evaluate_pose(looped_frame, skel, &mut app.morphs);
+            }
+
+            // Step Jolt physics and apply bone overrides
+            if app.physics_enabled {
+                if let (Some(ref mut skel), Some(ref mut rig)) = (&mut app.skeleton, &mut app.physics_rig) {
+                    skel.apply_physics(rig, dt);
+                }
             }
 
             // Apply dynamic facial and vertex morphs to mesh
@@ -397,11 +444,19 @@ fn main() {
                 };
 
                 let vsync_str = if app.vsync { "VSync: ON" } else { "VSync: OFF" };
+                let phys_str = if app.physics_enabled && app.physics_rig.is_some() {
+                    "Jolt Phys: ON"
+                } else if app.physics_rig.is_some() {
+                    "Jolt Phys: OFF"
+                } else {
+                    "No Phys"
+                };
                 let title = format!(
-                    "Hikari Studio [DX11] | {:.1} FPS ({:.2} ms) [{}] | '{}' ({} vtx, {} tris, {} bones) | {} | Cam: {:.1}m\0",
+                    "Hikari Studio [DX11] | {:.1} FPS ({:.2} ms) [{}] [{}] | '{}' ({} vtx, {} tris, {} bones) | {} | Cam: {:.1}m\0",
                     app.current_fps,
                     app.current_frame_time_ms,
                     vsync_str,
+                    phys_str,
                     if app.model_name.is_empty() { "Empty" } else { &app.model_name },
                     app.vertex_count,
                     app.index_count / 3,

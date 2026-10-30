@@ -8,3 +8,4 @@ license = "MIT"
 
 [dependencies]
 hikari-formats = { path = "../formats" }
+hikari-physics = { path = "../physics" }

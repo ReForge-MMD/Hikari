@@ -1,0 +1,15 @@
+[package]
+name = "hikari-physics"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hikari Contributors"]
+description = "Jolt Physics integration for MMD models (hair, cloth, rigid bodies, and 6DOF spring joints) in Hikari"
+license = "MIT"
+build = "build.rs"
+
+[build-dependencies]
+cc = { version = "1.0", features = ["parallel"] }
+
+[dependencies]
+hikari-formats = { path = "../formats" }
+glam = "0.29"

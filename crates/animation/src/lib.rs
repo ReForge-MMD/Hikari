@@ -14,3 +14,4 @@ pub use math::{Mat4, Quat, Vec3};
 pub use morph::MorphEvaluator;
 pub use skeleton::Skeleton;
 pub use timeline::MotionPlayer;
+pub use hikari_physics as physics;
