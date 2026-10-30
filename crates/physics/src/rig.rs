@@ -36,15 +36,15 @@ impl Default for PhysicsSettings {
         Self {
             gravity: 98.0,
             max_substep: 1.0 / 120.0,
-            max_substeps: 6,
+            max_substeps: 8,
             max_frame: 0.25,
-            collision_steps: 1,
-            velocity_steps: 10,
-            position_steps: 4,
-            spring_damping_ratio: 0.25,
+            collision_steps: 2,
+            velocity_steps: 16,
+            position_steps: 6,
+            spring_damping_ratio: 0.30,
             spring_scale: 1.0,
-            extra_damping: 0.0,
-            rest_overlaps: RestOverlaps::IgnoreAll,
+            extra_damping: 0.02,
+            rest_overlaps: RestOverlaps::IgnoreDynamic,
         }
     }
 }

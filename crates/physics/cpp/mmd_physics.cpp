@@ -154,6 +154,13 @@ MmdWorld *mmd_world_create(const MmdWorldSettings *settings, uint32_t max_bodies
     physics.mNumPositionSteps = std::max<uint32_t>(settings->position_steps, 1);
     // MMD rigs never rest: hair and cloth follow the dancer every frame.
     physics.mAllowSleeping = false;
+    physics.mBaumgarte = 0.15f;
+    physics.mConstraintWarmStart = false; // Disable contact impulse warm starting to avoid Source-style jitter in chattering skirt contacts
+    physics.mUseBodyPairContactCache = true;
+    physics.mPenetrationSlop = 0.01f;
+    physics.mSpeculativeContactDistance = 0.08f; // Lookahead distance to detect sweeping kinematic limbs and push skirts before penetration
+    physics.mLinearCastThreshold = 0.1f;         // Trigger CCD even for small dynamic movements
+    physics.mLinearCastMaxPenetration = 0.5f;
     world->system.SetPhysicsSettings(physics);
     world->system.SetGravity(Vec3(settings->gravity[0], settings->gravity[1], settings->gravity[2]));
     world->spring_damping_ratio = std::max(0.0f, settings->spring_damping_ratio);
@@ -205,12 +212,17 @@ int32_t mmd_world_add_body(MmdWorld *world, const MmdBodyDesc *desc) {
                                   load_quat(desc->rotation), kinematic ? EMotionType::Kinematic : EMotionType::Dynamic,
                                   kinematic ? LAYER_KINEMATIC : LAYER_DYNAMIC);
     settings.mAllowSleeping = false;
-    settings.mFriction = std::max(0.0f, desc->friction);
-    settings.mRestitution = std::clamp(desc->restitution, 0.0f, 1.0f);
+    // For cloth/hair/skirt physics: zero out restitution and minimize friction on kinematic colliders
+    // so clothing slides effortlessly over legs/torso without sticking, dragging upward, or vibrating.
+    settings.mFriction = kinematic ? 0.0f : std::min(std::max(0.0f, desc->friction), 0.05f);
+    settings.mRestitution = 0.0f; // Completely inelastic: clothing and hair absorb impact rather than bouncing
     settings.mLinearDamping = std::max(0.0f, desc->linear_damping);
     settings.mAngularDamping = std::max(0.0f, desc->angular_damping);
+    // Cap maximum linear velocity on dynamic bodies to prevent explosive launches
+    settings.mMaxLinearVelocity = kinematic ? 500.0f : 120.0f;
     // Small MMD bodies spin fast when a dancer turns; keep Jolt's cap out of the way.
     settings.mMaxAngularVelocity = 4.0f * JPH_PI * 60.0f;
+    // Both kinematic limbs and dynamic clothing use LinearCast so rapid limb motions never tunnel through thin cloth panels
     settings.mMotionQuality = EMotionQuality::LinearCast;
     settings.mOverrideMassProperties = EOverrideMassProperties::CalculateInertia;
     settings.mMassPropertiesOverride.mMass = desc->mass > 0.0f ? desc->mass : 1.0f;
@@ -284,8 +296,11 @@ int32_t mmd_world_add_joint(MmdWorld *world, const MmdJointDesc *desc) {
         const A axis = A(i);
         if (!(k > 0.0f) || !std::isfinite(k) || settings.IsFixedAxis(axis))
             continue;
+        // Cap maximum force and torque to prevent motors from fighting collision contacts with infinite impulse
+        const float max_force = 10000.0f;
+        const float max_torque = 10000.0f;
         settings.mMotorSettings[i] =
-            MotorSettings(ESpringMode::StiffnessAndDamping, k, 2.0f * ratio * std::sqrt(k));
+            MotorSettings(ESpringMode::StiffnessAndDamping, k, 2.0f * ratio * std::sqrt(k), max_force, max_torque);
         motors[i] = true;
     }
 
