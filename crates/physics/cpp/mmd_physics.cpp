@@ -154,13 +154,17 @@ MmdWorld *mmd_world_create(const MmdWorldSettings *settings, uint32_t max_bodies
     physics.mNumPositionSteps = std::max<uint32_t>(settings->position_steps, 1);
     // MMD rigs never rest: hair and cloth follow the dancer every frame.
     physics.mAllowSleeping = false;
-    physics.mBaumgarte = 0.15f;
+    physics.mBaumgarte = 0.2f;
     physics.mConstraintWarmStart = false; // Disable contact impulse warm starting to avoid Source-style jitter in chattering skirt contacts
     physics.mUseBodyPairContactCache = true;
-    physics.mPenetrationSlop = 0.01f;
-    physics.mSpeculativeContactDistance = 0.08f; // Lookahead distance to detect sweeping kinematic limbs and push skirts before penetration
-    physics.mLinearCastThreshold = 0.1f;         // Trigger CCD even for small dynamic movements
-    physics.mLinearCastMaxPenetration = 0.5f;
+    // Larger slop avoids micro-jitter on resting contacts while still resolving real penetrations.
+    physics.mPenetrationSlop = 0.02f;
+    // Lookahead must cover the fastest kinematic limb sweep per sub-step. At 120 Hz a fast
+    // dancer's thigh moves ~25 cm/s → 2 mm per step; 0.15 gives a comfortable 6–7× margin so
+    // skirt panels are pushed *before* the leg tunnels through them.
+    physics.mSpeculativeContactDistance = 0.15f;
+    physics.mLinearCastThreshold = 0.05f;        // Trigger CCD even for small dynamic movements
+    physics.mLinearCastMaxPenetration = 0.25f;
     world->system.SetPhysicsSettings(physics);
     world->system.SetGravity(Vec3(settings->gravity[0], settings->gravity[1], settings->gravity[2]));
     world->spring_damping_ratio = std::max(0.0f, settings->spring_damping_ratio);
@@ -212,9 +216,9 @@ int32_t mmd_world_add_body(MmdWorld *world, const MmdBodyDesc *desc) {
                                   load_quat(desc->rotation), kinematic ? EMotionType::Kinematic : EMotionType::Dynamic,
                                   kinematic ? LAYER_KINEMATIC : LAYER_DYNAMIC);
     settings.mAllowSleeping = false;
-    // For cloth/hair/skirt physics: zero out restitution and minimize friction on kinematic colliders
-    // so clothing slides effortlessly over legs/torso without sticking, dragging upward, or vibrating.
-    settings.mFriction = kinematic ? 0.0f : std::min(std::max(0.0f, desc->friction), 0.05f);
+    // Kinematic limb colliders (legs, torso) are frictionless so skirt panels slide off cleanly
+    // without being dragged upward or pinned. Dynamic cloth/hair keep their authored friction.
+    settings.mFriction = kinematic ? 0.0f : std::max(0.0f, desc->friction);
     settings.mRestitution = 0.0f; // Completely inelastic: clothing and hair absorb impact rather than bouncing
     settings.mLinearDamping = std::max(0.0f, desc->linear_damping);
     settings.mAngularDamping = std::max(0.0f, desc->angular_damping);

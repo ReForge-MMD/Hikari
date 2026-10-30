@@ -28,6 +28,27 @@ fn main() {
     sources.sort();
     sources.push(root.join(BRIDGE));
 
+    // Enable ccache if available.
+    // On Windows MSVC targets, cc-rs automatically queries the Windows Registry
+    // to discover MSVC and Windows SDK include/lib directories. If we override CC/CXX
+    // with ccache, we must propagate these MSVC environment variables (INCLUDE, LIB, PATH)
+    // into the process so that ccache/cl.exe finds headers like winapifamily.h.
+    if is_executable_available("ccache") {
+        if target.contains("windows-msvc") {
+            if let Some(tool) = cc::windows_registry::find_tool(&target, "cl.exe") {
+                for (key, val) in tool.get_envs() {
+                    env::set_var(key, val);
+                }
+            }
+            env::set_var("CCACHE_COMPILERTYPE", "msvc");
+            env::set_var("CXX", "ccache cl");
+            env::set_var("CC", "ccache cl");
+        } else {
+            env::set_var("CXX", "ccache");
+            env::set_var("CC", "ccache");
+        }
+    }
+
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -80,4 +101,11 @@ fn collect(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn is_executable_available(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .map_or(false, |output| output.status.success())
 }

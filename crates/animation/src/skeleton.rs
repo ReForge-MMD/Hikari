@@ -43,6 +43,8 @@ pub struct Skeleton {
     pub world_matrices: Vec<Mat4>,
     pub skinning_palette: Vec<Mat4>,
     pub sorted_eval_order: Vec<usize>,
+    /// Reusable buffer for physics bone transforms; avoids a per-frame heap allocation.
+    bone_transform_scratch: Vec<hikari_physics::world::BodyTransform>,
 }
 
 impl Skeleton {
@@ -159,6 +161,7 @@ impl Skeleton {
             world_matrices,
             skinning_palette,
             sorted_eval_order,
+            bone_transform_scratch: Vec::new(),
         };
 
         skel.update_transforms();
@@ -190,9 +193,8 @@ impl Skeleton {
 
     /// Evaluates one deformation stage: false = before physics, true = after physics.
     pub fn update_transforms_stage(&mut self, after_physics: bool) {
-        let order = self.sorted_eval_order.clone();
-
-        for &idx in &order {
+        for i in 0..self.sorted_eval_order.len() {
+            let idx = self.sorted_eval_order[i];
             if self.bones[idx].after_physics != after_physics {
                 continue;
             }
@@ -224,29 +226,39 @@ impl Skeleton {
         }
     }
 
-    /// Extracts bone transforms in Jolt physics world space.
-    pub fn get_bone_world_transforms(&self) -> Vec<hikari_physics::world::BodyTransform> {
+    /// Fills `buf` with bone transforms in Jolt physics world space, reusing its allocation.
+    fn fill_bone_world_transforms(&self, buf: &mut Vec<hikari_physics::world::BodyTransform>) {
         let count = self.bones.len();
-        let mut transforms = Vec::with_capacity(count);
+        buf.clear();
+        buf.reserve(count.saturating_sub(buf.capacity()));
         for i in 0..count {
             let pos = self.world_positions[i];
             let rot = self.world_rotations[i];
-            transforms.push(hikari_physics::world::BodyTransform {
+            buf.push(hikari_physics::world::BodyTransform {
                 position: hikari_physics::glam::Vec3::new(pos.x, pos.y, -pos.z),
                 rotation: hikari_physics::glam::Quat::from_xyzw(-rot.x, -rot.y, rot.z, rot.w).normalize(),
             });
         }
+    }
+
+    /// Extracts bone transforms in Jolt physics world space.
+    pub fn get_bone_world_transforms(&self) -> Vec<hikari_physics::world::BodyTransform> {
+        let count = self.bones.len();
+        let mut transforms = Vec::with_capacity(count);
+        self.fill_bone_world_transforms(&mut transforms);
         transforms
     }
 
     /// Steps the physics rig and applies physics body overrides to dynamic and aligned bones.
     pub fn apply_physics(&mut self, rig: &mut hikari_physics::PhysicsRig, dt: f32) {
-        let bone_transforms = self.get_bone_world_transforms();
-        let overrides = rig.step(&bone_transforms, dt);
+        // Reuse the scratch buffer to avoid a per-frame heap allocation.
+        let mut scratch = std::mem::take(&mut self.bone_transform_scratch);
+        self.fill_bone_world_transforms(&mut scratch);
+        let overrides_vec: Vec<_> = rig.step(scratch.as_slice(), dt).to_vec();
+        self.bone_transform_scratch = scratch;
 
-        let order = self.sorted_eval_order.clone();
-
-        for idx in order {
+        for i in 0..self.sorted_eval_order.len() {
+            let idx = self.sorted_eval_order[i];
             if self.bones[idx].after_physics {
                 continue;
             }
@@ -256,7 +268,7 @@ impl Skeleton {
                 None => (Vec3::ZERO, Quat::IDENTITY),
             };
 
-            match overrides.get(idx).copied().flatten() {
+            match overrides_vec.get(idx).copied().flatten() {
                 Some(hikari_physics::rig::BoneOverride::Full(jolt_pos, jolt_rot)) => {
                     let mmd_pos = Vec3::new(jolt_pos.x, jolt_pos.y, -jolt_pos.z);
                     let mmd_rot = Quat {

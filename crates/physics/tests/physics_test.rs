@@ -45,7 +45,7 @@ fn test_physics_rig_dynamic_bone_simulation() {
         name_universal: "".into(),
         bone_index: 0,
         collision_group: 0,
-        collision_mask: 0,
+        collision_mask: 0xFFFF,
         shape: 0, // Sphere
         size: [1.0, 0.0, 0.0],
         position: [0.0, 10.0, 0.0],
@@ -64,7 +64,7 @@ fn test_physics_rig_dynamic_bone_simulation() {
         name_universal: "".into(),
         bone_index: 1,
         collision_group: 1,
-        collision_mask: 0,
+        collision_mask: 0xFFFF,
         shape: 2, // Capsule
         size: [0.5, 2.0, 0.0],
         position: [0.0, 8.0, 0.0],
