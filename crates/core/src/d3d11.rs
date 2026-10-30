@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11BlendState, ID3D11Buffer, ID3D11DepthStencilState,
     ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout,
     ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11VertexShader,
-    ID3D11PixelShader,
+    ID3D11PixelShader, ID3D11CommandList, D3D11_FEATURE_THREADING, D3D11_FEATURE_DATA_THREADING,
     ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_DEPTH_STENCIL, D3D11_BIND_INDEX_BUFFER,
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_UNORDERED_ACCESS,
@@ -51,6 +51,68 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
     DXGI_SWAP_EFFECT_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
+
+/// Direct3D 11 hardware and driver threading capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D11ThreadingCaps {
+    pub driver_concurrent_creates: bool,
+    pub driver_command_lists: bool,
+}
+
+/// Send + Sync wrapper around an immutable ID3D11CommandList.
+#[repr(transparent)]
+#[derive(Clone, Debug)]
+pub struct SendCommandList(pub ID3D11CommandList);
+unsafe impl Send for SendCommandList {}
+unsafe impl Sync for SendCommandList {}
+
+/// Send + Sync wrapper around a thread-isolated deferred ID3D11DeviceContext.
+#[repr(transparent)]
+#[derive(Clone, Debug)]
+pub struct SendDeviceContext(pub ID3D11DeviceContext);
+unsafe impl Send for SendDeviceContext {}
+unsafe impl Sync for SendDeviceContext {}
+
+/// Thread-safe reusable pool of deferred ID3D11DeviceContext instances.
+pub struct DeferredContextPool {
+    device: ID3D11Device,
+    pool: std::sync::Mutex<Vec<ID3D11DeviceContext>>,
+}
+
+impl DeferredContextPool {
+    pub fn new(device: &ID3D11Device) -> Self {
+        Self {
+            device: device.clone(),
+            pool: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Acquires a deferred context from the pool or creates a new one.
+    pub fn acquire(&self) -> Result<ID3D11DeviceContext> {
+        let mut guard = self.pool.lock().unwrap();
+        if let Some(ctx) = guard.pop() {
+            Ok(ctx)
+        } else {
+            unsafe {
+                let mut ctx = None;
+                self.device.CreateDeferredContext(0, Some(&mut ctx))?;
+                ctx.ok_or_else(|| windows::core::Error::from(HRESULT(-1)))
+            }
+        }
+    }
+
+    /// Returns a recycled deferred context to the pool.
+    pub fn recycle(&self, ctx: ID3D11DeviceContext) {
+        let mut guard = self.pool.lock().unwrap();
+        guard.push(ctx);
+    }
+
+    /// Clears the pool.
+    pub fn clear(&self) {
+        let mut guard = self.pool.lock().unwrap();
+        guard.clear();
+    }
+}
 
 /// Encapsulates native Direct3D 11 rendering infrastructure.
 pub struct D3D11Context {
@@ -89,6 +151,7 @@ pub struct D3D11Context {
     pub current_bound_srvs: [Option<usize>; 8],
     pub state_manager: StateManager,
     pub render_targets: RenderTargetManager,
+    pub deferred_pool: DeferredContextPool,
 
     /// Offscreen composite chain: the model pass target (transparent background), the
     /// composite canvas and a staging texture for CPU readback.
@@ -157,6 +220,87 @@ impl D3D11Context {
         }
     }
 
+    /// Checks hardware and driver multi-threading support flags.
+    pub fn check_threading_support(&self) -> D3D11ThreadingCaps {
+        unsafe {
+            let mut feature_data = D3D11_FEATURE_DATA_THREADING::default();
+            let hr = self.device.CheckFeatureSupport(
+                D3D11_FEATURE_THREADING,
+                &mut feature_data as *mut _ as *mut c_void,
+                std::mem::size_of::<D3D11_FEATURE_DATA_THREADING>() as u32,
+            );
+            if hr.is_ok() {
+                D3D11ThreadingCaps {
+                    driver_concurrent_creates: feature_data.DriverConcurrentCreates.as_bool(),
+                    driver_command_lists: feature_data.DriverCommandLists.as_bool(),
+                }
+            } else {
+                D3D11ThreadingCaps {
+                    driver_concurrent_creates: false,
+                    driver_command_lists: false,
+                }
+            }
+        }
+    }
+
+    /// Creates a fresh deferred device context for multi-threaded draw call recording.
+    pub fn create_deferred_context(&self) -> Result<ID3D11DeviceContext> {
+        unsafe {
+            let mut deferred = None;
+            self.device.CreateDeferredContext(0, Some(&mut deferred))?;
+            deferred.ok_or_else(|| windows::core::Error::from(HRESULT(-1)))
+        }
+    }
+
+    /// Acquires a deferred device context from the reusable context pool.
+    pub fn acquire_deferred_context(&self) -> Result<ID3D11DeviceContext> {
+        self.deferred_pool.acquire()
+    }
+
+    /// Returns a deferred context to the reusable pool.
+    pub fn recycle_deferred_context(&self, ctx: ID3D11DeviceContext) {
+        self.deferred_pool.recycle(ctx);
+    }
+
+    /// Finishes recording commands on a deferred context and produces an ID3D11CommandList.
+    pub fn finish_command_list(
+        deferred: &ID3D11DeviceContext,
+        restore_deferred_context_state: bool,
+    ) -> Result<ID3D11CommandList> {
+        unsafe {
+            let mut command_list = None;
+            deferred.FinishCommandList(
+                restore_deferred_context_state,
+                Some(&mut command_list),
+            )?;
+            command_list.ok_or_else(|| windows::core::Error::from(HRESULT(-1)))
+        }
+    }
+
+    /// Executes a recorded command list on the immediate context.
+    pub fn execute_command_list(
+        &self,
+        command_list: &ID3D11CommandList,
+        restore_context_state: bool,
+    ) {
+        unsafe {
+            self.context.ExecuteCommandList(command_list, restore_context_state);
+        }
+    }
+
+    /// Executes multiple recorded command lists in order on the immediate context.
+    pub fn execute_command_lists(
+        &self,
+        command_lists: &[ID3D11CommandList],
+        restore_context_state: bool,
+    ) {
+        unsafe {
+            for cl in command_lists {
+                self.context.ExecuteCommandList(cl, restore_context_state);
+            }
+        }
+    }
+
     /// Creates a headless or window-bound Direct3D 11 context.
     pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self> {
         let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
@@ -219,6 +363,7 @@ impl D3D11Context {
 
         let state_manager = StateManager::new(&device)?;
         let render_targets = RenderTargetManager::new();
+        let deferred_pool = DeferredContextPool::new(&device);
 
         let mut ctx = Self {
             device,
@@ -252,6 +397,7 @@ impl D3D11Context {
             current_bound_srvs: [None; 8],
             state_manager,
             render_targets,
+            deferred_pool,
             model_tex: None,
             model_rtv: None,
             model_srv: None,
@@ -377,22 +523,27 @@ impl D3D11Context {
         Ok(())
     }
 
-    /// Binds default backbuffer and depth buffer to the output merger.
-    pub fn bind_default_targets(&self) {
+    /// Binds default backbuffer and depth buffer to any target context (immediate or deferred).
+    pub fn bind_default_targets_to(&self, target_ctx: &ID3D11DeviceContext) {
         if let Some(rtv) = &self.render_target_view {
             let rtv_slice = [Some(rtv.clone())];
             unsafe {
-                self.context.OMSetRenderTargets(
+                target_ctx.OMSetRenderTargets(
                     Some(&rtv_slice),
                     self.depth_stencil_view.as_ref(),
                 );
             }
         }
-        self.set_viewport(self.width as f32, self.height as f32);
+        self.set_viewport_on(target_ctx, self.width as f32, self.height as f32);
     }
 
-    /// Sets viewport dimensions.
-    pub fn set_viewport(&self, width: f32, height: f32) {
+    /// Binds default backbuffer and depth buffer to the output merger.
+    pub fn bind_default_targets(&self) {
+        self.bind_default_targets_to(&self.context);
+    }
+
+    /// Sets viewport dimensions on a specific device context.
+    pub fn set_viewport_on(&self, target_ctx: &ID3D11DeviceContext, width: f32, height: f32) {
         let vp = [D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
@@ -402,8 +553,13 @@ impl D3D11Context {
             MaxDepth: 1.0,
         }];
         unsafe {
-            self.context.RSSetViewports(Some(&vp));
+            target_ctx.RSSetViewports(Some(&vp));
         }
+    }
+
+    /// Sets viewport dimensions.
+    pub fn set_viewport(&self, width: f32, height: f32) {
+        self.set_viewport_on(&self.context, width, height);
     }
 
     /// Clears active render target and depth stencil views.

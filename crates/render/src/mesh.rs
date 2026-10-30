@@ -191,16 +191,20 @@ impl GpuMesh {
         Ok(())
     }
 
-    pub fn bind(&self, ctx: &D3D11Context) {
+    pub fn bind_to(&self, target_ctx: &ID3D11DeviceContext) {
         let stride = std::mem::size_of::<ModelVertex>() as u32;
         let offset = 0u32;
         unsafe {
             let vbs = [Some(self.vertex_buffer.clone())];
-            ctx.context.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&offset));
-            ctx.context.IASetIndexBuffer(&self.index_buffer, DXGI_FORMAT_R32_UINT, 0);
-            ctx.context.IASetPrimitiveTopology(
+            target_ctx.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&offset));
+            target_ctx.IASetIndexBuffer(&self.index_buffer, DXGI_FORMAT_R32_UINT, 0);
+            target_ctx.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );
         }
+    }
+
+    pub fn bind(&self, ctx: &D3D11Context) {
+        self.bind_to(&ctx.context);
     }
 }

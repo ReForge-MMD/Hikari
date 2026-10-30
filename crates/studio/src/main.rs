@@ -51,6 +51,7 @@ struct StudioApp {
     current_frame_time_ms: f32,
     last_title_update: Instant,
     vsync: bool,
+    multithreaded: bool,
 }
 
 static mut APP_PTR: *mut StudioApp = std::ptr::null_mut();
@@ -148,6 +149,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 if wparam.0 == 0x4A {
                     app.jiggle_enabled = !app.jiggle_enabled;
                     println!("[Studio] Jiggle secondary dynamics toggled: {}", if app.jiggle_enabled { "ON" } else { "OFF" });
+                }
+                // 'M' key (0x4D) toggles Multi-threaded deferred rendering
+                if wparam.0 == 0x4D {
+                    app.multithreaded = !app.multithreaded;
+                    println!("[Studio] Multi-threaded rendering toggled: {}", if app.multithreaded { "ON (Deferred Contexts)" } else { "OFF (Single-threaded Immediate)" });
                 }
                 // 'R' key (0x52) resets physics simulation
                 if wparam.0 == 0x52 {
@@ -258,6 +264,7 @@ fn main() {
             current_frame_time_ms: 0.0,
             last_title_update: Instant::now(),
             vsync: false,
+            multithreaded: true,
         };
 
         // Load PMX model if specified
@@ -380,10 +387,7 @@ fn main() {
             app.ctx.bind_default_targets();
             app.ctx.clear([0.14, 0.14, 0.16, 1.0], 1.0, 0);
 
-            // Render 3D studio floor grid
-            let _ = app.renderer.render_grid(&app.ctx, &app.camera);
-
-            // Animate and render
+            // Animate and update scene
             let now = Instant::now();
             let dt = now.duration_since(app.last_frame_instant).as_secs_f32().clamp(0.0001, 0.1);
             app.last_frame_instant = now;
@@ -428,15 +432,50 @@ fn main() {
                 let _ = mesh.apply_morph_offsets(&app.ctx, &pos_offsets, &uv_offsets);
             }
 
-            if let (Some(ref mesh), Some(ref skel)) = (&app.mesh, &app.skeleton) {
-                let _ = app.renderer.render_mesh(
-                    &app.ctx,
-                    mesh,
-                    &app.materials,
-                    &app.textures,
-                    &skel.skinning_palette,
-                    &app.camera,
-                );
+            // Update camera constants once per frame on the immediate context
+            let _ = app.renderer.update_camera(&app.ctx, &app.camera);
+
+            // Render scene (Multi-threaded deferred or Single-threaded immediate)
+            if app.multithreaded {
+                use hikari_render::{ParallelFrameRenderer, ScenePassItem};
+
+                let passes = if let (Some(ref mesh), Some(ref skel)) = (&app.mesh, &app.skeleton) {
+                    let _ = app.renderer.skinning_buffer.update(&app.ctx, &skel.skinning_palette);
+                    vec![
+                        ScenePassItem::Grid,
+                        ScenePassItem::Mesh {
+                            mesh,
+                            materials: &app.materials,
+                            textures: &app.textures,
+                            skinning_buffer: &app.renderer.skinning_buffer,
+                            subset_range: 0..mesh.subsets.len(),
+                        },
+                    ]
+                } else {
+                    vec![ScenePassItem::Grid]
+                };
+
+                match ParallelFrameRenderer::record_passes_parallel(&app.ctx, &app.renderer, &passes) {
+                    Ok(cls) => {
+                        app.ctx.execute_command_lists(&cls, false);
+                    }
+                    Err(e) => {
+                        eprintln!("[Studio] Multi-threaded render error: {:?}", e);
+                    }
+                }
+            } else {
+                let _ = app.renderer.render_grid(&app.ctx, &app.camera);
+
+                if let (Some(ref mesh), Some(ref skel)) = (&app.mesh, &app.skeleton) {
+                    let _ = app.renderer.render_mesh(
+                        &app.ctx,
+                        mesh,
+                        &app.materials,
+                        &app.textures,
+                        &skel.skinning_palette,
+                        &app.camera,
+                    );
+                }
             }
 
             // Present to screen (sync_interval = 0 for uncapped, 1 for VSync)
@@ -482,10 +521,12 @@ fn main() {
                 } else {
                     "No Jiggle"
                 };
+                let mt_str = if app.multithreaded { "MT: ON" } else { "MT: OFF" };
                 let title = format!(
-                    "Hikari Studio [DX11] | {:.1} FPS ({:.2} ms) [{}] [{}] [{}] | '{}' ({} vtx, {} tris, {} bones) | {} | Cam: {:.1}m\0",
+                    "Hikari Studio [DX11] | {:.1} FPS ({:.2} ms) [{}] [{}] [{}] [{}] | '{}' ({} vtx, {} tris, {} bones) | {} | Cam: {:.1}m\0",
                     app.current_fps,
                     app.current_frame_time_ms,
+                    mt_str,
                     vsync_str,
                     phys_str,
                     jiggle_str,

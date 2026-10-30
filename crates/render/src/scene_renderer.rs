@@ -341,7 +341,7 @@ float4 Grid_PS(GridOut input) : SV_Target {
         })
     }
 
-    pub fn update_camera(&self, ctx: &D3D11Context, camera: &Camera) -> Result<()> {
+    pub fn update_camera_on(&self, target_ctx: &ID3D11DeviceContext, camera: &Camera) -> Result<()> {
         let view = camera.view_matrix();
         let proj = camera.projection_matrix();
         let vp = camera.view_projection_matrix();
@@ -355,44 +355,233 @@ float4 Grid_PS(GridOut input) : SV_Target {
 
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            ctx.context.Map(&self.camera_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            target_ctx.Map(&self.camera_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
             *(mapped.pData as *mut CameraConstants) = constants;
-            ctx.context.Unmap(&self.camera_buffer, 0);
+            target_ctx.Unmap(&self.camera_buffer, 0);
         }
         Ok(())
     }
 
-    /// Renders the 3D ground plane coordinate grid.
-    pub fn render_grid(&self, ctx: &D3D11Context, camera: &Camera) -> Result<()> {
-        self.update_camera(ctx, camera)?;
-        ctx.set_viewport(ctx.width as f32, ctx.height as f32);
+    pub fn update_camera(&self, ctx: &D3D11Context, camera: &Camera) -> Result<()> {
+        self.update_camera_on(&ctx.context, camera)
+    }
+
+    /// Renders the 3D ground plane coordinate grid directly to a target context.
+    pub fn render_grid_to(&self, ctx: &D3D11Context, target_ctx: &ID3D11DeviceContext) -> Result<()> {
+        ctx.bind_default_targets_to(target_ctx);
 
         unsafe {
-            ctx.context.IASetInputLayout(&self.grid_layout);
-            ctx.context.VSSetShader(&self.grid_vs, None);
-            ctx.context.PSSetShader(&self.grid_ps, None);
+            target_ctx.IASetInputLayout(&self.grid_layout);
+            target_ctx.VSSetShader(&self.grid_vs, None);
+            target_ctx.PSSetShader(&self.grid_ps, None);
 
             let cam_cbs = [Some(self.camera_buffer.clone())];
-            ctx.context.VSSetConstantBuffers(0, Some(&cam_cbs));
+            target_ctx.VSSetConstantBuffers(0, Some(&cam_cbs));
 
             let stride = std::mem::size_of::<GridVertex>() as u32;
             let offset = 0u32;
             let vbs = [Some(self.grid_vb.clone())];
-            ctx.context.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&offset));
-            ctx.context.IASetPrimitiveTopology(
+            target_ctx.IASetVertexBuffers(0, 1, Some(vbs.as_ptr()), Some(&stride), Some(&offset));
+            target_ctx.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_LINELIST,
             );
 
             if let Some(depth) = ctx.state_manager.get_depth(hikari_core::states::DepthPreset::ReadWriteLessEqual) {
-                ctx.context.OMSetDepthStencilState(Some(depth), 1);
+                target_ctx.OMSetDepthStencilState(Some(depth), 1);
             }
             if let Some(blend) = ctx.state_manager.get_blend(hikari_core::states::BlendPreset::Opaque) {
-                ctx.context.OMSetBlendState(Some(blend), Some(&[0.0; 4]), 0xFFFFFFFF);
+                target_ctx.OMSetBlendState(Some(blend), Some(&[0.0; 4]), 0xFFFFFFFF);
             }
 
-            ctx.context.Draw(self.grid_vertex_count, 0);
+            target_ctx.Draw(self.grid_vertex_count, 0);
         }
         Ok(())
+    }
+
+    /// Renders the 3D ground plane coordinate grid on the immediate context.
+    pub fn render_grid(&self, ctx: &D3D11Context, camera: &Camera) -> Result<()> {
+        self.update_camera(ctx, camera)?;
+        self.render_grid_to(ctx, &ctx.context)
+    }
+
+    /// Records 3D ground grid rendering commands onto a deferred context into a command list.
+    pub fn record_grid(
+        &self,
+        ctx: &D3D11Context,
+        deferred_ctx: &ID3D11DeviceContext,
+    ) -> Result<ID3D11CommandList> {
+        self.render_grid_to(ctx, deferred_ctx)?;
+        D3D11Context::finish_command_list(deferred_ctx, false)
+    }
+
+    /// Renders a specific subset slice of a skinned mesh onto any target device context (immediate or deferred).
+    pub fn render_mesh_subsets_to(
+        &self,
+        ctx: &D3D11Context,
+        target_ctx: &ID3D11DeviceContext,
+        mesh: &GpuMesh,
+        materials: &[GpuMaterial],
+        textures: &[Option<GpuTexture>],
+        skinning_buffer: &GpuSkinningBuffer,
+        subset_range: std::ops::Range<usize>,
+    ) -> Result<()> {
+        ctx.bind_default_targets_to(target_ctx);
+
+        unsafe {
+            // Bind shaders and input layout
+            target_ctx.IASetInputLayout(&self.input_layout);
+            target_ctx.VSSetShader(&self.default_vs, None);
+            target_ctx.PSSetShader(&self.default_ps, None);
+
+            // Bind camera buffer (b0) and skinning buffer (b2)
+            let cam_cbs = [Some(self.camera_buffer.clone())];
+            target_ctx.VSSetConstantBuffers(0, Some(&cam_cbs));
+            target_ctx.PSSetConstantBuffers(0, Some(&cam_cbs));
+
+            skinning_buffer.bind_vs_to(target_ctx, 2);
+
+            // Bind texture sampler (LinearWrap)
+            if let Some(sampler) = ctx.state_manager.get_sampler(hikari_core::states::SamplerPreset::LinearWrap) {
+                let samplers = [Some(sampler.clone())];
+                target_ctx.PSSetSamplers(0, Some(&samplers));
+            }
+
+            // Set pipeline states
+            if let Some(raster) = ctx.state_manager.get_rasterizer(hikari_core::states::RasterizerPreset::CullNoneSolid) {
+                target_ctx.RSSetState(Some(raster));
+            }
+            if let Some(depth) = ctx.state_manager.get_depth(hikari_core::states::DepthPreset::ReadWriteLessEqual) {
+                target_ctx.OMSetDepthStencilState(Some(depth), 1);
+            }
+            if let Some(blend) = ctx.state_manager.get_blend(hikari_core::states::BlendPreset::AlphaBlend) {
+                target_ctx.OMSetBlendState(Some(blend), Some(&[0.0; 4]), 0xFFFFFFFF);
+            }
+
+            // Bind mesh buffers
+            mesh.bind_to(target_ctx);
+
+            let start = subset_range.start.min(mesh.subsets.len());
+            let end = subset_range.end.min(mesh.subsets.len());
+
+            for subset in &mesh.subsets[start..end] {
+                let mut srv_to_bind = &self.default_white_texture.srv;
+                if subset.material_index < materials.len() {
+                    let mat = &materials[subset.material_index];
+                    mat.bind_to(target_ctx, 1);
+                    if mat.texture_index >= 0 && (mat.texture_index as usize) < textures.len() {
+                        if let Some(ref tex) = textures[mat.texture_index as usize] {
+                            srv_to_bind = &tex.srv;
+                        }
+                    }
+                }
+                let srvs = [Some(srv_to_bind.clone())];
+                target_ctx.PSSetShaderResources(0, Some(&srvs));
+                target_ctx.DrawIndexed(subset.index_count, subset.index_start, 0);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Renders all subsets of a skinned mesh onto any target device context.
+    pub fn render_mesh_to(
+        &self,
+        ctx: &D3D11Context,
+        target_ctx: &ID3D11DeviceContext,
+        mesh: &GpuMesh,
+        materials: &[GpuMaterial],
+        textures: &[Option<GpuTexture>],
+        skinning_buffer: &GpuSkinningBuffer,
+    ) -> Result<()> {
+        self.render_mesh_subsets_to(ctx, target_ctx, mesh, materials, textures, skinning_buffer, 0..mesh.subsets.len())
+    }
+
+    /// Records drawing commands for a subset range of a skinned mesh onto a deferred context.
+    pub fn record_mesh_subsets(
+        &self,
+        ctx: &D3D11Context,
+        deferred_ctx: &ID3D11DeviceContext,
+        mesh: &GpuMesh,
+        materials: &[GpuMaterial],
+        textures: &[Option<GpuTexture>],
+        skinning_buffer: &GpuSkinningBuffer,
+        subset_range: std::ops::Range<usize>,
+    ) -> Result<ID3D11CommandList> {
+        self.render_mesh_subsets_to(ctx, deferred_ctx, mesh, materials, textures, skinning_buffer, subset_range)?;
+        D3D11Context::finish_command_list(deferred_ctx, false)
+    }
+
+    /// Records drawing commands across multiple CPU worker threads using D3D11 deferred contexts.
+    ///
+    /// Subsets are partitioned across worker threads, recorded into command lists concurrently,
+    /// and returned in draw order to be executed on the immediate context.
+    pub fn record_mesh_subsets_parallel(
+        &self,
+        ctx: &D3D11Context,
+        mesh: &GpuMesh,
+        materials: &[GpuMaterial],
+        textures: &[Option<GpuTexture>],
+        skinning_buffer: &GpuSkinningBuffer,
+        num_threads: usize,
+    ) -> Result<Vec<ID3D11CommandList>> {
+        let total_subsets = mesh.subsets.len();
+        if total_subsets == 0 {
+            return Ok(Vec::new());
+        }
+
+        let threads = num_threads.max(1).min(total_subsets);
+        if threads <= 1 {
+            let deferred = ctx.acquire_deferred_context()?;
+            let cl = self.record_mesh_subsets(ctx, &deferred, mesh, materials, textures, skinning_buffer, 0..total_subsets)?;
+            ctx.recycle_deferred_context(deferred);
+            return Ok(vec![cl]);
+        }
+
+        let chunk_size = (total_subsets + threads - 1) / threads;
+        let mut ranges = Vec::new();
+        for i in 0..threads {
+            let start = i * chunk_size;
+            if start < total_subsets {
+                let end = (start + chunk_size).min(total_subsets);
+                ranges.push(start..end);
+            }
+        }
+
+        use hikari_core::d3d11::{SendCommandList, SendDeviceContext};
+
+        let mut deferred_contexts = Vec::new();
+        for _ in 0..ranges.len() {
+            let d = ctx.acquire_deferred_context()?;
+            deferred_contexts.push(SendDeviceContext(d));
+        }
+
+        let results: Vec<std::result::Result<SendCommandList, String>> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for (range, d_ctx) in ranges.into_iter().zip(deferred_contexts.iter()) {
+                let d_ref = &d_ctx.0;
+                let handle = s.spawn(move || -> std::result::Result<SendCommandList, String> {
+                    match self.record_mesh_subsets(ctx, d_ref, mesh, materials, textures, skinning_buffer, range) {
+                        Ok(cl) => Ok(SendCommandList(cl)),
+                        Err(e) => Err(format!("Command list recording error: {:?}", e)),
+                    }
+                });
+                handles.push(handle);
+            }
+
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("Worker thread panicked".into()))).collect()
+        });
+
+        for d in deferred_contexts {
+            ctx.recycle_deferred_context(d.0);
+        }
+
+        let mut command_lists = Vec::with_capacity(results.len());
+        for res in results {
+            let send_cl = res.map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e))?;
+            command_lists.push(send_cl.0);
+        }
+
+        Ok(command_lists)
     }
 
     /// Renders a skinned PMX mesh with materials and textures on DirectX 11.
@@ -407,60 +596,6 @@ float4 Grid_PS(GridOut input) : SV_Target {
     ) -> Result<()> {
         self.update_camera(ctx, camera)?;
         self.skinning_buffer.update(ctx, skinning_palette)?;
-
-        unsafe {
-            ctx.set_viewport(ctx.width as f32, ctx.height as f32);
-
-            // Bind shaders and input layout
-            ctx.context.IASetInputLayout(&self.input_layout);
-            ctx.context.VSSetShader(&self.default_vs, None);
-            ctx.context.PSSetShader(&self.default_ps, None);
-
-            // Bind camera buffer (b0) and skinning buffer (b2)
-            let cam_cbs = [Some(self.camera_buffer.clone())];
-            ctx.context.VSSetConstantBuffers(0, Some(&cam_cbs));
-            ctx.context.PSSetConstantBuffers(0, Some(&cam_cbs));
-
-            self.skinning_buffer.bind_vs(ctx, 2);
-
-            // Bind texture sampler (LinearWrap)
-            if let Some(sampler) = ctx.state_manager.get_sampler(hikari_core::states::SamplerPreset::LinearWrap) {
-                let samplers = [Some(sampler.clone())];
-                ctx.context.PSSetSamplers(0, Some(&samplers));
-            }
-
-            // Set pipeline states (CullNoneSolid ensures all double-sided PMX mesh parts like hair and clothes render cleanly)
-            if let Some(raster) = ctx.state_manager.get_rasterizer(hikari_core::states::RasterizerPreset::CullNoneSolid) {
-                ctx.context.RSSetState(Some(raster));
-            }
-            if let Some(depth) = ctx.state_manager.get_depth(hikari_core::states::DepthPreset::ReadWriteLessEqual) {
-                ctx.context.OMSetDepthStencilState(Some(depth), 1);
-            }
-            if let Some(blend) = ctx.state_manager.get_blend(hikari_core::states::BlendPreset::AlphaBlend) {
-                ctx.context.OMSetBlendState(Some(blend), Some(&[0.0; 4]), 0xFFFFFFFF);
-            }
-
-            // Bind mesh buffers
-            mesh.bind(ctx);
-
-            // Draw each material subset with its diffuse texture
-            for subset in &mesh.subsets {
-                let mut srv_to_bind = &self.default_white_texture.srv;
-                if subset.material_index < materials.len() {
-                    let mat = &materials[subset.material_index];
-                    mat.bind(ctx, 1);
-                    if mat.texture_index >= 0 && (mat.texture_index as usize) < textures.len() {
-                        if let Some(ref tex) = textures[mat.texture_index as usize] {
-                            srv_to_bind = &tex.srv;
-                        }
-                    }
-                }
-                let srvs = [Some(srv_to_bind.clone())];
-                ctx.context.PSSetShaderResources(0, Some(&srvs));
-                ctx.context.DrawIndexed(subset.index_count, subset.index_start, 0);
-            }
-        }
-
-        Ok(())
+        self.render_mesh_to(ctx, &ctx.context, mesh, materials, textures, &self.skinning_buffer)
     }
 }

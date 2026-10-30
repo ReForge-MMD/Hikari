@@ -16,6 +16,7 @@ pub struct MaterialConstants {
     pub edge_color: [f32; 4],
 }
 
+#[derive(Clone)]
 pub struct GpuMaterial {
     pub name: String,
     pub constants: MaterialConstants,
@@ -58,11 +59,15 @@ impl GpuMaterial {
         })
     }
 
-    pub fn bind(&self, ctx: &D3D11Context, slot: u32) {
+    pub fn bind_to(&self, target_ctx: &ID3D11DeviceContext, slot: u32) {
         unsafe {
             let cbs = [Some(self.constant_buffer.clone())];
-            ctx.context.PSSetConstantBuffers(slot, Some(&cbs));
-            ctx.context.VSSetConstantBuffers(slot, Some(&cbs));
+            target_ctx.PSSetConstantBuffers(slot, Some(&cbs));
+            target_ctx.VSSetConstantBuffers(slot, Some(&cbs));
         }
+    }
+
+    pub fn bind(&self, ctx: &D3D11Context, slot: u32) {
+        self.bind_to(&ctx.context, slot);
     }
 }

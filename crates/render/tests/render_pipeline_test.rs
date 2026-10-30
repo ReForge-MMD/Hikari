@@ -108,4 +108,30 @@ fn test_render_pipeline_creation_and_mesh_upload() {
     let gpu_mat = GpuMaterial::from_pmx_material(&ctx, &pmx.materials[0])
         .expect("Failed to create GpuMaterial");
     assert_eq!(gpu_mat.name, "Mat1");
+
+    // Test multi-threaded command list generation for mesh subsets
+    let materials = [gpu_mat];
+    let parallel_cls = renderer
+        .record_mesh_subsets_parallel(&ctx, &gpu_mesh, &materials, &[], &renderer.skinning_buffer, 2)
+        .expect("Failed to record mesh subsets in parallel");
+    assert_eq!(parallel_cls.len(), 1, "1 subset partitioned into 1 active command list");
+    ctx.execute_command_lists(&parallel_cls, false);
+
+    // Test pass-based multi-threaded parallel frame renderer (Grid + Mesh passes)
+    use hikari_render::{ParallelFrameRenderer, ScenePassItem};
+    let passes = [
+        ScenePassItem::Grid,
+        ScenePassItem::Mesh {
+            mesh: &gpu_mesh,
+            materials: &materials,
+            textures: &[],
+            skinning_buffer: &renderer.skinning_buffer,
+            subset_range: 0..gpu_mesh.subsets.len(),
+        },
+    ];
+
+    let pass_cls = ParallelFrameRenderer::record_passes_parallel(&ctx, &renderer, &passes)
+        .expect("Failed to record frame passes in parallel");
+    assert_eq!(pass_cls.len(), 2, "Grid pass and Mesh pass recorded concurrently");
+    ctx.execute_command_lists(&pass_cls, false);
 }

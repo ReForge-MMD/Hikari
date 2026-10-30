@@ -26,4 +26,34 @@ fn test_create_headless_d3d11_context() {
     let (_texture, srv, uav) = tex.unwrap();
     assert!(srv.is_some(), "Texture should have SRV");
     assert!(uav.is_some(), "Texture should have UAV");
+
+    // Verify Direct3D 11 threading capabilities query
+    let caps = ctx.check_threading_support();
+    // Hardware or WARP driver will report valid booleans
+    println!("D3D11 Threading Caps: concurrent_creates={}, command_lists={}", caps.driver_concurrent_creates, caps.driver_command_lists);
+
+    // Verify Deferred Context acquisition from pool and command list execution
+    let deferred = ctx.acquire_deferred_context();
+    assert!(deferred.is_ok(), "Failed to acquire deferred context from pool");
+    let deferred = deferred.unwrap();
+
+    // Record simple state change on deferred context
+    unsafe {
+        deferred.RSSetState(Some(&ctx.raster_solid_cull_none));
+    }
+
+    // Finish command list
+    let cl = D3D11Context::finish_command_list(&deferred, false);
+    assert!(cl.is_ok(), "Failed to finish command list on deferred context");
+    let cl = cl.unwrap();
+
+    // Recycle deferred context back to pool
+    ctx.recycle_deferred_context(deferred);
+
+    // Execute recorded command list on immediate context
+    ctx.execute_command_list(&cl, false);
+
+    // Acquire again from pool (should reuse recycled context)
+    let deferred_reused = ctx.acquire_deferred_context().unwrap();
+    ctx.recycle_deferred_context(deferred_reused);
 }

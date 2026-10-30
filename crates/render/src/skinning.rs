@@ -35,11 +35,11 @@ impl GpuSkinningBuffer {
         })
     }
 
-    pub fn update(&self, ctx: &D3D11Context, palette: &[Mat4]) -> Result<()> {
+    pub fn update_on(&self, target_ctx: &ID3D11DeviceContext, palette: &[Mat4]) -> Result<()> {
         let count = palette.len().min(MAX_BONES);
         unsafe {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            ctx.context.Map(&self.buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            target_ctx.Map(&self.buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
             let dst = mapped.pData as *mut Mat4;
             if count > 0 {
                 std::ptr::copy_nonoverlapping(palette.as_ptr(), dst, count);
@@ -51,15 +51,23 @@ impl GpuSkinningBuffer {
                     *dst.add(i) = Mat4::IDENTITY;
                 }
             }
-            ctx.context.Unmap(&self.buffer, 0);
+            target_ctx.Unmap(&self.buffer, 0);
         }
         Ok(())
     }
 
-    pub fn bind_vs(&self, ctx: &D3D11Context, slot: u32) {
+    pub fn update(&self, ctx: &D3D11Context, palette: &[Mat4]) -> Result<()> {
+        self.update_on(&ctx.context, palette)
+    }
+
+    pub fn bind_vs_to(&self, target_ctx: &ID3D11DeviceContext, slot: u32) {
         unsafe {
             let cbs = [Some(self.buffer.clone())];
-            ctx.context.VSSetConstantBuffers(slot, Some(&cbs));
+            target_ctx.VSSetConstantBuffers(slot, Some(&cbs));
         }
+    }
+
+    pub fn bind_vs(&self, ctx: &D3D11Context, slot: u32) {
+        self.bind_vs_to(&ctx.context, slot);
     }
 }
