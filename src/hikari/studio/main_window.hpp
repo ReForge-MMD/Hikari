@@ -1,0 +1,74 @@
+#pragma once
+
+#include <QMainWindow>
+
+#include <array>
+
+#include "hikari/studio/app_state.hpp"
+
+class QComboBox;
+class QDoubleSpinBox;
+class QLabel;
+class QListWidget;
+class QSlider;
+class QSpinBox;
+class QTabWidget;
+class QTimer;
+
+namespace hikari::studio {
+
+class D3DViewport;
+class TimelineWidget;
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    explicit MainWindow(QString model_path, QString motion_path, QWidget* parent = nullptr);
+
+private:
+    void build_menus();
+    void build_docks();
+    QWidget* build_model_tab();
+    QWidget* build_bone_tab();
+    QWidget* build_facial_tab();
+    QWidget* build_camera_tab();
+    QWidget* build_light_tab();
+    QWidget* build_shadow_tab();
+    QWidget* build_accessory_tab();
+    QWidget* build_view_tab();
+    QWidget* build_playback_tab();
+    QWidget* build_interpolation_tab();
+    void show_effect_dialog();
+    void show_gravity_dialog();
+    void show_physics_dialog();
+    void show_shortcuts_dialog();
+    void show_about_dialog();
+    void show_screen_size_dialog();
+    void show_render_video_dialog();
+    void choose_model();
+    void choose_motion();
+    void choose_vpd_load();
+    void choose_vpd_save();
+    void choose_render_image();
+    void refresh_bone_list();
+    void refresh_morph_combos();
+    void sync_bone_fields();
+    void sync_morph_fields();
+
+    StudioAppState state_;
+    D3DViewport* viewport_ = nullptr;
+    TimelineWidget* timeline_ = nullptr;
+    QTabWidget* panels_ = nullptr;
+    QListWidget* bone_list_ = nullptr;
+    std::array<QDoubleSpinBox*, 3> bone_pos_{};
+    std::array<QDoubleSpinBox*, 3> bone_rot_{};
+    std::array<QComboBox*, 4> morph_combo_{};
+    std::array<QSlider*, 4> morph_slider_{};
+    std::array<QLabel*, 4> morph_value_{};
+    QSpinBox* jump_frame_ = nullptr;
+    QLabel* stats_label_ = nullptr;
+    QLabel* info_label_ = nullptr;
+    QString model_path_;
+};
+
+} // namespace hikari::studio

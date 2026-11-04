@@ -1,0 +1,39 @@
+cmake_minimum_required(VERSION 3.29)
+project(Hikari VERSION 1.0.0 LANGUAGES CXX)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "Hikari targets Windows: Direct3D 11 and Win32 host interop are required.")
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(HikariOptions)
+
+option(HIKARI_BUILD_STUDIO "Build the Qt 6 studio application" ON)
+if(HIKARI_BUILD_STUDIO)
+  find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets)
+endif()
+find_package(Jolt CONFIG REQUIRED)
+find_package(Stb REQUIRED)
+
+option(HIKARI_BUILD_TESTS "Build Hikari tests" ON)
+if(HIKARI_BUILD_TESTS)
+  find_package(Catch2 3 CONFIG REQUIRED)
+  enable_testing()
+endif()
+
+add_library(hikari_options INTERFACE)
+target_include_directories(hikari_options INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+hikari_apply_warnings(hikari_options)
+
+add_subdirectory(src/hikari/formats)
+add_subdirectory(src/hikari/animation)
+add_subdirectory(src/hikari/physics)
+add_subdirectory(src/hikari/render)
+add_subdirectory(src/hikari/core)
+if(HIKARI_BUILD_STUDIO)
+  add_subdirectory(src/hikari/studio)
+endif()
+
+if(HIKARI_BUILD_TESTS)
+  add_subdirectory(tests)
+endif()

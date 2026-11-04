@@ -1,9 +1,9 @@
-# Rust build artifacts
-/target/
-**/*.rs.bk
-
-# Cargo
-# Keep Cargo.lock for deterministic builds of cdylib
+# CMake / vcpkg / ccache build output
+/out/
+/vcpkg_installed/
+CMakeUserPresets.json
+compile_commands.json
+.cache/
 
 # Visual Studio / MSVC artifacts
 .vs/
@@ -83,4 +83,3 @@ mmdplugin_dev_ver0.41_x64/
 specs/
 .specify/
 .agents/
-
