@@ -33,6 +33,25 @@ struct EffectDialogState {
     int pbr_tonemapper = 1;
 };
 
+// Snapshot of an animated value captured when a keyframe is registered.
+// Per-track interpretation:
+//   bone: position + rotation (local transform)
+//   camera: position (pan), angles (yaw/pitch/roll radians), distance, fov
+//   light: position (color), angles (direction)
+//   shadow: weight (mode), distance (range), fov (detail)
+//   gravity: position, weight (noise)
+//   accessory: position, angles, weight (alpha), scale
+//   morph: weight
+struct TrackKeyframe {
+    std::array<float, 3> position{0.0f, 0.0f, 0.0f};
+    std::array<float, 4> rotation{0.0f, 0.0f, 0.0f, 1.0f};
+    std::array<float, 3> angles{0.0f, 0.0f, 0.0f};
+    float weight = 0.0f;
+    float distance = 0.0f;
+    float fov = 0.0f;
+    float scale = 1.0f;
+};
+
 struct StudioAppState {
     EditorMode mode = EditorMode::Camera;
     bool model_loaded = false;
@@ -68,8 +87,9 @@ struct StudioAppState {
     std::pair<int, int> play_range{0, 300};
     float timeline_zoom = 1.0f;
     float timeline_scroll = 0.0f;
-    std::map<QString, std::set<unsigned int>> track_keyframes;
+    std::map<QString, std::map<unsigned int, TrackKeyframe>> track_keyframes;
     std::set<std::pair<QString, unsigned int>> selected_keyframes;
+    bool track_keys_dirty = true;
     QString jump_frame_input = "0";
 
     InterpolationTarget curve_target = InterpolationTarget::Rotation;
@@ -147,6 +167,7 @@ struct StudioAppState {
     QString selected_track_name() const;
     void register_keyframe(const QString& track, unsigned int frame);
     void delete_keyframe(const QString& track, unsigned int frame);
+    TrackKeyframe capture_keyframe(const QString& track) const;
     bool is_playing_back() const { return is_playing; }
 };
 

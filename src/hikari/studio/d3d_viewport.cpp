@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 
 #include "hikari/core/log.hpp"
 #include "hikari/studio/viewport_chrome.hpp"
@@ -207,6 +208,8 @@ bool D3DViewport::load_model(const QString& path) {
                                           : std::nullopt;
         morphs_ = std::move(morphs);
         motion_player_.reset();
+        last_editor_frame_ = -1.0f;
+        state_.track_keys_dirty = true;
 
         vertex_count_ = static_cast<int>(mesh_->vertex_count);
         index_count_ = static_cast<int>(mesh_->index_count);
@@ -369,6 +372,8 @@ void D3DViewport::clear_model() {
     physics_rig_.reset();
     jiggle_.reset();
     motion_player_.reset();
+    last_editor_frame_ = -1.0f;
+    state_.track_keys_dirty = true;
     vertex_count_ = 0;
     index_count_ = 0;
     bone_count_ = 0;
@@ -570,10 +575,10 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
     }
     for (int frame = start; frame <= end; ++frame) {
         state_.current_frame = static_cast<float>(frame);
-        evaluate_frame(static_cast<float>(frame));
         if (!motion_player_) {
             morphs_.reset();
         }
+        evaluate_frame(static_cast<float>(frame));
         for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
             morphs_.set_weight(it.key().toStdString(), it.value());
         }
@@ -659,11 +664,11 @@ void D3DViewport::tick_impl() {
     }
 
     update_camera();
-    evaluate_frame(state_.current_frame);
-
     if (!motion_player_) {
         morphs_.reset();
     }
+    evaluate_frame(state_.current_frame);
+
     for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
         morphs_.set_weight(it.key().toStdString(), it.value());
     }
@@ -755,6 +760,100 @@ void D3DViewport::evaluate_frame(float frame) {
                 ? std::fmod(frame, static_cast<float>(motion_player_->max_frame) + 1.0f)
                 : frame;
         motion_player_->evaluate_pose(evaluated, *skeleton_, morphs_);
+    }
+    const bool scene_changed = state_.is_playing || state_.track_keys_dirty ||
+                               frame != last_editor_frame_;
+    apply_editor_tracks(frame, scene_changed);
+    state_.track_keys_dirty = false;
+    last_editor_frame_ = frame;
+}
+
+void D3DViewport::apply_editor_tracks(float frame, bool apply_scene_values) {
+    bool bones_changed = false;
+    for (const auto& [track, keys] : state_.track_keyframes) {
+        if (keys.empty()) {
+            continue;
+        }
+        const TrackKeyframe* first = nullptr;
+        const TrackKeyframe* second = nullptr;
+        float t = 0.0f;
+        const auto next = keys.upper_bound(
+            static_cast<unsigned int>(std::max(0.0f, std::floor(frame))));
+        if (next == keys.begin()) {
+            first = &keys.begin()->second;
+            second = first;
+        } else {
+            const auto lower = std::prev(next);
+            first = &lower->second;
+            if (next == keys.end()) {
+                second = first;
+            } else {
+                second = &next->second;
+                const float span = static_cast<float>(next->first - lower->first);
+                t = span > 0.0f
+                        ? std::clamp((frame - static_cast<float>(lower->first)) / span, 0.0f,
+                                     1.0f)
+                        : 0.0f;
+            }
+        }
+        const auto mix = [t](float a, float b) { return a + (b - a) * t; };
+        const auto mix3 = [&mix](const std::array<float, 3>& a,
+                                 const std::array<float, 3>& b) {
+            return std::array<float, 3>{mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])};
+        };
+
+        const bool scene_track =
+            track == QStringLiteral("camera") || track == QStringLiteral("light") ||
+            track == QStringLiteral("shadow") || track == QStringLiteral("gravity") ||
+            track == QStringLiteral("accessory");
+        if (scene_track) {
+            if (!apply_scene_values) {
+                continue;
+            }
+            if (track == QStringLiteral("camera")) {
+                state_.camera_pan = mix3(first->position, second->position);
+                state_.camera_yaw = mix(first->angles[0], second->angles[0]);
+                state_.camera_pitch = mix(first->angles[1], second->angles[1]);
+                state_.camera_roll = mix(first->angles[2], second->angles[2]);
+                state_.camera_distance = mix(first->distance, second->distance);
+                state_.camera_fov_deg = mix(first->fov, second->fov);
+            } else if (track == QStringLiteral("light")) {
+                state_.light_color = mix3(first->position, second->position);
+                state_.light_direction = mix3(first->angles, second->angles);
+            } else if (track == QStringLiteral("shadow")) {
+                state_.shadow_mode =
+                    static_cast<ShadowMode>(std::lround(mix(first->weight, second->weight)));
+                state_.shadow_range = mix(first->distance, second->distance);
+                state_.shadow_detail = mix(first->fov, second->fov);
+            } else if (track == QStringLiteral("gravity")) {
+                state_.gravity = mix3(first->position, second->position);
+                state_.gravity_noise = mix(first->weight, second->weight);
+            } else if (track == QStringLiteral("accessory")) {
+                state_.accessory_pos = mix3(first->position, second->position);
+                state_.accessory_rot = mix3(first->angles, second->angles);
+                state_.accessory_alpha = mix(first->weight, second->weight);
+                state_.accessory_scale = mix(first->scale, second->scale);
+            }
+            continue;
+        }
+
+        if (track == QStringLiteral("view cnt") || track == QStringLiteral("Disp/IK/OP") ||
+            track == QStringLiteral("Facial")) {
+            continue;
+        }
+
+        if (const auto index = skeleton_->find_bone_index(track.toStdString())) {
+            skeleton_->local_translations[*index] =
+                Vec3::from_array(mix3(first->position, second->position));
+            skeleton_->local_rotations[*index] = Quat::from_array(first->rotation)
+                                                     .slerp(Quat::from_array(second->rotation), t);
+            bones_changed = true;
+        } else {
+            morphs_.set_weight(track.toStdString(), mix(first->weight, second->weight));
+        }
+    }
+    if (bones_changed) {
+        skeleton_->update_transforms();
     }
 }
 

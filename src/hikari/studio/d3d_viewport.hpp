@@ -83,6 +83,7 @@ private:
     void draw_overlay();
     void update_camera();
     void evaluate_frame(float frame);
+    void apply_editor_tracks(float frame, bool apply_scene_values);
     void apply_editor_bone_override();
     void apply_bone_morphs(const animation::MorphResult& result);
     void apply_material_morphs(const animation::MorphResult& result);
@@ -124,6 +125,7 @@ private:
     bool right_down_ = false;
     bool middle_down_ = false;
     bool initialized_ = false;
+    float last_editor_frame_ = -1.0f;
 };
 
 } // namespace hikari::studio

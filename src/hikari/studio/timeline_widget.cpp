@@ -159,7 +159,8 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         if (track == state_.track_keyframes.end()) {
             continue;
         }
-        for (unsigned int frame : track->second) {
+        for (const auto& entry : track->second) {
+            const unsigned int frame = entry.first;
             const int x =
                 kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
             if (x < kHeaderWidth || x > width()) {
@@ -212,7 +213,8 @@ std::optional<TimelineKeyframeHit> TimelineWidget::keyframe_at(const QPoint& pos
     }
     const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
     const int offset = static_cast<int>(state_.timeline_scroll);
-    for (unsigned int frame : track->second) {
+    for (const auto& entry : track->second) {
+        const unsigned int frame = entry.first;
         const int x = kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
         if (x < kHeaderWidth || x > width()) {
             continue;

@@ -556,8 +556,8 @@ QWidget* MainWindow::build_timeline_panel() {
         const QString track = state_.selected_track_name();
         const auto it = state_.track_keyframes.find(track);
         if (it != state_.track_keyframes.end()) {
-            for (unsigned int frame : it->second) {
-                state_.selected_keyframes.insert({track, frame});
+            for (const auto& entry : it->second) {
+                state_.selected_keyframes.insert({track, entry.first});
             }
         }
         timeline_->update();
