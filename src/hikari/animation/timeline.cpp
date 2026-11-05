@@ -81,6 +81,27 @@ float sample_morph_track(const std::vector<formats::VmdMorphFrame>& frames, floa
     return f0.weight + (f1.weight - f0.weight) * t;
 }
 
+std::pair<const formats::VmdCameraFrame*, const formats::VmdCameraFrame*> camera_segment(
+    const std::vector<formats::VmdCameraFrame>& frames, float frame) {
+    const auto upper = std::lower_bound(
+        frames.begin(), frames.end(), frame,
+        [](const formats::VmdCameraFrame& f, float value) {
+            return static_cast<float>(f.frame) < value;
+        });
+    if (upper == frames.end()) {
+        return {&frames.back(), &frames.back()};
+    }
+    if (upper == frames.begin()) {
+        return {&*upper, &*upper};
+    }
+    return {&*(upper - 1), &*upper};
+}
+
+float segment_t(std::uint32_t a, std::uint32_t b, float frame) {
+    const float span = static_cast<float>(b) - static_cast<float>(a);
+    return span > 0.0f ? std::clamp((frame - static_cast<float>(a)) / span, 0.0f, 1.0f) : 0.0f;
+}
+
 } // namespace
 
 MotionPlayer::MotionPlayer(const formats::VmdMotion& motion) {
@@ -100,6 +121,91 @@ MotionPlayer::MotionPlayer(const formats::VmdMotion& motion) {
         std::stable_sort(track.begin(), track.end(),
                          [](const auto& a, const auto& b) { return a.frame < b.frame; });
     }
+    camera_track_ = motion.camera_frames;
+    light_track_ = motion.light_frames;
+    shadow_track_ = motion.shadow_frames;
+    for (const auto& frame : camera_track_) {
+        max_frame = std::max(max_frame, frame.frame);
+    }
+    for (const auto& frame : light_track_) {
+        max_frame = std::max(max_frame, frame.frame);
+    }
+    for (const auto& frame : shadow_track_) {
+        max_frame = std::max(max_frame, frame.frame);
+    }
+    const auto by_frame = [](const auto& a, const auto& b) { return a.frame < b.frame; };
+    std::stable_sort(camera_track_.begin(), camera_track_.end(), by_frame);
+    std::stable_sort(light_track_.begin(), light_track_.end(), by_frame);
+    std::stable_sort(shadow_track_.begin(), shadow_track_.end(), by_frame);
+}
+
+std::optional<SceneSample> MotionPlayer::evaluate_scene(float frame) const {
+    if (camera_track_.empty() && light_track_.empty() && shadow_track_.empty()) {
+        return std::nullopt;
+    }
+    SceneSample result;
+    if (!camera_track_.empty()) {
+        const auto [first, second] = camera_segment(camera_track_, frame);
+        const float t = first == second ? 0.0f : segment_t(first->frame, second->frame, frame);
+        const auto mix = [t](float a, float b) { return a + (b - a) * t; };
+        SceneCameraSample camera;
+        camera.distance = mix(first->distance, second->distance);
+        for (std::size_t i = 0; i < 3; ++i) {
+            camera.position[i] = mix(first->position[i], second->position[i]);
+            camera.rotation[i] = mix(first->rotation[i], second->rotation[i]);
+        }
+        camera.fov = mix(static_cast<float>(first->fov), static_cast<float>(second->fov));
+        camera.perspective = first->perspective;
+        result.camera = camera;
+    }
+    if (!light_track_.empty()) {
+        const auto upper = std::lower_bound(
+            light_track_.begin(), light_track_.end(), frame,
+            [](const formats::VmdLightFrame& f, float value) {
+                return static_cast<float>(f.frame) < value;
+            });
+        const formats::VmdLightFrame* first = nullptr;
+        const formats::VmdLightFrame* second = nullptr;
+        if (upper == light_track_.end()) {
+            first = second = &light_track_.back();
+        } else if (upper == light_track_.begin()) {
+            first = second = &*upper;
+        } else {
+            first = &*(upper - 1);
+            second = &*upper;
+        }
+        const float t = first == second ? 0.0f : segment_t(first->frame, second->frame, frame);
+        SceneLightSample light;
+        for (std::size_t i = 0; i < 3; ++i) {
+            light.color[i] = first->color[i] + (second->color[i] - first->color[i]) * t;
+            light.direction[i] =
+                first->direction[i] + (second->direction[i] - first->direction[i]) * t;
+        }
+        result.light = light;
+    }
+    if (!shadow_track_.empty()) {
+        const auto upper = std::lower_bound(
+            shadow_track_.begin(), shadow_track_.end(), frame,
+            [](const formats::VmdShadowFrame& f, float value) {
+                return static_cast<float>(f.frame) < value;
+            });
+        const formats::VmdShadowFrame* first = nullptr;
+        const formats::VmdShadowFrame* second = nullptr;
+        if (upper == shadow_track_.end()) {
+            first = second = &shadow_track_.back();
+        } else if (upper == shadow_track_.begin()) {
+            first = second = &*upper;
+        } else {
+            first = &*(upper - 1);
+            second = &*upper;
+        }
+        const float t = first == second ? 0.0f : segment_t(first->frame, second->frame, frame);
+        SceneShadowSample shadow;
+        shadow.mode = t < 0.5f ? first->mode : second->mode;
+        shadow.distance = first->distance + (second->distance - first->distance) * t;
+        result.shadow = shadow;
+    }
+    return result;
 }
 
 void MotionPlayer::evaluate_pose(float frame, Skeleton& skeleton, MorphEvaluator& morphs) const {

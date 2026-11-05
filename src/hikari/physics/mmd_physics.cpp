@@ -37,7 +37,8 @@ namespace {
 
 constexpr ObjectLayer kLayerKinematic = 0;
 constexpr ObjectLayer kLayerDynamic = 1;
-constexpr uint kNumLayers = 2;
+constexpr ObjectLayer kLayerStatic = 2;
+constexpr uint kNumLayers = 3;
 
 class BroadPhaseLayers final : public BroadPhaseLayerInterface {
 public:
@@ -47,7 +48,8 @@ public:
     }
 #if defined(JPH_EXTERNAL_PROFILE) || defined(JPH_PROFILE_ENABLED)
     const char* GetBroadPhaseLayerName(BroadPhaseLayer layer) const override {
-        return layer.GetValue() == 0 ? "KINEMATIC" : "DYNAMIC";
+        return layer.GetValue() == 0 ? "KINEMATIC"
+                                     : (layer.GetValue() == 1 ? "DYNAMIC" : "STATIC");
     }
 #endif
 };
@@ -142,9 +144,47 @@ struct MmdWorld {
     Ref<MmdGroupFilter> groups = new MmdGroupFilter();
     std::vector<BodyID> bodies;
     std::vector<bool> kinematic;
+    BodyID ground;
+    bool ground_enabled = false;
     int32_t joints = 0;
     float spring_damping_ratio = 0.0f;
 };
+
+namespace {
+
+void create_ground(MmdWorld* world) {
+    if (!world || !world->ground.IsInvalid()) {
+        return;
+    }
+    // The top of the box sits exactly at Y = 0. Half extents keep it far larger
+    // than any MMD scene while staying well inside float precision.
+    Ref<Shape> shape = new BoxShape(Vec3(5000.0f, 0.5f, 5000.0f));
+    BodyCreationSettings settings(shape, RVec3(0.0f, -0.5f, 0.0f), Quat::sIdentity(),
+                                  EMotionType::Static, kLayerStatic);
+    settings.mAllowSleeping = true;
+    settings.mFriction = 0.8f;
+    settings.mRestitution = 0.0f;
+    // No group filter: MMD's per-body collision masks cannot disable the floor.
+    settings.mCollisionGroup = CollisionGroup();
+    // Keep the rest-overlap pass from treating the floor as a PMX body.
+    settings.mUserData = 0xFFFFFFFFu;
+    BodyInterface& bodies = world->system.GetBodyInterfaceNoLock();
+    world->ground = bodies.CreateAndAddBody(settings, EActivation::DontActivate);
+    world->ground_enabled = !world->ground.IsInvalid();
+}
+
+void destroy_ground(MmdWorld* world) {
+    if (!world || world->ground.IsInvalid()) {
+        return;
+    }
+    BodyInterface& bodies = world->system.GetBodyInterfaceNoLock();
+    bodies.RemoveBody(world->ground);
+    bodies.DestroyBody(world->ground);
+    world->ground = BodyID();
+    world->ground_enabled = false;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -169,6 +209,7 @@ MmdWorld* mmd_world_create(const MmdWorldSettings* settings, uint32_t max_bodies
     world->system.SetPhysicsSettings(physics);
     world->system.SetGravity(Vec3(settings->gravity[0], settings->gravity[1], settings->gravity[2]));
     world->spring_damping_ratio = std::max(0.0f, settings->spring_damping_ratio);
+    create_ground(world);
     return world;
 }
 
@@ -180,6 +221,7 @@ void mmd_world_destroy(MmdWorld* world) {
         bodies.RemoveBodies(world->bodies.data(), int(world->bodies.size()));
         bodies.DestroyBodies(world->bodies.data(), int(world->bodies.size()));
     }
+    destroy_ground(world);
     delete world;
     jolt_release();
 }
@@ -187,6 +229,15 @@ void mmd_world_destroy(MmdWorld* world) {
 void mmd_world_set_gravity(MmdWorld* world, float x, float y, float z) {
     if (world)
         world->system.SetGravity(Vec3(x, y, z));
+}
+
+void mmd_world_set_ground(MmdWorld* world, int32_t enabled) {
+    if (!world)
+        return;
+    if (enabled != 0)
+        create_ground(world);
+    else
+        destroy_ground(world);
 }
 
 int32_t mmd_world_add_body(MmdWorld* world, const MmdBodyDesc* desc) {

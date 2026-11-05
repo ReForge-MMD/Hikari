@@ -49,6 +49,10 @@ float eval_mmd_bezier(std::uint8_t x1_byte, std::uint8_t y1_byte, std::uint8_t x
            s * s * s;
 }
 
+float evaluate_keyframe_ease(const std::array<std::uint8_t, 4>& curve, float t) {
+    return eval_mmd_bezier(curve[0], curve[1], curve[2], curve[3], t);
+}
+
 std::array<std::uint8_t, 4> unpack_bone_bezier(const std::array<std::uint8_t, 64>& buffer,
                                                std::size_t channel) {
     return {buffer[channel], buffer[4 + channel], buffer[8 + channel], buffer[12 + channel]};

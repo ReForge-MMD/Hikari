@@ -3,12 +3,17 @@
 #include <QMainWindow>
 
 #include <array>
+#include <vector>
 
 #include "hikari/studio/app_state.hpp"
 
+class QAction;
+class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
+class QKeyEvent;
 class QLabel;
+class QPushButton;
 class QSlider;
 class QSpinBox;
 class QActionGroup;
@@ -24,6 +29,9 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(QString model_path, QString motion_path, QWidget* parent = nullptr);
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override;
 
 private:
     void build_menus();
@@ -42,7 +50,6 @@ private:
     QWidget* build_view_tab();
     QWidget* build_playback_tab();
     QWidget* build_interpolation_tab();
-    void show_effect_dialog();
     void show_gravity_dialog();
     void show_physics_dialog();
     void show_shortcuts_dialog();
@@ -51,14 +58,19 @@ private:
     void show_render_video_dialog();
     void choose_model();
     void choose_motion();
+    void choose_motion_save();
     void choose_vpd_load();
     void choose_vpd_save();
     void choose_render_image();
+    void copy_keyframes();
+    void paste_keyframes();
     void refresh_targets();
+    void refresh_model_list();
     void refresh_morph_combos();
     void sync_bone_fields();
     void sync_morph_fields();
     void delete_selected_keyframes();
+    void update_edit_actions();
     void update_viewport_title();
 
     StudioAppState state_;
@@ -74,9 +86,17 @@ private:
     std::array<QLabel*, 4> morph_value_{};
     QComboBox* physics_speed_ = nullptr;
     QActionGroup* physics_speed_group_ = nullptr;
+    QComboBox* model_combo_ = nullptr;
+    QCheckBox* model_visible_ = nullptr;
+    QPushButton* copy_button_ = nullptr;
+    QPushButton* paste_button_ = nullptr;
+    QAction* undo_action_ = nullptr;
+    QAction* redo_action_ = nullptr;
     QSpinBox* jump_frame_ = nullptr;
     QLabel* stats_label_ = nullptr;
     QLabel* info_label_ = nullptr;
+    std::vector<ClipboardKey> clipboard_;
+    unsigned int clipboard_anchor_ = 0;
     QString model_path_;
 };
 

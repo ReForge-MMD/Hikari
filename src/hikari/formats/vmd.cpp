@@ -131,6 +131,43 @@ bool parse_components(const std::string& line, std::vector<float>& out) {
     return !out.empty();
 }
 
+void append_u8(std::vector<std::uint8_t>& out, std::uint8_t value) {
+    out.push_back(value);
+}
+
+void append_u32(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    out.push_back(static_cast<std::uint8_t>(value & 0xFFu));
+    out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFFu));
+    out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFFu));
+    out.push_back(static_cast<std::uint8_t>((value >> 24) & 0xFFu));
+}
+
+void append_f32(std::vector<std::uint8_t>& out, float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_u32(out, bits);
+}
+
+std::string truncate_sjis(const std::string& text, std::size_t max_bytes) {
+    const std::string encoded = utf8_to_sjis(text);
+    if (encoded.size() <= max_bytes) {
+        return encoded;
+    }
+    std::size_t length = max_bytes;
+    const unsigned char previous = static_cast<unsigned char>(encoded[length - 1]);
+    if ((previous >= 0x81 && previous <= 0x9F) || (previous >= 0xE0 && previous <= 0xFC)) {
+        --length;
+    }
+    return encoded.substr(0, length);
+}
+
+void append_name(std::vector<std::uint8_t>& out, const std::string& name,
+                 std::size_t field_size) {
+    const std::string encoded = truncate_sjis(name, field_size);
+    out.insert(out.end(), encoded.begin(), encoded.end());
+    out.insert(out.end(), field_size - encoded.size(), 0);
+}
+
 std::string parse_block_name(const std::vector<std::string>& lines) {
     for (const auto& line : lines) {
         const std::string trimmed = trim(line);
@@ -261,6 +298,81 @@ VmdMotion VmdMotion::parse(const std::vector<std::uint8_t>& bytes) {
     }
 
     return motion;
+}
+
+std::vector<std::uint8_t> VmdMotion::to_bytes(const std::string& model_name_out) const {
+    std::vector<std::uint8_t> out;
+    const char magic[] = "Vocaloid Motion Data 0002";
+    const std::size_t magic_size = sizeof(magic) - 1;
+    out.insert(out.end(), magic, magic + magic_size);
+    out.insert(out.end(), 30 - magic_size, 0);
+    append_name(out, model_name_out, 20);
+
+    append_u32(out, static_cast<std::uint32_t>(bone_frames.size()));
+    for (const auto& frame : bone_frames) {
+        append_name(out, frame.name, 15);
+        append_u32(out, frame.frame);
+        for (float value : frame.position) {
+            append_f32(out, value);
+        }
+        for (float value : frame.rotation) {
+            append_f32(out, value);
+        }
+        out.insert(out.end(), frame.interpolation.begin(), frame.interpolation.end());
+    }
+
+    append_u32(out, static_cast<std::uint32_t>(morph_frames.size()));
+    for (const auto& frame : morph_frames) {
+        append_name(out, frame.name, 15);
+        append_u32(out, frame.frame);
+        append_f32(out, frame.weight);
+    }
+
+    append_u32(out, static_cast<std::uint32_t>(camera_frames.size()));
+    for (const auto& frame : camera_frames) {
+        append_u32(out, frame.frame);
+        append_f32(out, frame.distance);
+        for (float value : frame.position) {
+            append_f32(out, value);
+        }
+        for (float value : frame.rotation) {
+            append_f32(out, value);
+        }
+        out.insert(out.end(), frame.interpolation.begin(), frame.interpolation.end());
+        append_u32(out, frame.fov);
+        append_u8(out, frame.perspective ? 0 : 1);
+    }
+
+    append_u32(out, static_cast<std::uint32_t>(light_frames.size()));
+    for (const auto& frame : light_frames) {
+        append_u32(out, frame.frame);
+        for (float value : frame.color) {
+            append_f32(out, value);
+        }
+        for (float value : frame.direction) {
+            append_f32(out, value);
+        }
+    }
+
+    append_u32(out, static_cast<std::uint32_t>(shadow_frames.size()));
+    for (const auto& frame : shadow_frames) {
+        append_u32(out, frame.frame);
+        append_u8(out, frame.mode);
+        append_f32(out, frame.distance);
+    }
+
+    append_u32(out, static_cast<std::uint32_t>(ik_frames.size()));
+    for (const auto& frame : ik_frames) {
+        append_u32(out, frame.frame);
+        append_u8(out, frame.show ? 1 : 0);
+        append_u32(out, static_cast<std::uint32_t>(frame.ik_switches.size()));
+        for (const auto& sw : frame.ik_switches) {
+            append_name(out, sw.name, 20);
+            append_u8(out, sw.enabled ? 1 : 0);
+        }
+    }
+
+    return out;
 }
 
 VpdPose VpdPose::from_bytes(const std::vector<std::uint8_t>& bytes) {

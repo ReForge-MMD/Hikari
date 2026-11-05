@@ -17,6 +17,8 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
@@ -27,7 +29,6 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStatusBar>
-#include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -121,6 +122,17 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
         state_.screen_size_height = height;
         footer_->sync();
     });
+    connect(viewport_, &D3DViewport::modelsChanged, this, [this] {
+        refresh_model_list();
+        refresh_targets();
+        refresh_morph_combos();
+    });
+    connect(viewport_, &D3DViewport::activeModelChanged, this, [this] {
+        refresh_model_list();
+        refresh_targets();
+        refresh_morph_combos();
+        sync_bone_fields();
+    });
     connect(timeline_, &TimelineWidget::boneSelected, this, [this](int index) {
         state_.selected_bone_idx = index;
         state_.mode = EditorMode::Model;
@@ -176,7 +188,15 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
         header_->set_frame(static_cast<int>(state_.current_frame));
         footer_->sync();
         update_viewport_title();
+        update_edit_actions();
+        timeline_->refresh_layout();
         timeline_->update();
+        if (stats_label_ != nullptr) {
+            stats_label_->setVisible(state_.info_display);
+        }
+        if (info_label_ != nullptr) {
+            info_label_->setVisible(state_.info_display);
+        }
     });
     sync_timer->start();
 
@@ -229,6 +249,8 @@ void MainWindow::build_menus() {
                          [this] { choose_vpd_load(); });
     file_menu->addAction(QStringLiteral("Save Pose (.VPD)..."), this,
                          [this] { choose_vpd_save(); });
+    file_menu->addAction(QStringLiteral("Save Motion (.VMD)..."), this,
+                         [this] { choose_motion_save(); });
     file_menu->addSeparator();
     file_menu->addAction(QStringLiteral("Render Image (BMP)..."), this,
                          [this] { choose_render_image(); });
@@ -246,6 +268,26 @@ void MainWindow::build_menus() {
     file_menu->addAction(QStringLiteral("Exit"), this, [] { QApplication::quit(); });
 
     auto* edit_menu = menuBar()->addMenu(QStringLiteral("&Edit"));
+    undo_action_ = edit_menu->addAction(QStringLiteral("Undo"));
+    undo_action_->setShortcut(QKeySequence::Undo);
+    undo_action_->setEnabled(false);
+    connect(undo_action_, &QAction::triggered, this, [this] {
+        state_.undo_keyframes();
+        timeline_->refresh_layout();
+        timeline_->update();
+        update_edit_actions();
+    });
+    redo_action_ = edit_menu->addAction(QStringLiteral("Redo"));
+    redo_action_->setShortcuts(
+        {QKeySequence(QStringLiteral("Ctrl+Shift+Z")), QKeySequence(QStringLiteral("Ctrl+Y"))});
+    redo_action_->setEnabled(false);
+    connect(redo_action_, &QAction::triggered, this, [this] {
+        state_.redo_keyframes();
+        timeline_->refresh_layout();
+        timeline_->update();
+        update_edit_actions();
+    });
+    edit_menu->addSeparator();
     edit_menu->addAction(QStringLiteral("Reset Bone Transform (Z)"), this, [this] {
         viewport_->reset_selection_transform();
         state_.bone_pos_override = {0.0f, 0.0f, 0.0f};
@@ -267,22 +309,18 @@ void MainWindow::build_menus() {
         timeline_->update();
     });
     edit_menu->addAction(QStringLiteral("Delete Frame Line (K)"), this, [this] {
-        const unsigned int frame = static_cast<unsigned int>(state_.current_frame);
-        for (auto& [track, frames] : state_.track_keyframes) {
-            frames.erase(frame);
-        }
-        state_.set_status(QStringLiteral("Deleted keyframes at frame %1").arg(frame));
+        state_.delete_frame_line(static_cast<unsigned int>(state_.current_frame));
+        timeline_->refresh_layout();
         timeline_->update();
+        update_edit_actions();
     });
 
     auto* view_menu = menuBar()->addMenu(QStringLiteral("&View"));
     auto* grid_action = view_menu->addAction(QStringLiteral("Coordinate Grid (G)"));
     grid_action->setCheckable(true);
     grid_action->setChecked(state_.show_grid);
-    connect(grid_action, &QAction::toggled, this, [this](bool checked) {
-        state_.show_grid = checked;
-        state_.show_axes = checked;
-    });
+    connect(grid_action, &QAction::toggled, this,
+            [this](bool checked) { state_.show_grid = checked; });
     auto* bones_action = view_menu->addAction(QStringLiteral("Skeleton Overlay"));
     bones_action->setCheckable(true);
     bones_action->setChecked(state_.show_bones);
@@ -293,6 +331,11 @@ void MainWindow::build_menus() {
     physics_bones_action->setChecked(state_.show_physics_bones);
     connect(physics_bones_action, &QAction::toggled, this,
             [this](bool checked) { state_.show_physics_bones = checked; });
+    auto* ground_shadow_action = view_menu->addAction(QStringLiteral("Ground Shadow"));
+    ground_shadow_action->setCheckable(true);
+    ground_shadow_action->setChecked(state_.ground_shadow);
+    connect(ground_shadow_action, &QAction::toggled, this,
+            [this](bool checked) { state_.ground_shadow = checked; });
     view_menu->addSeparator();
     view_menu->addAction(QStringLiteral("Reset View"), this, [this] {
         viewport_->reset_camera();
@@ -319,11 +362,6 @@ void MainWindow::build_menus() {
     wireframe_action->setChecked(state_.wireframe);
     connect(wireframe_action, &QAction::toggled, this,
             [this](bool checked) { state_.wireframe = checked; });
-    auto* aa_action = background_menu->addAction(QStringLiteral("Anti-aliasing"));
-    aa_action->setCheckable(true);
-    aa_action->setChecked(state_.antialiasing);
-    connect(aa_action, &QAction::toggled, this,
-            [this](bool checked) { state_.antialiasing = checked; });
     background_menu->addSeparator();
     background_menu->addAction(QStringLiteral("Screen Size..."), this,
                                [this] { show_screen_size_dialog(); });
@@ -336,10 +374,11 @@ void MainWindow::build_menus() {
         state_.set_status(QStringLiteral("Reset all facial morphs"));
     });
     facial_menu->addAction(QStringLiteral("Register All Facial Frames"), this, [this] {
+        state_.push_undo_snapshot();
         for (const auto& names : state_.category_morph_names) {
             for (const auto& name : names) {
                 state_.register_keyframe(name,
-                                         static_cast<unsigned int>(state_.current_frame));
+                                         static_cast<unsigned int>(state_.current_frame), false);
             }
         }
         timeline_->update();
@@ -366,6 +405,11 @@ void MainWindow::build_menus() {
     playtime_action->setChecked(state_.playtime_only);
     connect(playtime_action, &QAction::toggled, this,
             [this](bool checked) { state_.playtime_only = checked; });
+    auto* ground_action = physics_menu->addAction(QStringLiteral("Ground Collision"));
+    ground_action->setCheckable(true);
+    ground_action->setChecked(state_.ground_collision);
+    connect(ground_action, &QAction::toggled, this,
+            [this](bool checked) { state_.ground_collision = checked; });
     auto* speed_menu = physics_menu->addMenu(QStringLiteral("Simulation Speed"));
     auto* speed_group = new QActionGroup(this);
     speed_group->setExclusive(true);
@@ -406,8 +450,6 @@ void MainWindow::build_menus() {
             [this](bool checked) { state_.show_joints = checked; });
     physics_menu->addAction(QStringLiteral("About Jolt Physics"), this,
                             [this] { show_physics_dialog(); });
-
-    menuBar()->addAction(QStringLiteral("MMEffect"), this, [this] { show_effect_dialog(); });
 
     auto* help_menu = menuBar()->addMenu(QStringLiteral("&Help"));
     help_menu->addAction(QStringLiteral("Keyboard Shortcuts"), this,
@@ -482,16 +524,24 @@ QWidget* MainWindow::build_timeline_panel() {
     connect(timeline_, &TimelineWidget::scrollRangeChanged, timeline_scroll,
             [timeline_scroll](int maximum) { timeline_scroll->setRange(0, maximum); });
     connect(timeline_, &TimelineWidget::scrollChanged, timeline_scroll, &QScrollBar::setValue);
+    connect(timeline_scroll, &QScrollBar::sliderPressed, timeline_,
+            [this] { timeline_->set_follow_playhead(false); });
+    connect(timeline_scroll, &QScrollBar::sliderReleased, timeline_,
+            [this] { timeline_->set_follow_playhead(true); });
     connect(timeline_, &TimelineWidget::deleteSelectedRequested, this,
             [this] { delete_selected_keyframes(); });
+    connect(timeline_, &TimelineWidget::copyRequested, this,
+            [this] { copy_keyframes(); });
+    connect(timeline_, &TimelineWidget::pasteRequested, this,
+            [this] { paste_keyframes(); });
 
     auto* actions_row = new QHBoxLayout();
-    auto* copy_button = new QPushButton(QStringLiteral("Copy"));
-    auto* paste_button = new QPushButton(QStringLiteral("Paste"));
+    copy_button_ = new QPushButton(QStringLiteral("Copy"));
+    paste_button_ = new QPushButton(QStringLiteral("Paste"));
     auto* vsel_button = new QPushButton(QStringLiteral("V-Sel"));
     auto* delete_button = new QPushButton(QStringLiteral("Delete"));
-    actions_row->addWidget(copy_button);
-    actions_row->addWidget(paste_button);
+    actions_row->addWidget(copy_button_);
+    actions_row->addWidget(paste_button_);
     actions_row->addWidget(vsel_button);
     actions_row->addWidget(delete_button);
     layout->addLayout(actions_row);
@@ -546,11 +596,10 @@ QWidget* MainWindow::build_timeline_panel() {
         timeline_->update();
     });
     connect(delete_line, &QPushButton::clicked, this, [this] {
-        const unsigned int frame = static_cast<unsigned int>(state_.current_frame);
-        for (auto& [track, frames] : state_.track_keyframes) {
-            frames.erase(frame);
-        }
+        state_.delete_frame_line(static_cast<unsigned int>(state_.current_frame));
+        timeline_->refresh_layout();
         timeline_->update();
+        update_edit_actions();
     });
     connect(vsel_button, &QPushButton::clicked, this, [this] {
         const QString track = state_.selected_track_name();
@@ -574,8 +623,10 @@ QWidget* MainWindow::build_timeline_panel() {
         timeline_->refresh_layout();
         timeline_->update();
     });
-    copy_button->setEnabled(false);
-    paste_button->setEnabled(false);
+    copy_button_->setEnabled(false);
+    paste_button_->setEnabled(false);
+    connect(copy_button_, &QPushButton::clicked, this, [this] { copy_keyframes(); });
+    connect(paste_button_, &QPushButton::clicked, this, [this] { paste_keyframes(); });
     return panel;
 }
 
@@ -629,6 +680,11 @@ QWidget* MainWindow::build_model_tab() {
     auto* layout = new QVBoxLayout(page);
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setSpacing(4);
+    model_combo_ = new QComboBox();
+    model_combo_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    model_combo_->setMinimumContentsLength(8);
+    model_combo_->setToolTip(QStringLiteral("Active model. Editing applies to this model."));
+    layout->addWidget(model_combo_);
     auto* row = new QHBoxLayout();
     auto* load = new QPushButton(QStringLiteral("Load PMX..."));
     auto* remove = new QPushButton(QStringLiteral("Remove"));
@@ -636,21 +692,24 @@ QWidget* MainWindow::build_model_tab() {
     row->addWidget(remove);
     layout->addLayout(row);
 
-    auto* visible = make_check(QStringLiteral("Display"), state_.model_visible);
-    auto* shadow = make_check(QStringLiteral("Shadow"), state_.model_shadow_visible);
-    layout->addWidget(visible);
-    layout->addWidget(shadow);
+    model_visible_ = make_check(QStringLiteral("Display"), state_.model_visible);
+    layout->addWidget(model_visible_);
     auto* register_button = new QPushButton(QStringLiteral("Register Disp/IK"));
     layout->addWidget(register_button);
     layout->addStretch(1);
 
+    connect(model_combo_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        if (index >= 0 && index != viewport_->active_model_index()) {
+            viewport_->set_active_model(index);
+        }
+    });
     connect(load, &QPushButton::clicked, this, [this] { choose_model(); });
     connect(remove, &QPushButton::clicked, this,
             [this] { state_.model_delete_requested = true; });
-    connect(visible, &QCheckBox::toggled, this,
-            [this](bool checked) { state_.model_visible = checked; });
-    connect(shadow, &QCheckBox::toggled, this,
-            [this](bool checked) { state_.model_shadow_visible = checked; });
+    connect(model_visible_, &QCheckBox::toggled, this, [this](bool checked) {
+        state_.model_visible = checked;
+        viewport_->set_model_visible(viewport_->active_model_index(), checked);
+    });
     connect(register_button, &QPushButton::clicked, this, [this] {
         state_.register_keyframe(QStringLiteral("Disp/IK/OP"),
                                  static_cast<unsigned int>(state_.current_frame));
@@ -980,6 +1039,13 @@ QWidget* MainWindow::build_shadow_tab() {
     layout->addLayout(grid);
     auto* register_button = new QPushButton(QStringLiteral("Register Shadow Keyframe"));
     layout->addWidget(register_button);
+    const QString tooltip = QStringLiteral(
+        "Self-shadow mapping is not rendered in this pass. These values are authored and "
+        "exported to VMD self-shadow frames.");
+    mode->setToolTip(tooltip);
+    range->setToolTip(tooltip);
+    detail->setToolTip(tooltip);
+    register_button->setToolTip(tooltip);
     layout->addStretch(1);
 
     connect(mode, &QComboBox::currentIndexChanged, this,
@@ -1009,6 +1075,16 @@ QWidget* MainWindow::build_accessory_tab() {
     layout->addLayout(row);
     auto* scale = make_spin(0.01, 100.0, 0.01, 2, state_.accessory_scale);
     auto* alpha = make_spin(0.0, 1.0, 0.01, 2, state_.accessory_alpha);
+    const QString accessory_tooltip =
+        QStringLiteral("Accessory rendering is not implemented in this pass.");
+    load->setEnabled(false);
+    clear->setEnabled(false);
+    scale->setEnabled(false);
+    alpha->setEnabled(false);
+    load->setToolTip(accessory_tooltip);
+    clear->setToolTip(accessory_tooltip);
+    scale->setToolTip(accessory_tooltip);
+    alpha->setToolTip(accessory_tooltip);
     auto* grid = new QGridLayout();
     grid->setHorizontalSpacing(4);
     grid->setVerticalSpacing(2);
@@ -1016,6 +1092,8 @@ QWidget* MainWindow::build_accessory_tab() {
     add_row(grid, 1, QStringLiteral("Alpha"), alpha);
     layout->addLayout(grid);
     auto* register_button = new QPushButton(QStringLiteral("Register Accessory Keyframe"));
+    register_button->setEnabled(false);
+    register_button->setToolTip(accessory_tooltip);
     layout->addWidget(register_button);
     layout->addStretch(1);
 
@@ -1050,17 +1128,15 @@ QWidget* MainWindow::build_view_tab() {
     grid->setHorizontalSpacing(6);
     grid->setVerticalSpacing(2);
     auto* ground = make_check(QStringLiteral("Ground grid"), state_.show_grid);
-    auto* axes = make_check(QStringLiteral("Axes"), state_.show_axes);
     auto* white = make_check(QStringLiteral("White canvas"), state_.viewport_white_bg);
     auto* wireframe = make_check(QStringLiteral("Wireframe"), state_.wireframe);
     auto* info = make_check(QStringLiteral("Info"), state_.info_display);
-    auto* aa = make_check(QStringLiteral("Anti-alias"), state_.antialiasing);
+    auto* ground_shadow = make_check(QStringLiteral("Ground shadow"), state_.ground_shadow);
     grid->addWidget(ground, 0, 0);
-    grid->addWidget(axes, 0, 1);
-    grid->addWidget(white, 1, 0);
-    grid->addWidget(wireframe, 1, 1);
-    grid->addWidget(info, 2, 0);
-    grid->addWidget(aa, 2, 1);
+    grid->addWidget(white, 0, 1);
+    grid->addWidget(wireframe, 1, 0);
+    grid->addWidget(info, 1, 1);
+    grid->addWidget(ground_shadow, 2, 0);
     layout->addLayout(grid);
 
     auto* fps = new QComboBox();
@@ -1077,16 +1153,14 @@ QWidget* MainWindow::build_view_tab() {
 
     connect(ground, &QCheckBox::toggled, this,
             [this](bool checked) { state_.show_grid = checked; });
-    connect(axes, &QCheckBox::toggled, this,
-            [this](bool checked) { state_.show_axes = checked; });
     connect(white, &QCheckBox::toggled, this,
             [this](bool checked) { state_.viewport_white_bg = checked; });
     connect(wireframe, &QCheckBox::toggled, this,
             [this](bool checked) { state_.wireframe = checked; });
     connect(info, &QCheckBox::toggled, this,
             [this](bool checked) { state_.info_display = checked; });
-    connect(aa, &QCheckBox::toggled, this,
-            [this](bool checked) { state_.antialiasing = checked; });
+    connect(ground_shadow, &QCheckBox::toggled, this,
+            [this](bool checked) { state_.ground_shadow = checked; });
     connect(fps, &QComboBox::currentIndexChanged, this,
             [this](int index) { state_.fps_limit = static_cast<FpsLimit>(index); });
     connect(screen_size, &QPushButton::clicked, this,
@@ -1132,7 +1206,12 @@ QWidget* MainWindow::build_playback_tab() {
     layout->addWidget(playtime);
     layout->addStretch(1);
 
-    connect(play, &QPushButton::clicked, this, [this] { state_.toggle_play(); });
+    connect(play, &QPushButton::clicked, this, [this] {
+        if (!state_.is_playing) {
+            timeline_->set_follow_playhead(true);
+        }
+        state_.toggle_play();
+    });
     connect(speed, &QComboBox::currentIndexChanged, this, [this](int index) {
         constexpr std::array<float, 6> values{1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f};
         state_.physics_speed = values[static_cast<std::size_t>(std::clamp(index, 0, 5))];
@@ -1164,34 +1243,35 @@ QWidget* MainWindow::build_interpolation_tab() {
     auto* layout = new QVBoxLayout(page);
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setSpacing(4);
-    auto* target = new QComboBox();
-    target->addItems({QStringLiteral("Rotation"), QStringLiteral("Move X"),
-                      QStringLiteral("Move Y"), QStringLiteral("Move Z")});
-    target->setCurrentIndex(static_cast<int>(state_.curve_target));
     auto* automatic = make_check(QStringLiteral("Automatic curve"), state_.curve_auto);
     auto* row = new QHBoxLayout();
     auto* linear = new QPushButton(QStringLiteral("Linear"));
     auto* scurve = new QPushButton(QStringLiteral("S-Curve"));
     row->addWidget(linear);
     row->addWidget(scurve);
-    layout->addWidget(target);
     layout->addWidget(automatic);
     layout->addLayout(row);
-    layout->addWidget(make_hint(QStringLiteral("Bezier control points are stored in the VMD "
-                                               "interpolation channel of each keyframe.")));
+    layout->addWidget(make_hint(QStringLiteral("Applies to selected keyframes, or sets the "
+                                               "default for new keys when nothing is selected.")));
     layout->addStretch(1);
 
-    connect(target, &QComboBox::currentIndexChanged, this,
-            [this](int index) { state_.curve_target = static_cast<InterpolationTarget>(index); });
     connect(automatic, &QCheckBox::toggled, this,
             [this](bool checked) { state_.curve_auto = checked; });
     connect(linear, &QPushButton::clicked, this, [this] {
+        state_.curve_auto = true;
         state_.curve_p1 = {0.33f, 0.33f};
         state_.curve_p2 = {0.66f, 0.66f};
+        state_.apply_curve_to_selection();
+        timeline_->update();
+        update_edit_actions();
     });
     connect(scurve, &QPushButton::clicked, this, [this] {
+        state_.curve_auto = false;
         state_.curve_p1 = {0.1f, 0.9f};
         state_.curve_p2 = {0.9f, 0.1f};
+        state_.apply_curve_to_selection();
+        timeline_->update();
+        update_edit_actions();
     });
     return page;
 }
@@ -1200,14 +1280,91 @@ void MainWindow::refresh_targets() {
     if (!state_.model_loaded && state_.mode == EditorMode::Model) {
         state_.mode = EditorMode::Camera;
     }
+    refresh_model_list();
     if (timeline_ != nullptr) {
         timeline_->refresh_layout();
         timeline_->update();
     }
+    update_edit_actions();
     update_viewport_title();
     if (footer_ != nullptr) {
         footer_->sync();
     }
+}
+
+void MainWindow::refresh_model_list() {
+    if (model_combo_ == nullptr || viewport_ == nullptr) {
+        return;
+    }
+    model_combo_->blockSignals(true);
+    model_combo_->clear();
+    model_combo_->addItems(viewport_->model_names());
+    const int active = viewport_->active_model_index();
+    if (active >= 0 && active < model_combo_->count()) {
+        model_combo_->setCurrentIndex(active);
+    }
+    model_combo_->blockSignals(false);
+    const bool loaded = model_combo_->count() > 0;
+    model_combo_->setEnabled(loaded);
+    if (model_visible_ != nullptr) {
+        model_visible_->setEnabled(loaded);
+        model_visible_->blockSignals(true);
+        model_visible_->setChecked(state_.model_visible);
+        model_visible_->blockSignals(false);
+    }
+}
+
+void MainWindow::update_edit_actions() {
+    if (undo_action_ != nullptr) {
+        undo_action_->setEnabled(state_.can_undo());
+    }
+    if (redo_action_ != nullptr) {
+        redo_action_->setEnabled(state_.can_redo());
+    }
+    if (copy_button_ != nullptr) {
+        copy_button_->setEnabled(!state_.selected_keyframes.empty());
+    }
+    if (paste_button_ != nullptr) {
+        paste_button_->setEnabled(!clipboard_.empty());
+    }
+}
+
+void MainWindow::copy_keyframes() {
+    clipboard_.clear();
+    clipboard_anchor_ = 0;
+    bool first = true;
+    for (const auto& [track, frame] : state_.selected_keyframes) {
+        const auto track_it = state_.track_keyframes.find(track);
+        if (track_it == state_.track_keyframes.end()) {
+            continue;
+        }
+        const auto key_it = track_it->second.find(frame);
+        if (key_it == track_it->second.end()) {
+            continue;
+        }
+        clipboard_.push_back({track, frame, key_it->second});
+        if (first) {
+            clipboard_anchor_ = frame;
+            first = false;
+        } else {
+            clipboard_anchor_ = std::min(clipboard_anchor_, frame);
+        }
+    }
+    state_.set_status(QStringLiteral("Copied %1 keyframe(s)")
+                          .arg(static_cast<int>(clipboard_.size())));
+    update_edit_actions();
+}
+
+void MainWindow::paste_keyframes() {
+    if (clipboard_.empty()) {
+        return;
+    }
+    const std::size_t pasted = state_.paste_keyframes(
+        clipboard_, clipboard_anchor_, static_cast<int>(state_.current_frame));
+    timeline_->refresh_layout();
+    timeline_->update();
+    update_edit_actions();
+    state_.set_status(QStringLiteral("Pasted %1 keyframe(s)").arg(static_cast<int>(pasted)));
 }
 
 void MainWindow::update_viewport_title() {
@@ -1296,16 +1453,12 @@ void MainWindow::delete_selected_keyframes() {
     if (state_.selected_keyframes.empty()) {
         state_.delete_keyframe(state_.selected_track_name(),
                                static_cast<unsigned int>(state_.current_frame));
-        timeline_->update();
-        return;
+    } else {
+        state_.delete_keyframes(state_.selected_keyframes);
     }
-    const std::size_t count = state_.selected_keyframes.size();
-    for (const auto& [track, frame] : state_.selected_keyframes) {
-        state_.delete_keyframe(track, frame);
-    }
-    state_.selected_keyframes.clear();
-    state_.set_status(QStringLiteral("Deleted %1 keyframe(s)").arg(count));
+    timeline_->refresh_layout();
     timeline_->update();
+    update_edit_actions();
 }
 
 void MainWindow::choose_model() {
@@ -1318,6 +1471,7 @@ void MainWindow::choose_model() {
     viewport_->initialize();
     if (viewport_->load_model(path)) {
         state_.default_directory = QFileInfo(path).absolutePath();
+        refresh_model_list();
         refresh_targets();
         refresh_morph_combos();
     }
@@ -1331,6 +1485,16 @@ void MainWindow::choose_motion() {
         viewport_->load_motion(path);
         state_.default_directory = QFileInfo(path).absolutePath();
         refresh_targets();
+    }
+}
+
+void MainWindow::choose_motion_save() {
+    const QString path = QFileDialog::getSaveFileName(
+        this, QStringLiteral("Save VMD Motion"), state_.default_directory,
+        QStringLiteral("Vocaloid Motion Data (*.vmd)"));
+    if (!path.isEmpty()) {
+        viewport_->save_motion(path);
+        state_.default_directory = QFileInfo(path).absolutePath();
     }
 }
 
@@ -1360,86 +1524,6 @@ void MainWindow::choose_render_image() {
     if (!path.isEmpty()) {
         viewport_->capture_image(path);
     }
-}
-
-void MainWindow::show_effect_dialog() {
-    QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("Effect Mapping & ReForge DX11 Pipeline"));
-    dialog.resize(620, 520);
-    auto* layout = new QVBoxLayout(&dialog);
-    auto* tabs = new QTabWidget();
-    const QStringList names = {QStringLiteral("Main"), QStringLiteral("MaterialMap"),
-                               QStringLiteral("DepthBuffer"), QStringLiteral("NormalMap"),
-                               QStringLiteral("SSAO"), QStringLiteral("ReForge PBR")};
-    for (int i = 0; i < 5; ++i) {
-        auto* page = new QWidget();
-        auto* page_layout = new QVBoxLayout(page);
-        page_layout->addWidget(make_section(QStringLiteral("Object Effect Assignment (.hmm / .fx)")));
-        auto* target = new QLabel(state_.model_name.isEmpty()
-                                      ? QStringLiteral("Current target: No model loaded")
-                                      : QStringLiteral("Current target: %1").arg(state_.model_name));
-        page_layout->addWidget(target);
-        auto* load = new QPushButton(QStringLiteral("Load Effect (.fx / .hlsl)..."));
-        page_layout->addWidget(load);
-        page_layout->addWidget(make_hint(QStringLiteral(
-            "Effect assignment is stored in the Hikari mapping registry and applied by "
-            "the MMD host bridge at draw time.")));
-        page_layout->addStretch(1);
-        connect(load, &QPushButton::clicked, &dialog, [this] {
-            const QString path = QFileDialog::getOpenFileName(
-                this, QStringLiteral("Effect"), state_.default_directory,
-                QStringLiteral("DirectX Effect (*.fx *.fxsub *.hlsl)"));
-            if (!path.isEmpty()) {
-                state_.set_status(QStringLiteral("Assigned effect: %1").arg(path));
-            }
-        });
-        tabs->addTab(page, names[i]);
-    }
-
-    auto* pbr_page = new QWidget();
-    auto* pbr_layout = new QGridLayout(pbr_page);
-    auto* exposure = make_spin(0.1, 5.0, 0.05, 2, state_.effect_state.pbr_exposure);
-    auto* bloom = make_spin(0.0, 2.0, 0.05, 2, state_.effect_state.pbr_bloom_intensity);
-    auto* ssao = make_spin(0.1, 2.0, 0.05, 2, state_.effect_state.pbr_ssao_radius);
-    auto* ssr = make_spin(0.0, 1.0, 0.02, 2, state_.effect_state.pbr_ssr_roughness_cutoff);
-    auto* fog = make_spin(0.0, 0.1, 0.001, 3, state_.effect_state.pbr_volumetric_fog_density);
-    auto* tonemapper = new QComboBox();
-    tonemapper->addItems({QStringLiteral("Reinhard Standard"),
-                          QStringLiteral("ACES Filmic High-Contrast"),
-                          QStringLiteral("AgX Neutral Modern")});
-    tonemapper->setCurrentIndex(state_.effect_state.pbr_tonemapper);
-    add_row(pbr_layout, 0, QStringLiteral("Exposure / ISO"), exposure);
-    add_row(pbr_layout, 1, QStringLiteral("Tone mapping"), tonemapper);
-    add_row(pbr_layout, 2, QStringLiteral("HDR Bloom"), bloom);
-    add_row(pbr_layout, 3, QStringLiteral("SSAO Radius"), ssao);
-    add_row(pbr_layout, 4, QStringLiteral("SSR Cutoff"), ssr);
-    add_row(pbr_layout, 5, QStringLiteral("Fog Density"), fog);
-    pbr_layout->setRowStretch(6, 1);
-    tabs->addTab(pbr_page, QStringLiteral("ReForge PBR"));
-
-    layout->addWidget(tabs);
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
-    auto* reset = new QPushButton(QStringLiteral("Reset ReForge"));
-    buttons->addButton(reset, QDialogButtonBox::ResetRole);
-    layout->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(reset, &QPushButton::clicked, &dialog, [this] {
-        state_.effect_state = EffectDialogState{};
-        state_.set_status(QStringLiteral("Reset ReForge parameters to defaults"));
-    });
-    connect(exposure, &QDoubleSpinBox::valueChanged, &dialog,
-            [this](double value) { state_.effect_state.pbr_exposure = static_cast<float>(value); });
-    connect(bloom, &QDoubleSpinBox::valueChanged, &dialog,
-            [this](double value) { state_.effect_state.pbr_bloom_intensity = static_cast<float>(value); });
-    connect(ssao, &QDoubleSpinBox::valueChanged, &dialog,
-            [this](double value) { state_.effect_state.pbr_ssao_radius = static_cast<float>(value); });
-    connect(ssr, &QDoubleSpinBox::valueChanged, &dialog,
-            [this](double value) { state_.effect_state.pbr_ssr_roughness_cutoff = static_cast<float>(value); });
-    connect(fog, &QDoubleSpinBox::valueChanged, &dialog,
-            [this](double value) { state_.effect_state.pbr_volumetric_fog_density = static_cast<float>(value); });
-    connect(tonemapper, &QComboBox::currentIndexChanged, &dialog,
-            [this](int index) { state_.effect_state.pbr_tonemapper = index; });
-    dialog.exec();
 }
 
 void MainWindow::show_gravity_dialog() {
@@ -1682,6 +1766,20 @@ void MainWindow::show_render_video_dialog() {
             });
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     dialog.exec();
+}
+
+void MainWindow::keyPressEvent(QKeyEvent* event) {
+    if (event->matches(QKeySequence::Copy)) {
+        copy_keyframes();
+        event->accept();
+        return;
+    }
+    if (event->matches(QKeySequence::Paste)) {
+        paste_keyframes();
+        event->accept();
+        return;
+    }
+    QMainWindow::keyPressEvent(event);
 }
 
 } // namespace hikari::studio

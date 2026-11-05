@@ -29,6 +29,40 @@ TEST_CASE("Jolt world steps a falling body", "[physics]") {
     REQUIRE(transforms[0].position.y < 10.0f);
 }
 
+TEST_CASE("Physics floor stops simulated bodies and can be disabled", "[physics]") {
+    hikari::physics::WorldSettings settings;
+    settings.gravity = {0.0f, -9.81f, 0.0f};
+    hikari::physics::World world(settings, 16);
+    world.set_ground_enabled(true);
+
+    MmdBodyDesc desc{};
+    desc.shape = MMD_SHAPE_SPHERE;
+    desc.size[0] = 0.5f;
+    desc.position[1] = 5.0f;
+    desc.rotation[3] = 1.0f;
+    desc.mass = 1.0f;
+    desc.friction = 0.5f;
+    desc.collide_mask = 0xFFFF;
+    const auto index = world.add_body(desc);
+    REQUIRE(index.has_value());
+    world.finish(hikari::physics::RestOverlaps::IgnoreDynamic);
+
+    for (int i = 0; i < 400; ++i) {
+        world.step(1.0f / 60.0f, 1);
+    }
+    std::vector<hikari::physics::BodyTransform> transforms;
+    world.read(transforms);
+    REQUIRE(transforms.size() == 1);
+    REQUIRE(transforms[0].position.y > 0.0f);
+
+    world.set_ground_enabled(false);
+    for (int i = 0; i < 600; ++i) {
+        world.step(1.0f / 60.0f, 1);
+    }
+    world.read(transforms);
+    REQUIRE(transforms[0].position.y < 0.0f);
+}
+
 TEST_CASE("Physics time scale speeds up motion without raising gravity", "[physics]") {
     hikari::formats::PmxModel model;
     hikari::formats::PmxRigidBody body;

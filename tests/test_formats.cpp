@@ -131,6 +131,85 @@ TEST_CASE("VPD parse and serialize round trip", "[formats]") {
     REQUIRE(reparsed.bones[0].translation[2] == Catch::Approx(3.0f));
 }
 
+TEST_CASE("VMD writer round trips every record type", "[formats]") {
+    hikari::formats::VmdMotion motion;
+    hikari::formats::VmdBoneFrame bone;
+    bone.name = "センター";
+    bone.frame = 12;
+    bone.position = {1.0f, 2.0f, 3.0f};
+    bone.rotation = {0.0f, 0.7071068f, 0.0f, 0.7071068f};
+    bone.interpolation[0] = 13;
+    bone.interpolation[4] = 114;
+    bone.interpolation[8] = 114;
+    bone.interpolation[12] = 13;
+    motion.bone_frames = {bone};
+
+    hikari::formats::VmdMorphFrame morph;
+    morph.name = "まばたき";
+    morph.frame = 24;
+    morph.weight = 0.75f;
+    motion.morph_frames = {morph};
+
+    hikari::formats::VmdCameraFrame camera;
+    camera.frame = 36;
+    camera.distance = 42.0f;
+    camera.position = {3.0f, 4.0f, 5.0f};
+    camera.rotation = {0.1f, 0.2f, 0.3f};
+    camera.fov = 35;
+    camera.perspective = true;
+    hikari::formats::VmdCameraFrame ortho_camera = camera;
+    ortho_camera.frame = 37;
+    ortho_camera.fov = 40;
+    ortho_camera.perspective = false;
+    motion.camera_frames = {camera, ortho_camera};
+
+    hikari::formats::VmdLightFrame light;
+    light.frame = 48;
+    light.color = {0.1f, 0.2f, 0.3f};
+    light.direction = {-0.4f, -0.5f, -0.6f};
+    motion.light_frames = {light};
+
+    hikari::formats::VmdShadowFrame shadow;
+    shadow.frame = 60;
+    shadow.mode = 2;
+    shadow.distance = 8875.0f;
+    motion.shadow_frames = {shadow};
+
+    const auto bytes = motion.to_bytes("テストモデル");
+    const auto parsed = hikari::formats::VmdMotion::parse(bytes);
+    REQUIRE(parsed.version == 2);
+    REQUIRE(parsed.model_name == "テストモデル");
+    REQUIRE(parsed.bone_frames.size() == 1);
+    REQUIRE(parsed.bone_frames[0].name == "センター");
+    REQUIRE(parsed.bone_frames[0].frame == 12);
+    REQUIRE(parsed.bone_frames[0].position[1] == Catch::Approx(2.0f));
+    REQUIRE(parsed.bone_frames[0].interpolation[0] == 13);
+    REQUIRE(parsed.bone_frames[0].interpolation[8] == 114);
+    REQUIRE(parsed.morph_frames.size() == 1);
+    REQUIRE(parsed.morph_frames[0].name == "まばたき");
+    REQUIRE(parsed.morph_frames[0].weight == Catch::Approx(0.75f));
+    REQUIRE(parsed.camera_frames.size() == 2);
+    REQUIRE(parsed.camera_frames[0].distance == Catch::Approx(42.0f));
+    REQUIRE(parsed.camera_frames[0].fov == 35);
+    REQUIRE(parsed.camera_frames[0].perspective);
+    REQUIRE(parsed.camera_frames[1].fov == 40);
+    REQUIRE_FALSE(parsed.camera_frames[1].perspective);
+    REQUIRE(parsed.light_frames.size() == 1);
+    REQUIRE(parsed.light_frames[0].direction[2] == Catch::Approx(-0.6f));
+    REQUIRE(parsed.shadow_frames.size() == 1);
+    REQUIRE(parsed.shadow_frames[0].mode == 2);
+}
+
+TEST_CASE("VMD writer truncates long names on a Shift-JIS boundary", "[formats]") {
+    hikari::formats::VmdMotion motion;
+    hikari::formats::VmdMorphFrame morph;
+    morph.name = "ああああああああ";
+    motion.morph_frames = {morph};
+    const auto parsed = hikari::formats::VmdMotion::parse(motion.to_bytes("model"));
+    REQUIRE(parsed.morph_frames.size() == 1);
+    REQUIRE(parsed.morph_frames[0].name == "あああああああ");
+}
+
 TEST_CASE("VMD parser reads an empty motion", "[formats]") {
     std::vector<std::uint8_t> data(30, 0);
     const char magic[] = "Vocaloid Motion Data 0002";

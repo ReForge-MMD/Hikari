@@ -48,6 +48,12 @@ void World::set_gravity(const Vec3& gravity) {
     }
 }
 
+void World::set_ground_enabled(bool enabled) {
+    if (raw_ != nullptr) {
+        mmd_world_set_ground(raw_, enabled ? 1 : 0);
+    }
+}
+
 std::optional<std::size_t> World::add_body(const MmdBodyDesc& desc) {
     const std::int32_t index = mmd_world_add_body(raw_, &desc);
     if (index < 0) {

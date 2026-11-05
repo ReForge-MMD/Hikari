@@ -3,6 +3,8 @@
 #include <QDir>
 
 #include <algorithm>
+#include <cmath>
+#include <iterator>
 
 #include "hikari/math.hpp"
 
@@ -60,6 +62,7 @@ QString StudioAppState::selected_track_name() const {
 TrackKeyframe StudioAppState::capture_keyframe(const QString& track) const {
     constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
     TrackKeyframe key;
+    key.interpolation = default_interpolation;
     if (track == QStringLiteral("camera")) {
         key.position = camera_pan;
         key.angles = {camera_yaw, camera_pitch, camera_roll};
@@ -110,19 +113,176 @@ TrackKeyframe StudioAppState::capture_keyframe(const QString& track) const {
     return key;
 }
 
-void StudioAppState::register_keyframe(const QString& track, unsigned int frame) {
+void StudioAppState::push_undo_snapshot() {
+    undo_stack.push_back({track_keyframes, selected_keyframes});
+    if (undo_stack.size() > kUndoLimit) {
+        undo_stack.erase(undo_stack.begin());
+    }
+    redo_stack.clear();
+}
+
+void StudioAppState::undo_keyframes() {
+    if (undo_stack.empty()) {
+        return;
+    }
+    redo_stack.push_back({track_keyframes, selected_keyframes});
+    if (redo_stack.size() > kUndoLimit) {
+        redo_stack.erase(redo_stack.begin());
+    }
+    KeyframeSnapshot snapshot = std::move(undo_stack.back());
+    undo_stack.pop_back();
+    track_keyframes = std::move(snapshot.track_keyframes);
+    selected_keyframes = std::move(snapshot.selection);
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Undo keyframe edit"));
+}
+
+void StudioAppState::redo_keyframes() {
+    if (redo_stack.empty()) {
+        return;
+    }
+    undo_stack.push_back({track_keyframes, selected_keyframes});
+    if (undo_stack.size() > kUndoLimit) {
+        undo_stack.erase(undo_stack.begin());
+    }
+    KeyframeSnapshot snapshot = std::move(redo_stack.back());
+    redo_stack.pop_back();
+    track_keyframes = std::move(snapshot.track_keyframes);
+    selected_keyframes = std::move(snapshot.selection);
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Redo keyframe edit"));
+}
+
+void StudioAppState::register_keyframe(const QString& track, unsigned int frame, bool record_undo) {
+    if (record_undo) {
+        push_undo_snapshot();
+    }
     track_keyframes[track][frame] = capture_keyframe(track);
     track_keys_dirty = true;
+    ++keyframe_revision;
     set_status(QStringLiteral("Registered keyframe for '%1' at frame %2").arg(track).arg(frame));
 }
 
-void StudioAppState::delete_keyframe(const QString& track, unsigned int frame) {
+void StudioAppState::delete_keyframe(const QString& track, unsigned int frame, bool record_undo) {
     const auto it = track_keyframes.find(track);
-    if (it != track_keyframes.end()) {
-        it->second.erase(frame);
-        track_keys_dirty = true;
-        set_status(QStringLiteral("Deleted keyframe for '%1' at frame %2").arg(track).arg(frame));
+    if (it == track_keyframes.end() || it->second.find(frame) == it->second.end()) {
+        return;
     }
+    if (record_undo) {
+        push_undo_snapshot();
+    }
+    it->second.erase(frame);
+    selected_keyframes.erase({track, frame});
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Deleted keyframe for '%1' at frame %2").arg(track).arg(frame));
+}
+
+void StudioAppState::delete_keyframes(
+    const std::set<std::pair<QString, unsigned int>>& keys) {
+    const auto exists = [this](const std::pair<QString, unsigned int>& key) {
+        const auto track = track_keyframes.find(key.first);
+        return track != track_keyframes.end() && track->second.find(key.second) != track->second.end();
+    };
+    const std::size_t found = static_cast<std::size_t>(
+        std::count_if(keys.begin(), keys.end(), exists));
+    if (found == 0) {
+        return;
+    }
+    push_undo_snapshot();
+    for (const auto& key : keys) {
+        const auto track = track_keyframes.find(key.first);
+        if (track != track_keyframes.end()) {
+            track->second.erase(key.second);
+        }
+        selected_keyframes.erase(key);
+    }
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Deleted %1 keyframe(s)").arg(static_cast<int>(found)));
+}
+
+void StudioAppState::delete_frame_line(unsigned int frame) {
+    bool found = false;
+    for (const auto& entry : track_keyframes) {
+        if (entry.second.find(frame) != entry.second.end()) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return;
+    }
+    push_undo_snapshot();
+    for (auto& [track, frames] : track_keyframes) {
+        frames.erase(frame);
+    }
+    for (auto it = selected_keyframes.begin(); it != selected_keyframes.end();) {
+        it = it->second == frame ? selected_keyframes.erase(it) : std::next(it);
+    }
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Deleted keyframes at frame %1").arg(frame));
+}
+
+std::size_t StudioAppState::paste_keyframes(const std::vector<ClipboardKey>& keys,
+                                            unsigned int anchor, int target) {
+    if (keys.empty()) {
+        return 0;
+    }
+    push_undo_snapshot();
+    std::set<std::pair<QString, unsigned int>> pasted;
+    for (const auto& entry : keys) {
+        const int offset = static_cast<int>(entry.frame) - static_cast<int>(anchor);
+        const int frame = std::max(0, target + offset);
+        const unsigned int pasted_frame = static_cast<unsigned int>(frame);
+        track_keyframes[entry.track][pasted_frame] = entry.key;
+        pasted.insert({entry.track, pasted_frame});
+    }
+    selected_keyframes = std::move(pasted);
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Pasted %1 keyframe(s)").arg(static_cast<int>(keys.size())));
+    return keys.size();
+}
+
+std::array<std::uint8_t, 4> StudioAppState::panel_interpolation() const {
+    const auto to_byte = [](float value) {
+        return static_cast<std::uint8_t>(
+            std::clamp(std::lround(value * 127.0f), 0L, 127L));
+    };
+    return {to_byte(curve_p1[0]), to_byte(curve_p1[1]), to_byte(curve_p2[0]),
+            to_byte(curve_p2[1])};
+}
+
+void StudioAppState::apply_curve_to_selection() {
+    const std::array<std::uint8_t, 4> curve =
+        curve_auto ? std::array<std::uint8_t, 4>{20, 20, 20, 20} : panel_interpolation();
+    if (selected_keyframes.empty()) {
+        default_interpolation = curve;
+        set_status(QStringLiteral("Interpolation curve set as the default for new keyframes"));
+        return;
+    }
+    push_undo_snapshot();
+    std::size_t count = 0;
+    for (const auto& [track, frame] : selected_keyframes) {
+        const auto track_it = track_keyframes.find(track);
+        if (track_it == track_keyframes.end()) {
+            continue;
+        }
+        const auto key_it = track_it->second.find(frame);
+        if (key_it == track_it->second.end()) {
+            continue;
+        }
+        key_it->second.interpolation = curve;
+        ++count;
+    }
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Applied interpolation curve to %1 keyframe(s)")
+                   .arg(static_cast<int>(count)));
 }
 
 } // namespace hikari::studio

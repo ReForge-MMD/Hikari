@@ -69,6 +69,7 @@ public:
     void request_reset() { needs_reset_ = true; }
     void set_gravity(float gravity);
     void set_gravity_vec(const std::array<float, 3>& gravity);
+    void set_ground_enabled(bool enabled);
     void set_time_scale(float scale);
     void apply_impulse(std::size_t body_index, bool local, const Vec3& velocity,
                        const Vec3& torque);

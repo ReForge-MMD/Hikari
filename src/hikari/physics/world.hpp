@@ -43,6 +43,7 @@ public:
     bool valid() const { return raw_ != nullptr; }
 
     void set_gravity(const Vec3& gravity);
+    void set_ground_enabled(bool enabled);
     std::optional<std::size_t> add_body(const MmdBodyDesc& desc);
     std::optional<std::size_t> add_joint(const MmdJointDesc& desc);
     void finish(RestOverlaps overlaps);

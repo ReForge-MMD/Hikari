@@ -67,6 +67,7 @@ struct VmdMotion {
     std::vector<VmdIkFrame> ik_frames;
 
     static VmdMotion parse(const std::vector<std::uint8_t>& bytes);
+    std::vector<std::uint8_t> to_bytes(const std::string& model_name) const;
 };
 
 struct VpdBonePose {

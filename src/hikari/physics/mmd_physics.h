@@ -63,6 +63,10 @@ typedef struct MmdWorldSettings {
 MmdWorld* mmd_world_create(const MmdWorldSettings* settings, uint32_t max_bodies);
 void mmd_world_destroy(MmdWorld* world);
 void mmd_world_set_gravity(MmdWorld* world, float x, float y, float z);
+// Enables or disables the static floor whose top surface is world Y = 0.
+// The floor is independent of PMX collision groups and only collides with
+// simulated bodies, not with kinematic bone-following bodies.
+void mmd_world_set_ground(MmdWorld* world, int32_t enabled);
 
 // Returns the body index, or -1 when the description is invalid.
 int32_t mmd_world_add_body(MmdWorld* world, const MmdBodyDesc* desc);

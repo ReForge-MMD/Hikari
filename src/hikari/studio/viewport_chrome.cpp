@@ -284,10 +284,11 @@ ViewportHeader::ViewportHeader(StudioAppState& state, QWidget* parent)
     go_button->setObjectName(QStringLiteral("ViewportChip"));
     layout->addWidget(go_button);
 
-    auto* shadow = new QPushButton(QStringLiteral("FShdow"));
+    auto* shadow = new QPushButton(QStringLiteral("GShdow"));
     shadow->setObjectName(QStringLiteral("ViewportChip"));
     shadow->setCheckable(true);
-    shadow->setChecked(state_.model_shadow_visible);
+    shadow->setChecked(state_.ground_shadow);
+    shadow->setToolTip(QStringLiteral("Ground shadow"));
     layout->addWidget(shadow);
 
     auto* info = new QPushButton(QStringLiteral("info"));
@@ -302,10 +303,11 @@ ViewportHeader::ViewportHeader(StudioAppState& state, QWidget* parent)
     low_power->setChecked(state_.save_cpu_power);
     layout->addWidget(low_power);
 
-    auto* axis = new QPushButton(QStringLiteral("axis"));
+    auto* axis = new QPushButton(QStringLiteral("grid"));
     axis->setObjectName(QStringLiteral("ViewportChip"));
     axis->setCheckable(true);
-    axis->setChecked(state_.show_axes);
+    axis->setChecked(state_.show_grid);
+    axis->setToolTip(QStringLiteral("Coordinate grid"));
     layout->addWidget(axis);
 
     auto* home = new QPushButton(QStringLiteral("Reset View"));
@@ -322,15 +324,13 @@ ViewportHeader::ViewportHeader(StudioAppState& state, QWidget* parent)
                                  static_cast<unsigned int>(state_.current_frame));
     });
     connect(shadow, &QPushButton::toggled, this,
-            [this](bool checked) { state_.model_shadow_visible = checked; });
+            [this](bool checked) { state_.ground_shadow = checked; });
     connect(info, &QPushButton::toggled, this,
             [this](bool checked) { state_.info_display = checked; });
     connect(low_power, &QPushButton::toggled, this,
             [this](bool checked) { state_.save_cpu_power = checked; });
-    connect(axis, &QPushButton::toggled, this, [this](bool checked) {
-        state_.show_axes = checked;
-        state_.show_grid = checked;
-    });
+    connect(axis, &QPushButton::toggled, this,
+            [this](bool checked) { state_.show_grid = checked; });
     connect(home, &QPushButton::clicked, this, [this] { emit resetViewRequested(); });
 }
 

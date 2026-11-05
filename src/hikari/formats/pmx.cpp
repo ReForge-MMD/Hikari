@@ -196,6 +196,29 @@ std::string sjis_to_utf8(const std::uint8_t* data, std::size_t size) {
     return wide_to_utf8(wide);
 }
 
+std::string utf8_to_sjis(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int wide_size = ::MultiByteToWideChar(CP_UTF8, 0, text.data(),
+                                                static_cast<int>(text.size()), nullptr, 0);
+    if (wide_size <= 0) {
+        return text;
+    }
+    std::wstring wide(static_cast<std::size_t>(wide_size), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(),
+                          wide_size);
+    const int sjis_size = ::WideCharToMultiByte(932, 0, wide.data(), wide_size, nullptr, 0,
+                                                nullptr, nullptr);
+    if (sjis_size <= 0) {
+        return text;
+    }
+    std::string result(static_cast<std::size_t>(sjis_size), '\0');
+    ::WideCharToMultiByte(932, 0, wide.data(), wide_size, result.data(), sjis_size, nullptr,
+                          nullptr);
+    return result;
+}
+
 PmxModel PmxModel::parse(const std::vector<std::uint8_t>& bytes) {
     if (bytes.size() < 12 || std::memcmp(bytes.data(), "PMX ", 4) != 0) {
         throw FormatError("invalid PMX magic header");

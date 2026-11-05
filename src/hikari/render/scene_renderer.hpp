@@ -22,6 +22,8 @@ struct CameraConstants {
     std::array<std::array<float, 4>, 4> projection{};
     std::array<std::array<float, 4>, 4> view_projection{};
     std::array<float, 4> camera_pos{};
+    std::array<float, 4> light_color{0.6f, 0.6f, 0.6f, 1.0f};
+    std::array<float, 4> light_direction{-0.5f, -1.0f, -0.5f, 0.0f};
 };
 
 struct GridVertex {
@@ -55,13 +57,18 @@ public:
     bool wireframe = false;
     Microsoft::WRL::ComPtr<ID3D11Buffer> overlay_vb;
     std::size_t overlay_capacity = 0;
+    std::array<float, 4> light_color{0.6f, 0.6f, 0.6f, 1.0f};
+    std::array<float, 4> light_direction{-0.5f, -1.0f, -0.5f, 0.0f};
 
     void render_overlay_lines(core::D3D11Context& context,
                               const std::vector<OverlayVertex>& vertices);
 
+    void set_light(const std::array<float, 3>& color, const std::array<float, 3>& direction);
     void update_camera_on(ID3D11DeviceContext* context, const Camera& camera) const;
     void update_camera(core::D3D11Context& context, const Camera& camera) const;
     void render_viewport_background(core::D3D11Context& context, const std::array<float, 4>& color);
+    void render_ground_shadow(core::D3D11Context& context, const Vec3& center, float radius,
+                              const std::array<float, 4>& color);
     void render_grid_to(core::D3D11Context& context, ID3D11DeviceContext* target);
     void render_grid(core::D3D11Context& context, const Camera& camera);
     Microsoft::WRL::ComPtr<ID3D11CommandList> record_grid(core::D3D11Context& context,

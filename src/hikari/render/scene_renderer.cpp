@@ -1,6 +1,7 @@
 #include "hikari/render/scene_renderer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -16,6 +17,8 @@ cbuffer CameraParams : register(b0) {
     row_major float4x4 Projection;
     row_major float4x4 ViewProjection;
     float4 CameraPos;
+    float4 LightColor;
+    float4 LightDirection;
 };
 cbuffer MaterialParams : register(b1) {
     float4 Diffuse;
@@ -60,7 +63,7 @@ VS_OUTPUT VS_Main(VS_INPUT input) {
 Texture2D DiffuseMap : register(t0);
 SamplerState LinearSampler : register(s0);
 float4 PS_Main(VS_OUTPUT input) : SV_Target {
-    float3 light_dir = normalize(float3(0.35f, 0.85f, -0.4f));
+    float3 light_dir = normalize(-LightDirection.xyz);
     float n_dot_l = dot(normalize(input.normal_world), light_dir);
     float half_lambert = n_dot_l * 0.5f + 0.5f;
     float toon = smoothstep(0.32f, 0.48f, half_lambert) * 0.4f + 0.6f;
@@ -76,7 +79,8 @@ float4 PS_Main(VS_OUTPUT input) : SV_Target {
     if (Diffuse.r + Diffuse.g + Diffuse.b < 0.01f) {
         base_color = tex_color.rgb;
     }
-    float3 lit_color = base_color * toon + float3(rim_term, rim_term, rim_term);
+    float3 light_tint = saturate(LightColor.rgb * 2.0f);
+    float3 lit_color = base_color * toon * light_tint + float3(rim_term, rim_term, rim_term);
     return float4(saturate(lit_color), alpha);
 }
 )";
@@ -238,6 +242,8 @@ void SceneRenderer::update_camera_on(ID3D11DeviceContext* context, const Camera&
     constants.projection = projection.m;
     constants.view_projection = view_projection.m;
     constants.camera_pos = {camera.position.x, camera.position.y, camera.position.z, 1.0f};
+    constants.light_color = light_color;
+    constants.light_direction = light_direction;
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context->Map(camera_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
@@ -249,6 +255,90 @@ void SceneRenderer::update_camera_on(ID3D11DeviceContext* context, const Camera&
 
 void SceneRenderer::update_camera(core::D3D11Context& context, const Camera& camera) const {
     update_camera_on(context.context.Get(), camera);
+}
+
+void SceneRenderer::set_light(const std::array<float, 3>& color,
+                              const std::array<float, 3>& direction) {
+    light_color = {color[0], color[1], color[2], 1.0f};
+    light_direction = {direction[0], direction[1], direction[2], 0.0f};
+}
+
+void SceneRenderer::render_ground_shadow(core::D3D11Context& context, const Vec3& center,
+                                         float radius, const std::array<float, 4>& color) {
+    std::vector<OverlayVertex> vertices;
+    constexpr int kSegments = 48;
+    const auto ring = [&](float scale, float alpha) {
+        const std::array<float, 4> ring_color{color[0], color[1], color[2], color[3] * alpha};
+        const Vec3 origin(center.x, 0.02f, center.z);
+        for (int i = 0; i < kSegments; ++i) {
+            const float a0 = static_cast<float>(i) * 2.0f * 3.14159265358979323846f /
+                             static_cast<float>(kSegments);
+            const float a1 = static_cast<float>(i + 1) * 2.0f * 3.14159265358979323846f /
+                             static_cast<float>(kSegments);
+            vertices.push_back({{origin.x, origin.y, origin.z}, ring_color});
+            vertices.push_back(
+                {{origin.x + std::cos(a0) * radius * scale, origin.y,
+                  origin.z + std::sin(a0) * radius * scale},
+                 ring_color});
+            vertices.push_back(
+                {{origin.x + std::cos(a1) * radius * scale, origin.y,
+                  origin.z + std::sin(a1) * radius * scale},
+                 ring_color});
+        }
+    };
+    ring(1.0f, 0.35f);
+    ring(0.72f, 0.55f);
+    ring(0.45f, 0.8f);
+    if (vertices.empty()) {
+        return;
+    }
+
+    if (!overlay_vb || overlay_capacity < vertices.size()) {
+        std::size_t capacity = 4096;
+        while (capacity < vertices.size()) {
+            capacity *= 2;
+        }
+        D3D11_BUFFER_DESC desc{};
+        desc.ByteWidth = static_cast<UINT>(capacity * sizeof(OverlayVertex));
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(context.device->CreateBuffer(&desc, nullptr,
+                                                overlay_vb.ReleaseAndGetAddressOf()))) {
+            throw std::runtime_error("CreateBuffer ground shadow failed");
+        }
+        overlay_capacity = capacity;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context.context->Map(overlay_vb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        throw std::runtime_error("Map ground shadow buffer failed");
+    }
+    std::memcpy(mapped.pData, vertices.data(), vertices.size() * sizeof(OverlayVertex));
+    context.context->Unmap(overlay_vb.Get(), 0);
+
+    auto* target = context.context.Get();
+    context.bind_render_targets_to(target);
+    context.set_viewport_on(target, static_cast<float>(context.render_width),
+                            static_cast<float>(context.render_height));
+    target->IASetInputLayout(grid_layout.Get());
+    target->VSSetShader(grid_vs.Get(), nullptr, 0);
+    target->PSSetShader(grid_ps.Get(), nullptr, 0);
+    ID3D11Buffer* camera_buffers[] = {camera_buffer.Get()};
+    target->VSSetConstantBuffers(0, 1, camera_buffers);
+    const UINT stride = sizeof(OverlayVertex);
+    const UINT offset = 0;
+    ID3D11Buffer* buffers[] = {overlay_vb.Get()};
+    target->IASetVertexBuffers(0, 1, buffers, &stride, &offset);
+    target->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    target->OMSetDepthStencilState(
+        context.state_manager->get_depth(core::DepthPreset::ReadWriteLessEqual), 1);
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    target->OMSetBlendState(context.state_manager->get_blend(core::BlendPreset::AlphaBlend),
+                            blend_factor, 0xFFFFFFFF);
+    target->RSSetState(
+        context.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+    target->Draw(static_cast<UINT>(vertices.size()), 0);
 }
 
 void SceneRenderer::render_viewport_background(core::D3D11Context& context,

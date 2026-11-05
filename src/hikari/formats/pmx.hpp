@@ -243,6 +243,7 @@ struct PmxModel {
 };
 
 std::string sjis_to_utf8(const std::uint8_t* data, std::size_t size);
+std::string utf8_to_sjis(const std::string& text);
 std::string utf16le_to_utf8(const std::uint8_t* data, std::size_t size);
 
 } // namespace hikari::formats

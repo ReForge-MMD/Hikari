@@ -7,9 +7,11 @@
 #include <QElapsedTimer>
 
 #include <array>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace hikari::studio {
@@ -20,18 +22,6 @@ enum class MorphCategory { Eyes = 0, Mouth = 1, Brow = 2, Other = 3 };
 enum class PhysicsMode { Always, Anytime, Trace, Disabled };
 enum class ShadowMode { Off, Mode1, Mode2 };
 enum class FpsLimit { Fps30, Fps60, Unlimited };
-enum class InterpolationTarget { Rotation, TranslationX, TranslationY, TranslationZ };
-enum class EffectTab { Main, MaterialMap, DepthBuffer, NormalMap, Ssao, ReforgePbr };
-
-struct EffectDialogState {
-    EffectTab active_tab = EffectTab::ReforgePbr;
-    float pbr_exposure = 1.0f;
-    float pbr_bloom_intensity = 0.8f;
-    float pbr_ssao_radius = 0.5f;
-    float pbr_ssr_roughness_cutoff = 0.4f;
-    float pbr_volumetric_fog_density = 0.02f;
-    int pbr_tonemapper = 1;
-};
 
 // Snapshot of an animated value captured when a keyframe is registered.
 // Per-track interpretation:
@@ -50,6 +40,22 @@ struct TrackKeyframe {
     float distance = 0.0f;
     float fov = 0.0f;
     float scale = 1.0f;
+    // MMD Bezier control points (X1, Y1, X2, Y2) in the 0..127 byte range.
+    // Equal X/Y pairs evaluate as linear.
+    std::array<std::uint8_t, 4> interpolation{20, 20, 20, 20};
+};
+
+using TrackKeyframeMap = std::map<QString, std::map<unsigned int, TrackKeyframe>>;
+
+struct KeyframeSnapshot {
+    TrackKeyframeMap track_keyframes;
+    std::set<std::pair<QString, unsigned int>> selection;
+};
+
+struct ClipboardKey {
+    QString track;
+    unsigned int frame = 0;
+    TrackKeyframe key;
 };
 
 struct StudioAppState {
@@ -59,7 +65,6 @@ struct StudioAppState {
     QStringList loaded_models;
     int selected_model_idx = 0;
     bool model_visible = true;
-    bool model_shadow_visible = true;
     bool model_delete_requested = false;
     QStringList model_bone_names;
 
@@ -87,15 +92,20 @@ struct StudioAppState {
     std::pair<int, int> play_range{0, 300};
     float timeline_zoom = 1.0f;
     float timeline_scroll = 0.0f;
-    std::map<QString, std::map<unsigned int, TrackKeyframe>> track_keyframes;
+    TrackKeyframeMap track_keyframes;
     std::set<std::pair<QString, unsigned int>> selected_keyframes;
     bool track_keys_dirty = true;
+    std::uint64_t keyframe_revision = 0;
     QString jump_frame_input = "0";
 
-    InterpolationTarget curve_target = InterpolationTarget::Rotation;
     bool curve_auto = true;
     std::array<float, 2> curve_p1{0.2f, 0.2f};
     std::array<float, 2> curve_p2{0.8f, 0.8f};
+    std::array<std::uint8_t, 4> default_interpolation{20, 20, 20, 20};
+
+    static constexpr std::size_t kUndoLimit = 64;
+    std::vector<KeyframeSnapshot> undo_stack;
+    std::vector<KeyframeSnapshot> redo_stack;
 
     std::array<float, 3> light_color{0.6f, 0.6f, 0.6f};
     std::array<float, 3> light_direction{-0.5f, -1.0f, -0.5f};
@@ -128,14 +138,13 @@ struct StudioAppState {
     float gravity_noise = 0.0f;
     float physics_speed = 3.0f;
     bool reset_physics_requested = false;
+    bool ground_collision = true;
 
     FpsLimit fps_limit = FpsLimit::Fps60;
     bool show_grid = true;
-    bool show_axes = true;
     bool viewport_white_bg = true;
     bool ground_shadow = true;
     bool transparent_ground_shadow = true;
-    bool antialiasing = true;
     bool wireframe = false;
     float edge_thickness = 1.0f;
     std::array<float, 4> edge_color{0.0f, 0.0f, 0.0f, 1.0f};
@@ -147,7 +156,6 @@ struct StudioAppState {
     bool jiggle_enabled = true;
     bool vsync = false;
 
-    EffectDialogState effect_state;
     int screen_size_width = 1280;
     int screen_size_height = 720;
     int video_render_start_frame = 0;
@@ -165,8 +173,20 @@ struct StudioAppState {
     void toggle_play();
     void step_frame(int delta);
     QString selected_track_name() const;
-    void register_keyframe(const QString& track, unsigned int frame);
-    void delete_keyframe(const QString& track, unsigned int frame);
+    void push_undo_snapshot();
+    bool can_undo() const { return !undo_stack.empty(); }
+    bool can_redo() const { return !redo_stack.empty(); }
+    void undo_keyframes();
+    void redo_keyframes();
+
+    void register_keyframe(const QString& track, unsigned int frame, bool record_undo = true);
+    void delete_keyframe(const QString& track, unsigned int frame, bool record_undo = true);
+    void delete_keyframes(const std::set<std::pair<QString, unsigned int>>& keys);
+    void delete_frame_line(unsigned int frame);
+    std::size_t paste_keyframes(const std::vector<ClipboardKey>& keys, unsigned int anchor,
+                                int target);
+    void apply_curve_to_selection();
+    std::array<std::uint8_t, 4> panel_interpolation() const;
     TrackKeyframe capture_keyframe(const QString& track) const;
     bool is_playing_back() const { return is_playing; }
 };

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "hikari/math.hpp"
 
 namespace hikari::render {
@@ -13,6 +15,9 @@ public:
     float aspect = 16.0f / 9.0f;
     float near_z = 0.1f;
     float far_z = 1000.0f;
+    bool orthographic = false;
+    // World-space height of the orthographic view. When zero it is derived from fov_y.
+    float ortho_height = 0.0f;
 
     Mat4 view_matrix() const {
         const Vec3 z_axis = (target - position).normalize();
@@ -29,7 +34,14 @@ public:
         return result;
     }
 
-    Mat4 projection_matrix() const { return perspective_lh(fov_y, aspect, near_z, far_z); }
+    Mat4 projection_matrix() const {
+        if (!orthographic) {
+            return perspective_lh(fov_y, aspect, near_z, far_z);
+        }
+        const float height =
+            ortho_height > 0.0f ? ortho_height : 2.0f * std::tan(fov_y * 0.5f);
+        return orthographic_lh(height * aspect, height, near_z, far_z);
+    }
     Mat4 view_projection_matrix() const { return view_matrix() * projection_matrix(); }
 };
 

@@ -2,24 +2,19 @@
 
 #include <QElapsedTimer>
 #include <QRect>
+#include <QStringList>
 #include <QWidget>
 
 #include <memory>
 #include <optional>
+#include <vector>
 
-#include "hikari/animation/jiggle.hpp"
-#include "hikari/animation/morph.hpp"
-#include "hikari/animation/skeleton.hpp"
 #include "hikari/animation/timeline.hpp"
 #include "hikari/core/d3d11.hpp"
-#include "hikari/formats/pmx.hpp"
-#include "hikari/physics/rig.hpp"
 #include "hikari/render/camera.hpp"
-#include "hikari/render/material.hpp"
-#include "hikari/render/mesh.hpp"
 #include "hikari/render/scene_renderer.hpp"
-#include "hikari/render/texture.hpp"
 #include "hikari/studio/app_state.hpp"
+#include "hikari/studio/model_instance.hpp"
 
 class QTimer;
 
@@ -38,7 +33,11 @@ public:
     bool load_motion(const QString& path);
     bool load_vpd(const QString& path);
     bool save_vpd(const QString& path);
+    bool save_motion(const QString& path);
     void clear_model();
+    void remove_active_model();
+    void set_active_model(int index);
+    void set_model_visible(int index, bool visible);
     void request_physics_reset();
     bool capture_image(const QString& path);
     bool render_frames(const QString& directory, int start, int end, int fps);
@@ -52,8 +51,11 @@ public:
     void reset_selection_transform();
     void reset_camera();
 
-    const animation::Skeleton* skeleton() const { return skeleton_ ? &*skeleton_ : nullptr; }
-    const physics::PhysicsRig* physics_rig() const { return physics_rig_ ? &*physics_rig_ : nullptr; }
+    int model_count() const { return static_cast<int>(models_.size()); }
+    int active_model_index() const { return active_model_; }
+    QStringList model_names() const;
+    const animation::Skeleton* skeleton() const;
+    const physics::PhysicsRig* physics_rig() const;
     int vertex_count() const { return vertex_count_; }
     int index_count() const { return index_count_; }
     int bone_count() const { return bone_count_; }
@@ -65,6 +67,8 @@ signals:
     void statsChanged(float fps, float frame_ms);
     void statusMessage(const QString& message);
     void modelLoaded(const QString& name, int vertices, int bones);
+    void modelsChanged();
+    void activeModelChanged();
     void screenSizeChanged(int width, int height);
 
 protected:
@@ -77,16 +81,20 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
 
 private:
+    ModelInstance* active_model();
+    const ModelInstance* active_model() const;
+    void sync_active_model_state();
+    void update_stats();
     void tick();
     void tick_impl();
     void render_scene();
     void draw_overlay();
     void update_camera();
     void evaluate_frame(float frame);
-    void apply_editor_tracks(float frame, bool apply_scene_values);
+    void apply_editor_tracks(ModelInstance* model, float frame, bool apply_scene_values);
     void apply_editor_bone_override();
-    void apply_bone_morphs(const animation::MorphResult& result);
-    void apply_material_morphs(const animation::MorphResult& result);
+    void apply_bone_morphs(ModelInstance& model, const animation::MorphResult& result);
+    void apply_material_morphs(ModelInstance& model, const animation::MorphResult& result);
     void apply_screen_size();
     void place_gizmo();
     bool selected_bone_transform(std::size_t& index) const;
@@ -97,16 +105,10 @@ private:
     render::Camera camera_;
     ViewGizmo* gizmo_ = nullptr;
 
-    std::optional<formats::PmxModel> pmx_;
-    std::optional<render::GpuMesh> mesh_;
-    std::vector<render::GpuMaterial> materials_;
-    std::vector<std::optional<render::GpuTexture>> textures_;
-    std::optional<animation::Skeleton> skeleton_;
-    std::optional<physics::PhysicsRig> physics_rig_;
-    std::optional<animation::Jiggle> jiggle_;
-    animation::JiggleSettings jiggle_settings_;
-    animation::MorphEvaluator morphs_;
+    std::vector<std::unique_ptr<ModelInstance>> models_;
+    int active_model_ = -1;
     std::optional<animation::MotionPlayer> motion_player_;
+    std::vector<Mat4> render_palette_;
 
     QTimer* timer_ = nullptr;
     QElapsedTimer frame_timer_;

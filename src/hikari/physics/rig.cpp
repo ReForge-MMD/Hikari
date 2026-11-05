@@ -273,6 +273,10 @@ void PhysicsRig::set_gravity_vec(const std::array<float, 3>& gravity) {
     world_.set_gravity(value);
 }
 
+void PhysicsRig::set_ground_enabled(bool enabled) {
+    world_.set_ground_enabled(enabled);
+}
+
 void PhysicsRig::set_time_scale(float scale) {
     settings_.time_scale = std::clamp(scale, 0.1f, 4.0f);
 }

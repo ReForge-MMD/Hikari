@@ -1,8 +1,10 @@
 #include "hikari/studio/timeline_widget.hpp"
 
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QSet>
 #include <QWheelEvent>
 
 #include <algorithm>
@@ -18,6 +20,7 @@ constexpr int kRulerHeight = 22;
 constexpr int kRightMargin = 20;
 constexpr int kGridPadding = 6;
 constexpr int kMinVisibleFrames = 40;
+constexpr int kPlayheadMargin = 18;
 constexpr float kFrameSpacing = 14.0f;
 const QColor kBase(24, 27, 34);
 const QColor kPanel(32, 37, 46);
@@ -26,6 +29,11 @@ const QColor kSnow(220, 224, 230);
 const QColor kCyan(126, 200, 227);
 const QColor kYellow(214, 190, 104);
 const QColor kRed(196, 92, 92);
+
+bool reserved_channel(const QString& name) {
+    return name == QStringLiteral("view cnt") || name == QStringLiteral("Disp/IK/OP") ||
+           name == QStringLiteral("Facial");
+}
 } // namespace
 
 TimelineWidget::TimelineWidget(StudioAppState& state, QWidget* parent)
@@ -51,19 +59,24 @@ int TimelineWidget::max_scroll() const {
 }
 
 void TimelineWidget::refresh_layout() {
-    const int rows = channels().size();
+    const auto& row_list = rows();
+    const int row_count = static_cast<int>(row_list.size());
     const int frames = std::max(state_.max_timeline_frame, kMinVisibleFrames);
     const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
     const bool changed =
-        frames != layout_frames_ || rows != layout_rows_ || spacing != layout_spacing_;
+        frames != layout_frames_ || row_count != layout_rows_ || spacing != layout_spacing_;
     layout_frames_ = frames;
-    layout_rows_ = rows;
+    layout_rows_ = row_count;
     layout_spacing_ = spacing;
-    setMinimumHeight(kRulerHeight + rows * kRowHeight + 4);
+    setMinimumHeight(kRulerHeight + row_count * kRowHeight + 4);
     if (changed) {
         updateGeometry();
     }
     update_scroll_range();
+}
+
+void TimelineWidget::set_follow_playhead(bool follow) {
+    follow_playhead_ = follow;
 }
 
 void TimelineWidget::set_scroll(int offset) {
@@ -73,6 +86,30 @@ void TimelineWidget::set_scroll(int offset) {
     }
     state_.timeline_scroll = static_cast<float>(clamped);
     update();
+}
+
+void TimelineWidget::ensure_playhead_visible() {
+    if (!follow_playhead_) {
+        return;
+    }
+    const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
+    const float content_x =
+        static_cast<float>(kHeaderWidth + kGridPadding) + state_.current_frame * spacing;
+    const int offset = static_cast<int>(state_.timeline_scroll);
+    const float playhead_x = content_x - static_cast<float>(offset);
+    const float left = static_cast<float>(kHeaderWidth + kPlayheadMargin);
+    const float right = std::max(left, static_cast<float>(width() - kPlayheadMargin));
+    int target = offset;
+    if (playhead_x < left) {
+        target = static_cast<int>(std::floor(content_x - left));
+    } else if (playhead_x > right) {
+        target = static_cast<int>(std::ceil(content_x - right));
+    }
+    const int clamped = std::clamp(target, 0, max_scroll());
+    if (clamped != offset) {
+        state_.timeline_scroll = static_cast<float>(clamped);
+        emit scrollChanged(clamped);
+    }
 }
 
 void TimelineWidget::update_scroll_range() {
@@ -89,40 +126,94 @@ void TimelineWidget::update_scroll_range() {
     }
 }
 
-QStringList TimelineWidget::channels() const {
-    QStringList list;
-    if (state_.mode == EditorMode::Camera) {
-        list << "camera" << "light" << "shadow" << "gravity" << "accessory";
-        return list;
+const std::vector<TimelineRow>& TimelineWidget::rows() const {
+    const int bone_count = state_.model_bone_names.size();
+    const int mode = static_cast<int>(state_.mode);
+    if (rows_mode_ == mode && rows_bone_count_ == bone_count &&
+        rows_revision_ == state_.keyframe_revision && !rows_cache_.empty()) {
+        return rows_cache_;
     }
-    list << "view cnt" << "Disp/IK/OP" << "Facial";
-    list << state_.model_bone_names;
-    return list;
+    rebuild_rows();
+    rows_mode_ = mode;
+    rows_bone_count_ = bone_count;
+    rows_revision_ = state_.keyframe_revision;
+    return rows_cache_;
+}
+
+void TimelineWidget::rebuild_rows() const {
+    rows_cache_.clear();
+    if (state_.mode == EditorMode::Camera) {
+        for (const QString& name :
+             {QStringLiteral("camera"), QStringLiteral("light"), QStringLiteral("shadow"),
+              QStringLiteral("gravity"), QStringLiteral("accessory")}) {
+            rows_cache_.push_back({name, TimelineRowKind::Channel, 0});
+        }
+        return;
+    }
+
+    rows_cache_.push_back({QStringLiteral("view cnt"), TimelineRowKind::Channel, 0});
+    rows_cache_.push_back({QStringLiteral("Disp/IK/OP"), TimelineRowKind::Channel, 0});
+    rows_cache_.push_back({QStringLiteral("Facial"), TimelineRowKind::Channel, 0});
+
+    QSet<QString> bone_names;
+    for (int i = 0; i < state_.model_bone_names.size(); ++i) {
+        const QString& name = state_.model_bone_names[i];
+        bone_names.insert(name);
+        rows_cache_.push_back({name, TimelineRowKind::Bone, i});
+    }
+
+    QSet<QString> morph_names;
+    const auto has_keys = [this](const QString& name) {
+        const auto track = state_.track_keyframes.find(name);
+        return track != state_.track_keyframes.end() && !track->second.empty();
+    };
+    for (const auto& category : state_.category_morph_names) {
+        for (const QString& name : category) {
+            if (has_keys(name) && !morph_names.contains(name)) {
+                morph_names.insert(name);
+                rows_cache_.push_back({name, TimelineRowKind::Morph, 0});
+            }
+        }
+    }
+    for (const auto& [track, keys] : state_.track_keyframes) {
+        if (keys.empty() || track.isEmpty() || reserved_channel(track) ||
+            bone_names.contains(track) || morph_names.contains(track)) {
+            continue;
+        }
+        if (track == QStringLiteral("camera") || track == QStringLiteral("light") ||
+            track == QStringLiteral("shadow") || track == QStringLiteral("gravity") ||
+            track == QStringLiteral("accessory")) {
+            continue;
+        }
+        morph_names.insert(track);
+        rows_cache_.push_back({track, TimelineRowKind::Morph, 0});
+    }
 }
 
 void TimelineWidget::paintEvent(QPaintEvent*) {
+    ensure_playhead_visible();
     QPainter painter(this);
     painter.fillRect(rect(), kBase);
-    const QStringList channel_list = channels();
+    const auto& row_list = rows();
     const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
     const int visible_frames = std::max(state_.max_timeline_frame, kMinVisibleFrames);
     const int offset = static_cast<int>(state_.timeline_scroll);
-    const int content_height = kRulerHeight + static_cast<int>(channel_list.size()) * kRowHeight;
+    const int content_height = kRulerHeight + static_cast<int>(row_list.size()) * kRowHeight;
     const QRect grid_rect(kHeaderWidth, 0, std::max(0, width() - kHeaderWidth), height());
 
     painter.fillRect(QRect(0, 0, width(), kRulerHeight), kPanel);
     painter.setPen(QPen(kLine, 1));
     painter.drawLine(0, kRulerHeight, width(), kRulerHeight);
 
-    for (int row = 0; row < channel_list.size(); ++row) {
+    for (int row = 0; row < static_cast<int>(row_list.size()); ++row) {
         const int y = kRulerHeight + row * kRowHeight;
         if (y > height()) {
             break;
         }
-        const QString name = channel_list[row];
+        const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
         bool selected = false;
-        if (state_.mode == EditorMode::Model && row >= 3 && state_.selected_bone_idx) {
-            selected = *state_.selected_bone_idx == row - 3;
+        if (descriptor.kind == TimelineRowKind::Bone && state_.selected_bone_idx) {
+            selected = *state_.selected_bone_idx == descriptor.index;
         }
         painter.fillRect(QRect(0, y, width(), kRowHeight),
                          selected ? QColor(45, 62, 72) : (row % 2 ? QColor(29, 33, 41) : kBase));
@@ -131,7 +222,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         painter.drawLine(0, y + kRowHeight - 1, width(), y + kRowHeight - 1);
         painter.setPen(selected ? kCyan : kSnow);
         painter.drawText(QRect(6, y, kHeaderWidth - 8, kRowHeight), Qt::AlignVCenter | Qt::AlignLeft,
-                         name);
+                         descriptor.name);
     }
 
     painter.setClipRect(grid_rect);
@@ -150,12 +241,13 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         painter.drawText(QRect(x - 20, 2, 40, 18), Qt::AlignCenter, QString::number(frame));
     }
 
-    for (int row = 0; row < channel_list.size(); ++row) {
+    for (int row = 0; row < static_cast<int>(row_list.size()); ++row) {
         const int y = kRulerHeight + row * kRowHeight;
         if (y > height()) {
             break;
         }
-        const auto track = state_.track_keyframes.find(channel_list[row]);
+        const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
+        const auto track = state_.track_keyframes.find(descriptor.name);
         if (track == state_.track_keyframes.end()) {
             continue;
         }
@@ -168,7 +260,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             }
             const QPointF center(x, y + kRowHeight / 2.0);
             const bool key_selected =
-                state_.selected_keyframes.count({channel_list[row], frame}) != 0;
+                state_.selected_keyframes.count({descriptor.name, frame}) != 0;
             QPolygonF diamond;
             diamond << QPointF(center.x(), center.y() - 4.5)
                     << QPointF(center.x() + 4.5, center.y())
@@ -199,15 +291,16 @@ std::optional<TimelineKeyframeHit> TimelineWidget::keyframe_at(const QPoint& pos
         return std::nullopt;
     }
     const int row = (position.y() - kRulerHeight) / kRowHeight;
-    const QStringList channel_list = channels();
-    if (row < 0 || row >= channel_list.size()) {
+    const auto& row_list = rows();
+    if (row < 0 || row >= static_cast<int>(row_list.size())) {
         return std::nullopt;
     }
     const int row_y = kRulerHeight + row * kRowHeight + kRowHeight / 2;
     if (std::abs(position.y() - row_y) > 6) {
         return std::nullopt;
     }
-    const auto track = state_.track_keyframes.find(channel_list[row]);
+    const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
+    const auto track = state_.track_keyframes.find(descriptor.name);
     if (track == state_.track_keyframes.end()) {
         return std::nullopt;
     }
@@ -220,7 +313,7 @@ std::optional<TimelineKeyframeHit> TimelineWidget::keyframe_at(const QPoint& pos
             continue;
         }
         if (std::abs(position.x() - x) <= 6) {
-            return TimelineKeyframeHit{channel_list[row], frame, row};
+            return TimelineKeyframeHit{descriptor.name, frame, row};
         }
     }
     return std::nullopt;
@@ -233,16 +326,19 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
     setFocus();
     const QPoint position = event->pos();
     if (position.x() < kHeaderWidth) {
-        if (position.y() >= kRulerHeight && state_.mode == EditorMode::Model) {
+        if (position.y() >= kRulerHeight) {
             const int row = (position.y() - kRulerHeight) / kRowHeight;
-            if (row >= 3) {
-                const int bone = row - 3;
-                if (bone < state_.model_bone_names.size()) {
-                    state_.selected_bone_idx = bone;
+            const auto& row_list = rows();
+            if (row >= 0 && row < static_cast<int>(row_list.size())) {
+                const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
+                if (descriptor.kind == TimelineRowKind::Bone) {
+                    state_.selected_bone_idx = descriptor.index;
                     state_.bone_transform_dirty = false;
-                    state_.set_status(QStringLiteral("Selected bone: %1")
-                                          .arg(state_.model_bone_names[bone]));
-                    emit boneSelected(bone);
+                    state_.set_status(QStringLiteral("Selected bone: %1").arg(descriptor.name));
+                    emit boneSelected(descriptor.index);
+                    update();
+                } else if (descriptor.kind == TimelineRowKind::Morph) {
+                    state_.set_status(QStringLiteral("Selected morph track: %1").arg(descriptor.name));
                     update();
                 }
             }
@@ -266,12 +362,13 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
         }
         state_.current_frame = static_cast<float>(hit->frame);
         state_.jump_frame_input = QString::number(hit->frame);
-        if (hit->row >= 3 && state_.mode == EditorMode::Model) {
-            const int bone = hit->row - 3;
-            if (bone < state_.model_bone_names.size()) {
-                state_.selected_bone_idx = bone;
+        const auto& row_list = rows();
+        if (hit->row >= 0 && hit->row < static_cast<int>(row_list.size())) {
+            const TimelineRow& descriptor = row_list[static_cast<std::size_t>(hit->row)];
+            if (descriptor.kind == TimelineRowKind::Bone) {
+                state_.selected_bone_idx = descriptor.index;
                 state_.bone_transform_dirty = false;
-                emit boneSelected(bone);
+                emit boneSelected(descriptor.index);
             }
         }
         state_.set_status(QStringLiteral("Selected keyframe %1 at frame %2")
@@ -352,6 +449,16 @@ void TimelineWidget::wheelEvent(QWheelEvent* event) {
 }
 
 void TimelineWidget::keyPressEvent(QKeyEvent* event) {
+    if (event->matches(QKeySequence::Copy)) {
+        emit copyRequested();
+        event->accept();
+        return;
+    }
+    if (event->matches(QKeySequence::Paste)) {
+        emit pasteRequested();
+        event->accept();
+        return;
+    }
     if (event->key() == Qt::Key_Delete) {
         emit deleteSelectedRequested();
         event->accept();
