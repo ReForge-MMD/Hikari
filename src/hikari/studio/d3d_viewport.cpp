@@ -217,9 +217,13 @@ bool D3DViewport::load_model(const QString& path) {
         }
         state_.model_name = to_qstring(pmx_->info.name_local);
         state_.model_bone_names.clear();
-        for (const auto& bone : pmx_->bones) {
-            state_.model_bone_names.push_back(to_qstring(
-                bone.name_local.empty() ? bone.name_universal : bone.name_local));
+        for (std::size_t i = 0; i < pmx_->bones.size(); ++i) {
+            const auto& bone = pmx_->bones[i];
+            const std::string& name =
+                bone.name_universal.empty() ? bone.name_local : bone.name_universal;
+            state_.model_bone_names.push_back(
+                name.empty() ? QStringLiteral("bone %1").arg(static_cast<int>(i))
+                             : to_qstring(name));
         }
         state_.selected_bone_idx.reset();
         state_.morph_weights.clear();
@@ -241,6 +245,7 @@ bool D3DViewport::load_model(const QString& path) {
             state_.selected_morph_names[static_cast<std::size_t>(i)] =
                 state_.category_morph_names[static_cast<std::size_t>(i)].first();
         }
+        state_.model_loaded = true;
         emit modelLoaded(state_.model_name, vertex_count_, bone_count_);
         emit statusMessage(QStringLiteral("Loaded model: %1").arg(path));
         core::log_msg("[studio] Loaded PMX: " + path.toStdString());
@@ -349,6 +354,7 @@ void D3DViewport::clear_model() {
     index_count_ = 0;
     bone_count_ = 0;
     state_.model_name.clear();
+    state_.model_loaded = false;
     state_.model_bone_names.clear();
     state_.selected_bone_idx.reset();
     emit statusMessage(QStringLiteral("Active model removed from scene"));

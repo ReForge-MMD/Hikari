@@ -394,6 +394,10 @@ ViewportFooter::ViewportFooter(StudioAppState& state, QWidget* parent)
     connect(distance_, &QDoubleSpinBox::valueChanged, this,
             [this](double) { apply_camera_fields(); });
     connect(mode_, &QPushButton::clicked, this, [this] {
+        if (state_.mode == EditorMode::Camera && !state_.model_loaded) {
+            emit modelLoadRequested();
+            return;
+        }
         state_.mode = state_.mode == EditorMode::Camera ? EditorMode::Model : EditorMode::Camera;
         sync();
         emit modeChanged();
@@ -402,8 +406,14 @@ ViewportFooter::ViewportFooter(StudioAppState& state, QWidget* parent)
 }
 
 void ViewportFooter::sync() {
+    if (!state_.model_loaded && state_.mode == EditorMode::Model) {
+        state_.mode = EditorMode::Camera;
+    }
     syncing_ = true;
     const bool camera = state_.mode == EditorMode::Camera;
+    mode_->setToolTip(state_.model_loaded
+                          ? QString()
+                          : QStringLiteral("To model mode: load a model first"));
     mode_->setText(camera ? QStringLiteral("To Model") : QStringLiteral("To Camera"));
     target_->setText(camera ? QStringLiteral("camera")
                             : (state_.model_name.isEmpty() ? QStringLiteral("model")

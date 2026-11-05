@@ -106,12 +106,21 @@ void MotionPlayer::evaluate_pose(float frame, Skeleton& skeleton, MorphEvaluator
     std::fill(skeleton.local_translations.begin(), skeleton.local_translations.end(), Vec3::zero());
     std::fill(skeleton.local_rotations.begin(), skeleton.local_rotations.end(), Quat::identity());
 
-    for (std::size_t i = 0; i < skeleton.bones.size(); ++i) {
-        const auto it = bone_tracks_.find(skeleton.bones[i].name);
-        if (it != bone_tracks_.end()) {
-            const auto [translation, rotation] = sample_bone_track(it->second, frame);
-            skeleton.set_bone_transform(i, translation, rotation);
+    std::vector<const std::vector<formats::VmdBoneFrame>*> resolved(skeleton.bones.size(),
+                                                                    nullptr);
+    for (const auto& [name, track] : bone_tracks_) {
+        const auto index = skeleton.find_bone_index(name);
+        if (!index || *index >= resolved.size() || resolved[*index] != nullptr) {
+            continue;
         }
+        resolved[*index] = &track;
+    }
+    for (std::size_t i = 0; i < resolved.size(); ++i) {
+        if (resolved[i] == nullptr) {
+            continue;
+        }
+        const auto [translation, rotation] = sample_bone_track(*resolved[i], frame);
+        skeleton.set_bone_transform(i, translation, rotation);
     }
     skeleton.update_transforms();
 

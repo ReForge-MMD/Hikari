@@ -148,6 +148,18 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
                               ? QStringLiteral("Editing the camera")
                               : QStringLiteral("Editing the model"));
     });
+    connect(footer_, &ViewportFooter::modelLoadRequested, this, [this] {
+        choose_model();
+        if (!state_.model_loaded) {
+            return;
+        }
+        state_.mode = EditorMode::Model;
+        update_viewport_title();
+        timeline_->update();
+        sync_bone_fields();
+        footer_->sync();
+        state_.set_status(QStringLiteral("Editing the model"));
+    });
 
     auto* sync_timer = new QTimer(this);
     sync_timer->setInterval(120);
@@ -162,6 +174,7 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
         }
         header_->set_frame(static_cast<int>(state_.current_frame));
         footer_->sync();
+        update_viewport_title();
         timeline_->update();
     });
     sync_timer->start();
@@ -682,7 +695,9 @@ QWidget* MainWindow::build_bone_tab() {
         state_.bone_mode = index == 1 ? BoneTransformMode::Rotate
                            : index == 2 ? BoneTransformMode::Move
                                         : BoneTransformMode::Select;
-        state_.mode = EditorMode::Model;
+        if (state_.model_loaded) {
+            state_.mode = EditorMode::Model;
+        }
         update_viewport_title();
     });
     connect(show_bones, &QCheckBox::toggled, this,
@@ -695,14 +710,18 @@ QWidget* MainWindow::build_bone_tab() {
                     state_.bone_pos_override[static_cast<std::size_t>(i)] =
                         static_cast<float>(value);
                     state_.bone_transform_dirty = true;
-                    state_.mode = EditorMode::Model;
+                    if (state_.model_loaded) {
+                        state_.mode = EditorMode::Model;
+                    }
                 });
         connect(bone_rot_[static_cast<std::size_t>(i)], &QDoubleSpinBox::valueChanged, this,
                 [this, i](double value) {
                     state_.bone_rot_euler_deg[static_cast<std::size_t>(i)] =
                         static_cast<float>(value);
                     state_.bone_transform_dirty = true;
-                    state_.mode = EditorMode::Model;
+                    if (state_.model_loaded) {
+                        state_.mode = EditorMode::Model;
+                    }
                 });
     }
     connect(reset, &QPushButton::clicked, this, [this] {
@@ -1167,6 +1186,9 @@ QWidget* MainWindow::build_interpolation_tab() {
 }
 
 void MainWindow::refresh_targets() {
+    if (!state_.model_loaded && state_.mode == EditorMode::Model) {
+        state_.mode = EditorMode::Camera;
+    }
     if (timeline_ != nullptr) {
         timeline_->refresh_layout();
         timeline_->update();

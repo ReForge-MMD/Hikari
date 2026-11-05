@@ -138,6 +138,7 @@ Skeleton Skeleton::from_pmx(const formats::PmxModel& pmx) {
         }
     }
 
+    skeleton.build_name_index();
     skeleton.update_transforms();
     return skeleton;
 }
@@ -145,13 +146,21 @@ Skeleton Skeleton::from_pmx(const formats::PmxModel& pmx) {
 std::string normalize_bone_name(const std::string& name) {
     std::string result;
     result.reserve(name.size());
+    const auto append_ascii = [&result](char ch) {
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '_' || ch == '-') {
+            return;
+        }
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        result.push_back(ch);
+    };
     for (std::size_t i = 0; i < name.size();) {
         const unsigned char c = static_cast<unsigned char>(name[i]);
         if (c == 0xE3 && i + 2 < name.size()) {
             // U+3000 IDEOGRAPHIC SPACE (E3 80 80).
             if (static_cast<unsigned char>(name[i + 1]) == 0x80 &&
                 static_cast<unsigned char>(name[i + 2]) == 0x80) {
-                result.push_back(' ');
                 i += 3;
                 continue;
             }
@@ -161,15 +170,20 @@ std::string normalize_bone_name(const std::string& name) {
             const unsigned char b1 = static_cast<unsigned char>(name[i + 1]);
             const unsigned char b2 = static_cast<unsigned char>(name[i + 2]);
             if (b1 == 0xBC && b2 >= 0x81) {
-                result.push_back(static_cast<char>(b2 - 0x60));
+                append_ascii(static_cast<char>(b2 - 0x60));
                 i += 3;
                 continue;
             }
             if (b1 == 0xBD && b2 <= 0x9E) {
-                result.push_back(static_cast<char>(b2 - 0x20));
+                append_ascii(static_cast<char>(b2 - 0x20));
                 i += 3;
                 continue;
             }
+        }
+        if (c < 0x80) {
+            append_ascii(static_cast<char>(c));
+            ++i;
+            continue;
         }
         result.push_back(name[i]);
         ++i;
@@ -183,8 +197,10 @@ std::string normalize_bone_name(const std::string& name) {
     return result.substr(begin, end - begin + 1);
 }
 
-std::vector<std::string> get_bone_aliases(const std::string& query) {
-    static const std::vector<std::vector<std::string>> pairs = {
+namespace {
+
+const std::vector<std::vector<std::string>>& bone_alias_groups() {
+    static const std::vector<std::vector<std::string>> groups = {
         {"全ての親", "Root", "Mother", "Parent"},
         {"センター", "Center"},
         {"グルーブ", "Groove"},
@@ -215,9 +231,15 @@ std::vector<std::string> get_bone_aliases(const std::string& query) {
         {"左つま先IK", "Toe_IK_L", "Left toe IK"},
         {"右つま先IK", "Toe_IK_R", "Right toe IK"},
     };
-    for (const auto& group : pairs) {
+    return groups;
+}
+
+} // namespace
+
+std::vector<std::string> get_bone_aliases(const std::string& query) {
+    for (const auto& group : bone_alias_groups()) {
         for (const auto& name : group) {
-            if (name == query) {
+            if (normalize_bone_name(name) == query) {
                 return group;
             }
         }
@@ -225,30 +247,61 @@ std::vector<std::string> get_bone_aliases(const std::string& query) {
     return {};
 }
 
-std::optional<std::size_t> Skeleton::find_bone_index(const std::string& name) const {
-    const std::string normalized = normalize_bone_name(name);
+void Skeleton::build_name_index() {
+    name_index_.clear();
+    name_index_.reserve(bones.size() * 4);
     for (std::size_t i = 0; i < bones.size(); ++i) {
         const auto& bone = bones[i];
-        if (bone.name == name || bone.name_en == name) {
-            return i;
+        if (!bone.name.empty()) {
+            name_index_.try_emplace(bone.name, i);
+        }
+        if (!bone.name_en.empty()) {
+            name_index_.try_emplace(bone.name_en, i);
+        }
+        const std::string normalized = normalize_bone_name(bone.name);
+        if (!normalized.empty()) {
+            name_index_.try_emplace(normalized, i);
+        }
+        const std::string normalized_en = normalize_bone_name(bone.name_en);
+        if (!normalized_en.empty()) {
+            name_index_.try_emplace(normalized_en, i);
         }
     }
-    for (std::size_t i = 0; i < bones.size(); ++i) {
-        const auto& bone = bones[i];
-        const std::string nb = normalize_bone_name(bone.name);
-        const std::string nben = normalize_bone_name(bone.name_en);
-        if (nb == normalized || nben == normalized) {
-            return i;
-        }
-    }
-    for (const auto& alias : get_bone_aliases(normalized)) {
-        for (std::size_t i = 0; i < bones.size(); ++i) {
-            const auto& bone = bones[i];
-            if (bone.name == alias || bone.name_en == alias ||
-                normalize_bone_name(bone.name) == alias) {
-                return i;
+    for (const auto& group : bone_alias_groups()) {
+        std::optional<std::size_t> index;
+        for (const auto& alias : group) {
+            const std::string target = normalize_bone_name(alias);
+            if (target.empty()) {
+                continue;
+            }
+            for (std::size_t i = 0; i < bones.size() && !index; ++i) {
+                if (normalize_bone_name(bones[i].name) == target ||
+                    normalize_bone_name(bones[i].name_en) == target) {
+                    index = i;
+                }
+            }
+            if (index) {
+                break;
             }
         }
+        if (!index) {
+            continue;
+        }
+        for (const auto& alias : group) {
+            const std::string target = normalize_bone_name(alias);
+            if (!target.empty()) {
+                name_index_.try_emplace(target, *index);
+            }
+        }
+    }
+}
+
+std::optional<std::size_t> Skeleton::find_bone_index(const std::string& name) const {
+    if (const auto it = name_index_.find(name); it != name_index_.end()) {
+        return it->second;
+    }
+    if (const auto it = name_index_.find(normalize_bone_name(name)); it != name_index_.end()) {
+        return it->second;
     }
     return std::nullopt;
 }

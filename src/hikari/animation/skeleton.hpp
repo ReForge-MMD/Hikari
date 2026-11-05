@@ -77,11 +77,13 @@ public:
     void apply_jiggle(Jiggle& jiggle, float dt, const JiggleSettings& settings);
 
 private:
+    void build_name_index();
     void compute_world_matrix(std::size_t index, const Vec3& effective_translation,
                               const Quat& effective_rotation);
     void solve_ik(bool after_physics);
     void fill_bone_world_transforms(std::vector<physics::BodyTransform>& out) const;
     std::vector<physics::BodyTransform> bone_transform_scratch_;
+    std::unordered_map<std::string, std::size_t> name_index_;
 };
 
 std::string normalize_bone_name(const std::string& name);

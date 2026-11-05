@@ -34,7 +34,8 @@ struct EffectDialogState {
 };
 
 struct StudioAppState {
-    EditorMode mode = EditorMode::Model;
+    EditorMode mode = EditorMode::Camera;
+    bool model_loaded = false;
     QString model_name;
     QStringList loaded_models;
     int selected_model_idx = 0;

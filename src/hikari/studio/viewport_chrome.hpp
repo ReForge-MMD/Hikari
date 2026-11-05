@@ -78,6 +78,7 @@ public:
 signals:
     void modeChanged();
     void valueEdited();
+    void modelLoadRequested();
 
 private:
     void apply_camera_fields();

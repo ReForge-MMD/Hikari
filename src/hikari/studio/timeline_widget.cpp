@@ -47,11 +47,7 @@ QStringList TimelineWidget::channels() const {
         return list;
     }
     list << "view cnt" << "Disp/IK/OP" << "Facial";
-    if (state_.model_bone_names.isEmpty()) {
-        list << "center" << "Root" << "Waist" << "Spine" << "Neck" << "Head";
-    } else {
-        list << state_.model_bone_names;
-    }
+    list << state_.model_bone_names;
     return list;
 }
 
