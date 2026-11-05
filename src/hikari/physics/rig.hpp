@@ -70,6 +70,8 @@ public:
     void set_gravity(float gravity);
     void set_gravity_vec(const std::array<float, 3>& gravity);
     void set_time_scale(float scale);
+    void apply_impulse(std::size_t body_index, bool local, const Vec3& velocity,
+                       const Vec3& torque);
 
     const std::vector<std::optional<BoneOverride>>& step(const std::vector<BodyTransform>& bone_world,
                                                          float dt);

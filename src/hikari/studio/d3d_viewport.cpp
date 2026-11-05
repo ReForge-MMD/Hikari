@@ -47,6 +47,23 @@ std::wstring to_wstring(const QString& text) {
     return text.toStdWString();
 }
 
+// PMX morph panels: 0 = system (hidden), 1 = brow, 2 = eye, 3 = mouth, 4 = other.
+// The facial tab uses Eyes, Mouth, Brow, Other in that order.
+std::optional<int> morph_panel_slot(std::uint8_t panel) {
+    switch (panel) {
+    case 1:
+        return 2;
+    case 2:
+        return 0;
+    case 3:
+        return 1;
+    case 4:
+        return 3;
+    default:
+        return std::nullopt;
+    }
+}
+
 } // namespace
 
 D3DViewport::D3DViewport(StudioAppState& state, QWidget* parent)
@@ -227,23 +244,25 @@ bool D3DViewport::load_model(const QString& path) {
         }
         state_.selected_bone_idx.reset();
         state_.morph_weights.clear();
+        state_.morph_slider_values = {0.0f, 0.0f, 0.0f, 0.0f};
         state_.category_morph_names[0].clear();
         state_.category_morph_names[1].clear();
         state_.category_morph_names[2].clear();
         state_.category_morph_names[3].clear();
         for (const auto& morph : pmx_->morphs) {
-            const QString name = to_qstring(morph.name_local);
-            const int category = std::clamp(static_cast<int>(morph.category), 0, 3);
-            state_.category_morph_names[static_cast<std::size_t>(category)].push_back(name);
-        }
-        const QStringList defaults = {QStringLiteral("まばたき"), QStringLiteral("あ"),
-                                      QStringLiteral("真面目"), QStringLiteral("涙")};
-        for (int i = 0; i < 4; ++i) {
-            if (state_.category_morph_names[static_cast<std::size_t>(i)].isEmpty()) {
-                state_.category_morph_names[static_cast<std::size_t>(i)].push_back(defaults[i]);
+            const auto slot = morph_panel_slot(morph.category);
+            if (!slot) {
+                continue;
             }
+            const std::string& name =
+                morph.name_local.empty() ? morph.name_universal : morph.name_local;
+            state_.category_morph_names[static_cast<std::size_t>(*slot)].push_back(
+                to_qstring(name));
+        }
+        for (int i = 0; i < 4; ++i) {
+            QStringList& names = state_.category_morph_names[static_cast<std::size_t>(i)];
             state_.selected_morph_names[static_cast<std::size_t>(i)] =
-                state_.category_morph_names[static_cast<std::size_t>(i)].first();
+                names.isEmpty() ? QString() : names.first();
         }
         state_.model_loaded = true;
         emit modelLoaded(state_.model_name, vertex_count_, bone_count_);
@@ -552,13 +571,28 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
     for (int frame = start; frame <= end; ++frame) {
         state_.current_frame = static_cast<float>(frame);
         evaluate_frame(static_cast<float>(frame));
+        if (!motion_player_) {
+            morphs_.reset();
+        }
+        for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
+            morphs_.set_weight(it.key().toStdString(), it.value());
+        }
+        const animation::MorphResult morph_result = morphs_.evaluate();
+        apply_bone_morphs(morph_result);
         apply_editor_bone_override();
+        if (physics_rig_) {
+            for (const auto& impulse : morph_result.impulses) {
+                physics_rig_->apply_impulse(impulse.body_index, impulse.local, impulse.velocity,
+                                            impulse.torque);
+            }
+        }
         if (state_.physics_mode != PhysicsMode::Disabled && skeleton_ && physics_rig_) {
             skeleton_->apply_physics(*physics_rig_, 1.0f / static_cast<float>(std::max(fps, 1)));
         }
+        apply_material_morphs(morph_result);
         if (mesh_) {
-            const auto [position_offsets, uv_offsets] = morphs_.compute_offsets();
-            mesh_->apply_morph_offsets(*context_, position_offsets, uv_offsets);
+            mesh_->apply_morph_offsets(*context_, morph_result.position_offsets,
+                                       morph_result.uv_offsets);
         }
         render_scene();
         try {
@@ -626,6 +660,15 @@ void D3DViewport::tick_impl() {
 
     update_camera();
     evaluate_frame(state_.current_frame);
+
+    if (!motion_player_) {
+        morphs_.reset();
+    }
+    for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
+        morphs_.set_weight(it.key().toStdString(), it.value());
+    }
+    const animation::MorphResult morph_result = morphs_.evaluate();
+    apply_bone_morphs(morph_result);
     apply_editor_bone_override();
 
     if (state_.reset_physics_requested) {
@@ -635,6 +678,10 @@ void D3DViewport::tick_impl() {
     if (physics_rig_) {
         physics_rig_->set_gravity_vec(state_.gravity);
         physics_rig_->set_time_scale(state_.physics_speed);
+        for (const auto& impulse : morph_result.impulses) {
+            physics_rig_->apply_impulse(impulse.body_index, impulse.local, impulse.velocity,
+                                        impulse.torque);
+        }
     }
     const bool physics_active =
         state_.physics_mode != PhysicsMode::Disabled &&
@@ -646,12 +693,10 @@ void D3DViewport::tick_impl() {
         skeleton_->apply_jiggle(*jiggle_, dt, jiggle_settings_);
     }
 
-    for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
-        morphs_.set_weight(it.key().toStdString(), it.value());
-    }
+    apply_material_morphs(morph_result);
     if (mesh_) {
-        const auto [position_offsets, uv_offsets] = morphs_.compute_offsets();
-        mesh_->apply_morph_offsets(*context_, position_offsets, uv_offsets);
+        mesh_->apply_morph_offsets(*context_, morph_result.position_offsets,
+                                   morph_result.uv_offsets);
     }
 
     render_scene();
@@ -710,6 +755,55 @@ void D3DViewport::evaluate_frame(float frame) {
                 ? std::fmod(frame, static_cast<float>(motion_player_->max_frame) + 1.0f)
                 : frame;
         motion_player_->evaluate_pose(evaluated, *skeleton_, morphs_);
+    }
+}
+
+void D3DViewport::apply_bone_morphs(const animation::MorphResult& result) {
+    if (!skeleton_) {
+        return;
+    }
+    bool changed = false;
+    const std::size_t count =
+        std::min(result.bone_offsets.size(), skeleton_->bones.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& offset = result.bone_offsets[i];
+        const bool has_translation = offset.translation.x != 0.0f ||
+                                     offset.translation.y != 0.0f ||
+                                     offset.translation.z != 0.0f;
+        const bool has_rotation = offset.rotation.x != 0.0f || offset.rotation.y != 0.0f ||
+                                  offset.rotation.z != 0.0f || offset.rotation.w != 1.0f;
+        if (!has_translation && !has_rotation) {
+            continue;
+        }
+        if (has_translation) {
+            skeleton_->local_translations[i] += offset.translation;
+        }
+        if (has_rotation) {
+            skeleton_->local_rotations[i] =
+                (skeleton_->local_rotations[i] * offset.rotation).normalize();
+        }
+        changed = true;
+    }
+    if (changed) {
+        skeleton_->update_transforms();
+    }
+}
+
+void D3DViewport::apply_material_morphs(const animation::MorphResult& result) {
+    if (!context_) {
+        return;
+    }
+    const std::size_t count = std::min(result.material_offsets.size(), materials_.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& offset = result.material_offsets[i];
+        render::MaterialConstants constants;
+        constants.diffuse = offset.diffuse;
+        constants.specular = offset.specular;
+        constants.shininess = offset.shininess;
+        constants.ambient = offset.ambient;
+        constants.edge_color = offset.edge_color;
+        constants.edge_size = offset.edge_size;
+        materials_[i].set_constants(*context_, constants);
     }
 }
 

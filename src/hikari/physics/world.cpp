@@ -92,6 +92,16 @@ void World::move_kinematic(const std::vector<BodyTransform>& targets, float dt) 
     mmd_world_move_kinematic(raw_, scratch_.data(), static_cast<std::uint32_t>(targets.size()), dt);
 }
 
+void World::add_impulse(std::size_t index, bool local, const Vec3& velocity,
+                        const Vec3& torque) {
+    if (raw_ == nullptr) {
+        return;
+    }
+    const float linear[3] = {velocity.x, velocity.y, velocity.z};
+    const float angular[3] = {torque.x, torque.y, torque.z};
+    mmd_world_add_impulse(raw_, static_cast<std::uint32_t>(index), local ? 1 : 0, linear, angular);
+}
+
 void World::step(float dt, std::uint32_t collision_steps) {
     mmd_world_step(raw_, dt, collision_steps);
 }

@@ -32,6 +32,7 @@ public:
                                          const formats::PmxMaterial& material);
     static GpuMaterial fallback(core::D3D11Context& context, const std::string& name,
                                 std::int32_t texture_index);
+    void set_constants(core::D3D11Context& context, const MaterialConstants& values);
     void bind_to(ID3D11DeviceContext* context, std::uint32_t slot) const;
     void bind(core::D3D11Context& context, std::uint32_t slot) const;
 

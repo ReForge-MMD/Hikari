@@ -49,6 +49,7 @@ public:
     std::size_t body_count() const;
 
     void move_kinematic(const std::vector<BodyTransform>& targets, float dt);
+    void add_impulse(std::size_t index, bool local, const Vec3& velocity, const Vec3& torque);
     void step(float dt, std::uint32_t collision_steps);
     void read(std::vector<BodyTransform>& out);
     void reset(const std::vector<BodyTransform>& transforms);

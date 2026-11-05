@@ -84,6 +84,8 @@ private:
     void update_camera();
     void evaluate_frame(float frame);
     void apply_editor_bone_override();
+    void apply_bone_morphs(const animation::MorphResult& result);
+    void apply_material_morphs(const animation::MorphResult& result);
     void apply_screen_size();
     void place_gizmo();
     bool selected_bone_transform(std::size_t& index) const;

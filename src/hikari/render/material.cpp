@@ -54,6 +54,20 @@ GpuMaterial GpuMaterial::fallback(core::D3D11Context& context, const std::string
     return create(context, name, constants, texture_index);
 }
 
+void GpuMaterial::set_constants(core::D3D11Context& context,
+                                const MaterialConstants& values) {
+    if (std::memcmp(&constants, &values, sizeof(MaterialConstants)) == 0) {
+        return;
+    }
+    constants = values;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(context.context->Map(constant_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                       &mapped))) {
+        std::memcpy(mapped.pData, &constants, sizeof(constants));
+        context.context->Unmap(constant_buffer.Get(), 0);
+    }
+}
+
 void GpuMaterial::bind_to(ID3D11DeviceContext* context, std::uint32_t slot) const {
     ID3D11Buffer* buffers[] = {constant_buffer.Get()};
     context->PSSetConstantBuffers(slot, 1, buffers);

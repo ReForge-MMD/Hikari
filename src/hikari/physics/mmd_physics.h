@@ -87,6 +87,10 @@ uint32_t mmd_world_body_count(const MmdWorld* world);
 
 // Kinematic bodies move to `transforms[i]` over `dt`; other entries are ignored.
 void mmd_world_move_kinematic(MmdWorld* world, const float* transforms, uint32_t count, float dt);
+// Adds a linear/angular velocity impulse to the simulated body at `index`.
+// When `local` is nonzero the vectors are rotated by the body orientation first.
+void mmd_world_add_impulse(MmdWorld* world, uint32_t index, int32_t local, const float* velocity,
+                           const float* torque);
 void mmd_world_step(MmdWorld* world, float dt, uint32_t collision_steps);
 void mmd_world_read(const MmdWorld* world, float* transforms, uint32_t count);
 // Teleport every body to `transforms` and stop it.

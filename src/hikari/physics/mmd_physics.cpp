@@ -376,6 +376,24 @@ void mmd_world_move_kinematic(MmdWorld* world, const float* transforms, uint32_t
     }
 }
 
+void mmd_world_add_impulse(MmdWorld* world, uint32_t index, int32_t local, const float* velocity,
+                           const float* torque) {
+    if (!world || index >= world->bodies.size() || world->kinematic[index] || !velocity ||
+        !torque)
+        return;
+    if (!finite(velocity, 3) || !finite(torque, 3))
+        return;
+    BodyInterface& bodies = world->system.GetBodyInterfaceNoLock();
+    Vec3 linear(velocity[0], velocity[1], velocity[2]);
+    Vec3 angular(torque[0], torque[1], torque[2]);
+    if (local != 0) {
+        const Quat rotation = bodies.GetRotation(world->bodies[index]);
+        linear = rotation * linear;
+        angular = rotation * angular;
+    }
+    bodies.AddLinearAndAngularVelocity(world->bodies[index], linear, angular);
+}
+
 void mmd_world_step(MmdWorld* world, float dt, uint32_t collision_steps) {
     if (!world || !(dt > 0.0f))
         return;

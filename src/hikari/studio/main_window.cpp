@@ -1224,6 +1224,14 @@ void MainWindow::refresh_morph_combos() {
         const int index = combo->findText(selected);
         combo->setCurrentIndex(index >= 0 ? index : 0);
         combo->blockSignals(false);
+        const bool available = combo->count() > 0;
+        combo->setEnabled(available);
+        if (morph_slider_[static_cast<std::size_t>(i)] != nullptr) {
+            morph_slider_[static_cast<std::size_t>(i)]->setEnabled(available);
+        }
+        if (morph_value_[static_cast<std::size_t>(i)] != nullptr) {
+            morph_value_[static_cast<std::size_t>(i)]->setEnabled(available);
+        }
     }
 }
 

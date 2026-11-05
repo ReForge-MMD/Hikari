@@ -277,6 +277,14 @@ void PhysicsRig::set_time_scale(float scale) {
     settings_.time_scale = std::clamp(scale, 0.1f, 4.0f);
 }
 
+void PhysicsRig::apply_impulse(std::size_t body_index, bool local, const Vec3& velocity,
+                               const Vec3& torque) {
+    if (body_index >= bodies_.size()) {
+        return;
+    }
+    world_.add_impulse(body_index, local, velocity, torque);
+}
+
 void PhysicsRig::update_targets(const std::vector<BodyTransform>& bone_world) {
     for (std::size_t i = 0; i < targets_.size() && i < bodies_.size(); ++i) {
         const auto& body = bodies_[i];
