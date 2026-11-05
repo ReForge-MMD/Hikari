@@ -58,6 +58,7 @@ private:
     void refresh_morph_combos();
     void sync_bone_fields();
     void sync_morph_fields();
+    void delete_selected_keyframes();
     void update_viewport_title();
 
     StudioAppState state_;

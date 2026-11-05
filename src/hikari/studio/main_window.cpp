@@ -23,6 +23,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -190,6 +191,7 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
     if (!motion_path.isEmpty()) {
         QTimer::singleShot(400, this, [this, motion_path] {
             viewport_->load_motion(motion_path);
+            refresh_targets();
         });
     }
 }
@@ -469,8 +471,19 @@ QWidget* MainWindow::build_timeline_panel() {
     timeline_ = new TimelineWidget(state_);
     auto* scroll = new QScrollArea();
     scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scroll->setWidget(timeline_);
     layout->addWidget(scroll, 1);
+
+    auto* timeline_scroll = new QScrollBar(Qt::Horizontal);
+    timeline_scroll->setObjectName(QStringLiteral("TimelineScroll"));
+    layout->addWidget(timeline_scroll);
+    connect(timeline_scroll, &QScrollBar::valueChanged, timeline_, &TimelineWidget::set_scroll);
+    connect(timeline_, &TimelineWidget::scrollRangeChanged, timeline_scroll,
+            [timeline_scroll](int maximum) { timeline_scroll->setRange(0, maximum); });
+    connect(timeline_, &TimelineWidget::scrollChanged, timeline_scroll, &QScrollBar::setValue);
+    connect(timeline_, &TimelineWidget::deleteSelectedRequested, this,
+            [this] { delete_selected_keyframes(); });
 
     auto* actions_row = new QHBoxLayout();
     auto* copy_button = new QPushButton(QStringLiteral("Copy"));
@@ -549,11 +562,8 @@ QWidget* MainWindow::build_timeline_panel() {
         }
         timeline_->update();
     });
-    connect(delete_button, &QPushButton::clicked, this, [this] {
-        state_.delete_keyframe(state_.selected_track_name(),
-                               static_cast<unsigned int>(state_.current_frame));
-        timeline_->update();
-    });
+    connect(delete_button, &QPushButton::clicked, this,
+            [this] { delete_selected_keyframes(); });
     connect(register_button, &QPushButton::clicked, this, [this] {
         state_.register_keyframe(state_.selected_track_name(),
                                  static_cast<unsigned int>(state_.current_frame));
@@ -561,6 +571,7 @@ QWidget* MainWindow::build_timeline_panel() {
     });
     connect(zoom, &QSlider::valueChanged, this, [this](int value) {
         state_.timeline_zoom = static_cast<float>(value) / 100.0f;
+        timeline_->refresh_layout();
         timeline_->update();
     });
     copy_button->setEnabled(false);
@@ -1281,6 +1292,22 @@ void MainWindow::sync_morph_fields() {
     }
 }
 
+void MainWindow::delete_selected_keyframes() {
+    if (state_.selected_keyframes.empty()) {
+        state_.delete_keyframe(state_.selected_track_name(),
+                               static_cast<unsigned int>(state_.current_frame));
+        timeline_->update();
+        return;
+    }
+    const std::size_t count = state_.selected_keyframes.size();
+    for (const auto& [track, frame] : state_.selected_keyframes) {
+        state_.delete_keyframe(track, frame);
+    }
+    state_.selected_keyframes.clear();
+    state_.set_status(QStringLiteral("Deleted %1 keyframe(s)").arg(count));
+    timeline_->update();
+}
+
 void MainWindow::choose_model() {
     const QString path = QFileDialog::getOpenFileName(
         this, QStringLiteral("Load PMX Model"), state_.default_directory,
@@ -1303,6 +1330,7 @@ void MainWindow::choose_motion() {
     if (!path.isEmpty()) {
         viewport_->load_motion(path);
         state_.default_directory = QFileInfo(path).absolutePath();
+        refresh_targets();
     }
 }
 
