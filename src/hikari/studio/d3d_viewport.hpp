@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QRect>
 #include <QWidget>
 
 #include <memory>
@@ -24,6 +25,8 @@ class QTimer;
 
 namespace hikari::studio {
 
+class ViewGizmo;
+
 class D3DViewport : public QWidget {
     Q_OBJECT
 public:
@@ -40,6 +43,15 @@ public:
     bool capture_image(const QString& path);
     bool render_frames(const QString& directory, int start, int end, int fps);
 
+    void set_screen_size(int width, int height);
+    QSize effective_screen_size() const;
+    QRect scene_rect() const;
+
+    void rotate_selection(int axis, float degrees);
+    void translate_selection(int axis, float amount);
+    void reset_selection_transform();
+    void reset_camera();
+
     const animation::Skeleton* skeleton() const { return skeleton_ ? &*skeleton_ : nullptr; }
     const physics::PhysicsRig* physics_rig() const { return physics_rig_ ? &*physics_rig_ : nullptr; }
     int vertex_count() const { return vertex_count_; }
@@ -53,6 +65,7 @@ signals:
     void statsChanged(float fps, float frame_ms);
     void statusMessage(const QString& message);
     void modelLoaded(const QString& name, int vertices, int bones);
+    void screenSizeChanged(int width, int height);
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -71,11 +84,15 @@ private:
     void update_camera();
     void evaluate_frame(float frame);
     void apply_editor_bone_override();
+    void apply_screen_size();
+    void place_gizmo();
+    bool selected_bone_transform(std::size_t& index) const;
 
     StudioAppState& state_;
     std::unique_ptr<core::D3D11Context> context_;
     std::unique_ptr<render::SceneRenderer> renderer_;
     render::Camera camera_;
+    ViewGizmo* gizmo_ = nullptr;
 
     std::optional<formats::PmxModel> pmx_;
     std::optional<render::GpuMesh> mesh_;
@@ -97,6 +114,8 @@ private:
     int vertex_count_ = 0;
     int index_count_ = 0;
     int bone_count_ = 0;
+    int applied_screen_width_ = -1;
+    int applied_screen_height_ = -1;
 
     QPoint last_mouse_;
     bool left_down_ = false;

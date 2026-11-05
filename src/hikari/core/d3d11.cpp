@@ -135,7 +135,8 @@ void DeferredContextPool::clear() {
 }
 
 D3D11Context::D3D11Context(HWND hwnd_, std::uint32_t width_, std::uint32_t height_)
-    : width(std::max(width_, 1u)), height(std::max(height_, 1u)), hwnd(hwnd_) {
+    : width(std::max(width_, 1u)), height(std::max(height_, 1u)),
+      render_width(std::max(width_, 1u)), render_height(std::max(height_, 1u)), hwnd(hwnd_) {
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     const D3D_FEATURE_LEVEL fallback[] = {D3D_FEATURE_LEVEL_11_0};
     const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -301,6 +302,8 @@ void D3D11Context::recreate_views() {
     render_target_view.Reset();
     depth_stencil_view.Reset();
     depth_stencil_texture.Reset();
+    backbuffer_rtv_.Reset();
+    backbuffer_dsv_.Reset();
     context->OMSetRenderTargets(0, nullptr, nullptr);
     if (!swap_chain) {
         return;
@@ -309,7 +312,7 @@ void D3D11Context::recreate_views() {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> back_buffer;
     check(swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.GetAddressOf())), "GetBuffer");
     check(device->CreateRenderTargetView(back_buffer.Get(), nullptr,
-                                         render_target_view.GetAddressOf()),
+                                         backbuffer_rtv_.GetAddressOf()),
           "CreateRenderTargetView");
 
     D3D11_TEXTURE2D_DESC desc{};
@@ -328,8 +331,14 @@ void D3D11Context::recreate_views() {
     dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
     check(device->CreateDepthStencilView(depth_stencil_texture.Get(), &dsv_desc,
-                                         depth_stencil_view.GetAddressOf()),
+                                         backbuffer_dsv_.GetAddressOf()),
           "CreateDepthStencilView");
+    if (!scene_active_) {
+        render_target_view = backbuffer_rtv_;
+        depth_stencil_view = backbuffer_dsv_;
+        render_width = width;
+        render_height = height;
+    }
     bind_default_targets();
 }
 
@@ -350,7 +359,7 @@ void D3D11Context::bind_render_targets() const {
 
 void D3D11Context::bind_default_targets_to(ID3D11DeviceContext* target) const {
     bind_render_targets_to(target);
-    set_viewport_on(target, static_cast<float>(width), static_cast<float>(height));
+    set_viewport_on(target, static_cast<float>(render_width), static_cast<float>(render_height));
 }
 
 void D3D11Context::bind_default_targets() const {
@@ -397,6 +406,158 @@ void D3D11Context::present(std::uint32_t sync_interval) const {
     }
 }
 
+void D3D11Context::ensure_blit_shaders() {
+    if (blit_vs && blit_ps) {
+        return;
+    }
+    const auto vs_bc = compile_hlsl(kBlitHLSL, "BlitVS", vs_profile());
+    const auto ps_bc = compile_hlsl(kBlitHLSL, "BlitPS", ps_profile());
+    check(device->CreateVertexShader(vs_bc.data(), vs_bc.size(), nullptr,
+                                     blit_vs.GetAddressOf()),
+          "CreateVertexShader blit");
+    check(device->CreatePixelShader(ps_bc.data(), ps_bc.size(), nullptr,
+                                    blit_ps.GetAddressOf()),
+          "CreatePixelShader blit");
+}
+
+void D3D11Context::create_scene_targets(std::uint32_t scene_width, std::uint32_t scene_height) {
+    scene_tex_.Reset();
+    scene_rtv_.Reset();
+    scene_srv_.Reset();
+    scene_depth_tex_.Reset();
+    scene_dsv_.Reset();
+    scene_staging_.Reset();
+    scene_size_ = {scene_width, scene_height};
+    scene_staging_size_ = {0, 0};
+
+    D3D11_TEXTURE2D_DESC color_desc{};
+    color_desc.Width = scene_width;
+    color_desc.Height = scene_height;
+    color_desc.MipLevels = 1;
+    color_desc.ArraySize = 1;
+    color_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    color_desc.SampleDesc.Count = 1;
+    color_desc.Usage = D3D11_USAGE_DEFAULT;
+    color_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    check(device->CreateTexture2D(&color_desc, nullptr, scene_tex_.GetAddressOf()),
+          "CreateTexture2D scene");
+    check(device->CreateRenderTargetView(scene_tex_.Get(), nullptr,
+                                         scene_rtv_.GetAddressOf()),
+          "CreateRenderTargetView scene");
+    check(device->CreateShaderResourceView(scene_tex_.Get(), nullptr,
+                                           scene_srv_.GetAddressOf()),
+          "CreateShaderResourceView scene");
+
+    D3D11_TEXTURE2D_DESC depth_desc{};
+    depth_desc.Width = scene_width;
+    depth_desc.Height = scene_height;
+    depth_desc.MipLevels = 1;
+    depth_desc.ArraySize = 1;
+    depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth_desc.SampleDesc.Count = 1;
+    depth_desc.Usage = D3D11_USAGE_DEFAULT;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    check(device->CreateTexture2D(&depth_desc, nullptr, scene_depth_tex_.GetAddressOf()),
+          "CreateTexture2D scene depth");
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
+    dsv_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    check(device->CreateDepthStencilView(scene_depth_tex_.Get(), &dsv_desc,
+                                         scene_dsv_.GetAddressOf()),
+          "CreateDepthStencilView scene");
+    ensure_blit_shaders();
+}
+
+void D3D11Context::set_scene_resolution(std::uint32_t scene_width, std::uint32_t scene_height) {
+    if (scene_width == 0 || scene_height == 0) {
+        scene_active_ = false;
+        scene_tex_.Reset();
+        scene_rtv_.Reset();
+        scene_srv_.Reset();
+        scene_depth_tex_.Reset();
+        scene_dsv_.Reset();
+        scene_staging_.Reset();
+        scene_size_ = {0, 0};
+        scene_staging_size_ = {0, 0};
+        render_target_view = backbuffer_rtv_;
+        depth_stencil_view = backbuffer_dsv_;
+        render_width = width;
+        render_height = height;
+        return;
+    }
+    scene_width = std::max(scene_width, 16u);
+    scene_height = std::max(scene_height, 16u);
+    if (scene_rtv_ && scene_size_ == std::make_pair(scene_width, scene_height)) {
+        return;
+    }
+    create_scene_targets(scene_width, scene_height);
+    if (scene_active_) {
+        render_target_view = scene_rtv_;
+        depth_stencil_view = scene_dsv_;
+        render_width = scene_width;
+        render_height = scene_height;
+    }
+}
+
+void D3D11Context::begin_scene() {
+    if (!scene_rtv_) {
+        render_width = width;
+        render_height = height;
+        scene_active_ = false;
+        render_target_view = backbuffer_rtv_;
+        depth_stencil_view = backbuffer_dsv_;
+        return;
+    }
+    scene_active_ = true;
+    render_target_view = scene_rtv_;
+    depth_stencil_view = scene_dsv_;
+    render_width = scene_size_.first;
+    render_height = scene_size_.second;
+    bind_default_targets();
+}
+
+void D3D11Context::end_scene() {
+    scene_active_ = false;
+    render_target_view = backbuffer_rtv_;
+    depth_stencil_view = backbuffer_dsv_;
+    render_width = width;
+    render_height = height;
+}
+
+void D3D11Context::clear_backbuffer(const float color[4]) const {
+    if (backbuffer_rtv_) {
+        context->ClearRenderTargetView(backbuffer_rtv_.Get(), color);
+    }
+}
+
+void D3D11Context::blit_scene_to_backbuffer(float x, float y, float w, float h) {
+    if (!scene_srv_ || !backbuffer_rtv_ || w <= 0.0f || h <= 0.0f) {
+        return;
+    }
+    ensure_blit_shaders();
+    ID3D11RenderTargetView* views[] = {backbuffer_rtv_.Get()};
+    context->OMSetRenderTargets(1, views, nullptr);
+    set_viewport_rect(x, y, w, h);
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    context->OMSetBlendState(state_manager->get_blend(BlendPreset::Opaque), blend_factor,
+                             0xFFFFFFFF);
+    context->OMSetDepthStencilState(depth_disabled.Get(), 0xFFFFFFFF);
+    context->RSSetState(state_manager->get_rasterizer(RasterizerPreset::CullNoneSolid));
+    auto* sampler = state_manager->get_sampler(SamplerPreset::LinearClamp);
+    ID3D11ShaderResourceView* source = scene_srv_.Get();
+    context->PSSetShaderResources(0, 1, &source);
+    context->PSSetSamplers(0, 1, &sampler);
+    context->VSSetShader(blit_vs.Get(), nullptr, 0);
+    context->PSSetShader(blit_ps.Get(), nullptr, 0);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->Draw(3, 0);
+    ID3D11ShaderResourceView* null_source[1] = {nullptr};
+    context->PSSetShaderResources(0, 1, null_source);
+    context->PSSetShader(nullptr, nullptr, 0);
+    context->VSSetShader(nullptr, nullptr, 0);
+}
+
 void D3D11Context::recreate_composite(std::uint32_t new_width, std::uint32_t new_height) {
     if (new_width == 0 || new_height == 0) {
         return;
@@ -412,14 +573,7 @@ void D3D11Context::recreate_composite(std::uint32_t new_width, std::uint32_t new
     context->OMSetRenderTargets(0, nullptr, nullptr);
 
     if (!blit_vs || !blit_ps) {
-        const auto vs_bc = compile_hlsl(kBlitHLSL, "BlitVS", vs_profile());
-        const auto ps_bc = compile_hlsl(kBlitHLSL, "BlitPS", ps_profile());
-        check(device->CreateVertexShader(vs_bc.data(), vs_bc.size(), nullptr,
-                                         blit_vs.GetAddressOf()),
-              "CreateVertexShader blit");
-        check(device->CreatePixelShader(ps_bc.data(), ps_bc.size(), nullptr,
-                                        blit_ps.GetAddressOf()),
-              "CreatePixelShader blit");
+        ensure_blit_shaders();
     }
 
     D3D11_TEXTURE2D_DESC target_desc{};
@@ -543,10 +697,16 @@ void D3D11Context::resize(std::uint32_t new_width, std::uint32_t new_height) {
     }
     width = new_width;
     height = new_height;
+    if (!scene_active_) {
+        render_width = new_width;
+        render_height = new_height;
+    }
     context->OMSetRenderTargets(0, nullptr, nullptr);
     render_target_view.Reset();
     depth_stencil_view.Reset();
     depth_stencil_texture.Reset();
+    backbuffer_rtv_.Reset();
+    backbuffer_dsv_.Reset();
     if (swap_chain) {
         check(swap_chain->ResizeBuffers(0, new_width, new_height, DXGI_FORMAT_UNKNOWN, 0),
               "ResizeBuffers");
@@ -769,6 +929,47 @@ D3D11Context::CaptureResult D3D11Context::capture_backbuffer() {
         }
     }
     context->Unmap(capture_staging_.Get(), 0);
+    return result;
+}
+
+D3D11Context::CaptureResult D3D11Context::capture_scene() {
+    if (!scene_tex_) {
+        return capture_backbuffer();
+    }
+    if (!scene_staging_ || scene_staging_size_ != scene_size_) {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = scene_size_.first;
+        desc.Height = scene_size_.second;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        check(device->CreateTexture2D(&desc, nullptr,
+                                      scene_staging_.ReleaseAndGetAddressOf()),
+              "CreateTexture2D scene capture");
+        scene_staging_size_ = scene_size_;
+    }
+    context->CopyResource(scene_staging_.Get(), scene_tex_.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    check(context->Map(scene_staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped),
+          "Map scene capture");
+    CaptureResult result;
+    result.width = scene_size_.first;
+    result.height = scene_size_.second;
+    result.rgba.resize(static_cast<std::size_t>(result.width) * result.height * 4);
+    for (std::uint32_t y = 0; y < result.height; ++y) {
+        const auto* src = static_cast<const std::uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+        auto* dst = result.rgba.data() + static_cast<std::size_t>(y) * result.width * 4;
+        for (std::uint32_t x = 0; x < result.width; ++x) {
+            dst[x * 4 + 0] = src[x * 4 + 2];
+            dst[x * 4 + 1] = src[x * 4 + 1];
+            dst[x * 4 + 2] = src[x * 4 + 0];
+            dst[x * 4 + 3] = 255;
+        }
+    }
+    context->Unmap(scene_staging_.Get(), 0);
     return result;
 }
 

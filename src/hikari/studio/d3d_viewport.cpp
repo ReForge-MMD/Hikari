@@ -5,6 +5,7 @@
 #include <QFileInfo>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QResizeEvent>
 #include <QThread>
 #include <QTimer>
 #include <QWheelEvent>
@@ -13,6 +14,7 @@
 #include <cmath>
 
 #include "hikari/core/log.hpp"
+#include "hikari/studio/viewport_chrome.hpp"
 
 namespace hikari::studio {
 namespace {
@@ -61,6 +63,15 @@ D3DViewport::D3DViewport(StudioAppState& state, QWidget* parent)
     connect(timer_, &QTimer::timeout, this, &D3DViewport::tick);
     frame_timer_.start();
     fps_timer_.start();
+
+    gizmo_ = new ViewGizmo(this);
+    gizmo_->setAttribute(Qt::WA_NativeWindow);
+    gizmo_->set_local_mode(state_.is_local_coord);
+    connect(gizmo_, &ViewGizmo::rotateRequested, this, &D3DViewport::rotate_selection);
+    connect(gizmo_, &ViewGizmo::translateRequested, this, &D3DViewport::translate_selection);
+    connect(gizmo_, &ViewGizmo::localModeChanged, this,
+            [this](bool local) { state_.is_local_coord = local; });
+    place_gizmo();
 }
 
 D3DViewport::~D3DViewport() = default;
@@ -75,6 +86,8 @@ bool D3DViewport::initialize() {
                                                          static_cast<std::uint32_t>(height()));
         renderer_ = std::make_unique<render::SceneRenderer>(*context_);
         initialized_ = true;
+        apply_screen_size();
+        place_gizmo();
         core::log_msg("[studio] Direct3D 11 viewport initialized");
         timer_->start();
         return true;
@@ -88,6 +101,7 @@ bool D3DViewport::initialize() {
 void D3DViewport::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
     initialize();
+    place_gizmo();
 }
 
 void D3DViewport::resizeEvent(QResizeEvent* event) {
@@ -96,10 +110,14 @@ void D3DViewport::resizeEvent(QResizeEvent* event) {
         try {
             context_->resize(static_cast<std::uint32_t>(std::max(width(), 1)),
                              static_cast<std::uint32_t>(std::max(height(), 1)));
+            if (state_.screen_size_width <= 0 || state_.screen_size_height <= 0) {
+                apply_screen_size();
+            }
         } catch (const std::exception& error) {
             emit statusMessage(QString::fromUtf8(error.what()));
         }
     }
+    place_gizmo();
 }
 
 bool D3DViewport::load_model(const QString& path) {
@@ -156,6 +174,9 @@ bool D3DViewport::load_model(const QString& path) {
         }
         auto physics_rig = physics::PhysicsRig::create(pmx, rest_positions,
                                                        physics::PhysicsSettings{});
+        if (physics_rig) {
+            physics_rig->set_time_scale(state_.physics_speed);
+        }
         auto jiggle = animation::Jiggle(pmx);
         auto morphs = animation::MorphEvaluator::from_pmx(pmx);
 
@@ -339,12 +360,169 @@ void D3DViewport::request_physics_reset() {
     }
 }
 
+void D3DViewport::set_screen_size(int width, int height) {
+    state_.screen_size_width = width;
+    state_.screen_size_height = height;
+    apply_screen_size();
+}
+
+QSize D3DViewport::effective_screen_size() const {
+    const bool explicit_size = state_.screen_size_width > 0 && state_.screen_size_height > 0;
+    if (explicit_size) {
+        return {state_.screen_size_width, state_.screen_size_height};
+    }
+    return {std::max(width(), 1), std::max(height(), 1)};
+}
+
+QRect D3DViewport::scene_rect() const {
+    const QSize render = effective_screen_size();
+    const float scale =
+        std::min(static_cast<float>(width()) / static_cast<float>(render.width()),
+                 static_cast<float>(height()) / static_cast<float>(render.height()));
+    const int scaled_width =
+        std::max(1, static_cast<int>(std::lround(static_cast<float>(render.width()) * scale)));
+    const int scaled_height =
+        std::max(1, static_cast<int>(std::lround(static_cast<float>(render.height()) * scale)));
+    return {(width() - scaled_width) / 2, (height() - scaled_height) / 2, scaled_width,
+            scaled_height};
+}
+
+void D3DViewport::apply_screen_size() {
+    applied_screen_width_ = state_.screen_size_width;
+    applied_screen_height_ = state_.screen_size_height;
+    if (!context_) {
+        return;
+    }
+    try {
+        if (state_.screen_size_width > 0 && state_.screen_size_height > 0) {
+            context_->set_scene_resolution(static_cast<std::uint32_t>(state_.screen_size_width),
+                                           static_cast<std::uint32_t>(state_.screen_size_height));
+        } else {
+            context_->set_scene_resolution(0, 0);
+        }
+    } catch (const std::exception& error) {
+        emit statusMessage(QString::fromUtf8(error.what()));
+    }
+    place_gizmo();
+    const QSize size = effective_screen_size();
+    emit screenSizeChanged(size.width(), size.height());
+}
+
+void D3DViewport::place_gizmo() {
+    if (gizmo_ == nullptr) {
+        return;
+    }
+    const QRect scene = scene_rect();
+    const int margin = 12;
+    const int x = std::clamp(scene.right() - gizmo_->width() - margin, 0,
+                             std::max(0, width() - gizmo_->width()));
+    const int y = std::clamp(scene.bottom() - gizmo_->height() - margin, 0,
+                             std::max(0, height() - gizmo_->height()));
+    gizmo_->move(x, y);
+    gizmo_->raise();
+}
+
+bool D3DViewport::selected_bone_transform(std::size_t& index) const {
+    if (!skeleton_ || !state_.selected_bone_idx) {
+        return false;
+    }
+    index = static_cast<std::size_t>(*state_.selected_bone_idx);
+    return index < skeleton_->bones.size();
+}
+
+void D3DViewport::rotate_selection(int axis, float degrees) {
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    const float radians = degrees * kDegToRad;
+    std::size_t index = 0;
+    if (state_.mode == EditorMode::Camera || !selected_bone_transform(index)) {
+        if (axis == 0) {
+            state_.camera_pitch = std::clamp(state_.camera_pitch + radians, -1.55f, 1.55f);
+        } else if (axis == 1) {
+            state_.camera_yaw += radians;
+        } else {
+            state_.camera_roll += radians;
+        }
+        return;
+    }
+    apply_editor_bone_override();
+    const Vec3 local_axis(axis == 0 ? 1.0f : 0.0f, axis == 1 ? 1.0f : 0.0f,
+                          axis == 2 ? 1.0f : 0.0f);
+    const Quat delta = Quat::from_axis_angle(local_axis, radians);
+    if (state_.is_local_coord) {
+        skeleton_->local_rotations[index] =
+            (skeleton_->local_rotations[index] * delta).normalize();
+    } else {
+        const Quat world = (delta * skeleton_->world_rotations[index]).normalize();
+        const auto& bone = skeleton_->bones[index];
+        const Quat parent = bone.parent_index
+                                ? skeleton_->world_rotations[*bone.parent_index]
+                                : Quat::identity();
+        skeleton_->local_rotations[index] = (parent.inverse() * world).normalize();
+    }
+    skeleton_->update_transforms();
+    state_.bone_transform_dirty = false;
+}
+
+void D3DViewport::translate_selection(int axis, float amount) {
+    std::size_t index = 0;
+    if (state_.mode == EditorMode::Camera || !selected_bone_transform(index)) {
+        const float cy = std::cos(state_.camera_yaw);
+        const float sy = std::sin(state_.camera_yaw);
+        const float cp = std::cos(state_.camera_pitch);
+        const float sp = std::sin(state_.camera_pitch);
+        const Vec3 right(cy, 0.0f, sy);
+        const Vec3 up(-sp * sy, cp, sp * cy);
+        const Vec3 forward(-cp * sy, -sp, cp * cy);
+        const Vec3 delta = axis == 0 ? right * amount
+                           : axis == 1 ? up * amount
+                                       : forward * amount;
+        state_.camera_pan[0] += delta.x;
+        state_.camera_pan[1] += delta.y;
+        state_.camera_pan[2] += delta.z;
+        return;
+    }
+    const auto& bone = skeleton_->bones[index];
+    const bool movable = (bone.flags & 0x0004) != 0 || bone.has_ik || !bone.parent_index;
+    if (!movable) {
+        return;
+    }
+    apply_editor_bone_override();
+    Vec3 local_delta(axis == 0 ? amount : 0.0f, axis == 1 ? amount : 0.0f,
+                     axis == 2 ? amount : 0.0f);
+    if (!state_.is_local_coord && bone.parent_index) {
+        local_delta = skeleton_->world_rotations[*bone.parent_index].inverse().rotate_vec3(
+            local_delta);
+    }
+    skeleton_->local_translations[index] = skeleton_->local_translations[index] + local_delta;
+    skeleton_->update_transforms();
+    state_.bone_transform_dirty = false;
+}
+
+void D3DViewport::reset_selection_transform() {
+    std::size_t index = 0;
+    if (!selected_bone_transform(index)) {
+        return;
+    }
+    skeleton_->local_translations[index] = Vec3::zero();
+    skeleton_->local_rotations[index] = Quat::identity();
+    skeleton_->update_transforms();
+    state_.bone_transform_dirty = false;
+}
+
+void D3DViewport::reset_camera() {
+    state_.camera_yaw = 0.0f;
+    state_.camera_pitch = 0.15f;
+    state_.camera_roll = 0.0f;
+    state_.camera_distance = 50.0f;
+    state_.camera_pan = {0.0f, 10.0f, 0.0f};
+}
+
 bool D3DViewport::capture_image(const QString& path) {
     if (!context_) {
         return false;
     }
     try {
-        const auto capture = context_->capture_backbuffer();
+        const auto capture = context_->capture_scene();
         core::save_bmp(to_wstring(path), capture.width, capture.height, capture.rgba);
         emit statusMessage(QStringLiteral("Screenshot saved to: %1").arg(path));
         return true;
@@ -378,7 +556,7 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
         }
         render_scene();
         try {
-            const auto capture = context_->capture_backbuffer();
+            const auto capture = context_->capture_scene();
             const QString file = QDir(directory).filePath(
                 QStringLiteral("frame_%1.bmp").arg(frame, 5, 10, QLatin1Char('0')));
             core::save_bmp(to_wstring(file), capture.width, capture.height, capture.rgba);
@@ -413,6 +591,10 @@ void D3DViewport::tick_impl() {
     if (!context_ || !renderer_ || !isVisible()) {
         return;
     }
+    if (state_.screen_size_width != applied_screen_width_ ||
+        state_.screen_size_height != applied_screen_height_) {
+        apply_screen_size();
+    }
     const float dt = std::clamp(frame_timer_.restart() / 1000.0f, 0.0001f, 0.1f);
 
     if (state_.is_playing) {
@@ -446,6 +628,7 @@ void D3DViewport::tick_impl() {
     }
     if (physics_rig_) {
         physics_rig_->set_gravity_vec(state_.gravity);
+        physics_rig_->set_time_scale(state_.physics_speed);
     }
     const bool physics_active =
         state_.physics_mode != PhysicsMode::Disabled &&
@@ -488,7 +671,9 @@ void D3DViewport::tick_impl() {
 
 void D3DViewport::update_camera() {
     camera_.fov_y = state_.camera_fov_deg * 3.14159265358979323846f / 180.0f;
-    camera_.aspect = static_cast<float>(width()) / static_cast<float>(std::max(height(), 1));
+    const QSize render_size = effective_screen_size();
+    camera_.aspect = static_cast<float>(render_size.width()) /
+                     static_cast<float>(std::max(render_size.height(), 1));
     const float cy = std::cos(state_.camera_yaw);
     const float sy = std::sin(state_.camera_yaw);
     const float cp = std::cos(state_.camera_pitch);
@@ -499,6 +684,14 @@ void D3DViewport::update_camera() {
     const Vec3 pan = Vec3::from_array(state_.camera_pan);
     camera_.position = pan + eye_offset;
     camera_.target = pan;
+
+    const Vec3 forward = (camera_.target - camera_.position).normalize();
+    const Vec3 world_up(0.0f, 1.0f, 0.0f);
+    Vec3 right = world_up.cross(forward);
+    right = right.length() > 1.0e-4f ? right.normalize() : Vec3(1.0f, 0.0f, 0.0f);
+    const Vec3 base_up = forward.cross(right).normalize();
+    camera_.up =
+        (base_up * std::cos(state_.camera_roll) + right * std::sin(state_.camera_roll)).normalize();
 }
 
 void D3DViewport::evaluate_frame(float frame) {
@@ -544,10 +737,11 @@ void D3DViewport::apply_editor_bone_override() {
 }
 
 void D3DViewport::render_scene() {
-    context_->bind_default_targets();
+    context_->begin_scene();
     const float clear_color[4] = {0.13f, 0.14f, 0.17f, 1.0f};
     context_->clear(clear_color, 1.0f, 0);
-    context_->set_viewport(static_cast<float>(width()), static_cast<float>(height()));
+    context_->set_viewport(static_cast<float>(context_->render_width),
+                           static_cast<float>(context_->render_height));
     const std::array<float, 4> background =
         state_.viewport_white_bg ? std::array<float, 4>{0.98f, 0.98f, 0.99f, 1.0f}
                                  : std::array<float, 4>{0.19f, 0.22f, 0.27f, 1.0f};
@@ -556,23 +750,32 @@ void D3DViewport::render_scene() {
     if (state_.show_grid) {
         renderer_->render_grid_to(*context_, context_->context.Get());
     }
-    if (!state_.model_visible || !mesh_ || !skeleton_) {
-        draw_overlay();
-        return;
-    }
-    renderer_->wireframe = state_.wireframe;
-    if (state_.multithreaded) {
-        renderer_->skinning_buffer.update(*context_, skeleton_->skinning_palette);
-        const auto lists = renderer_->record_mesh_subsets_parallel(
-            *context_, *mesh_, materials_, textures_, renderer_->skinning_buffer, 4);
-        for (const auto& list : lists) {
-            context_->execute_command_list(list.Get(), false);
+    if (state_.model_visible && mesh_ && skeleton_) {
+        renderer_->wireframe = state_.wireframe;
+        if (state_.multithreaded) {
+            renderer_->skinning_buffer.update(*context_, skeleton_->skinning_palette);
+            const auto lists = renderer_->record_mesh_subsets_parallel(
+                *context_, *mesh_, materials_, textures_, renderer_->skinning_buffer, 4);
+            for (const auto& list : lists) {
+                context_->execute_command_list(list.Get(), false);
+            }
+        } else {
+            renderer_->render_mesh(*context_, *mesh_, materials_, textures_,
+                                   skeleton_->skinning_palette, camera_);
         }
-    } else {
-        renderer_->render_mesh(*context_, *mesh_, materials_, textures_,
-                               skeleton_->skinning_palette, camera_);
     }
     draw_overlay();
+    context_->end_scene();
+
+    if (context_->scene_target_ready()) {
+        const QRect target = scene_rect();
+        const float letterbox[4] = {0.05f, 0.05f, 0.06f, 1.0f};
+        context_->clear_backbuffer(letterbox);
+        context_->blit_scene_to_backbuffer(static_cast<float>(target.x()),
+                                           static_cast<float>(target.y()),
+                                           static_cast<float>(target.width()),
+                                           static_cast<float>(target.height()));
+    }
 }
 
 void D3DViewport::draw_overlay() {
@@ -686,7 +889,7 @@ void D3DViewport::mousePressEvent(QMouseEvent* event) {
                     continue;
                 }
                 const auto projected = project_to_screen(skeleton_->world_positions[i],
-                                                         view_projection, rect());
+                                                         view_projection, scene_rect());
                 if (!projected) {
                     continue;
                 }

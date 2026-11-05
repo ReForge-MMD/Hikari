@@ -11,6 +11,8 @@ add_executable(hikari_studio WIN32
   theme.hpp
   timeline_widget.cpp
   timeline_widget.hpp
+  viewport_chrome.cpp
+  viewport_chrome.hpp
 )
 
 target_link_libraries(hikari_studio

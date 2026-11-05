@@ -273,6 +273,10 @@ void PhysicsRig::set_gravity_vec(const std::array<float, 3>& gravity) {
     world_.set_gravity(value);
 }
 
+void PhysicsRig::set_time_scale(float scale) {
+    settings_.time_scale = std::clamp(scale, 0.1f, 4.0f);
+}
+
 void PhysicsRig::update_targets(const std::vector<BodyTransform>& bone_world) {
     for (std::size_t i = 0; i < targets_.size() && i < bodies_.size(); ++i) {
         const auto& body = bodies_[i];
@@ -288,7 +292,9 @@ const std::vector<std::optional<BoneOverride>>& PhysicsRig::step(
     const std::vector<BodyTransform>& bone_world, float dt) {
     update_targets(bone_world);
 
-    if (needs_reset_ || !(dt > 0.0f) || dt > settings_.max_frame) {
+    const bool invalid_dt = !(dt > 0.0f) || dt > settings_.max_frame;
+    dt *= settings_.time_scale;
+    if (needs_reset_ || invalid_dt) {
         world_.reset(targets_);
         previous_targets_ = targets_;
         needs_reset_ = false;

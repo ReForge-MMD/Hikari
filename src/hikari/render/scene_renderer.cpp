@@ -278,8 +278,8 @@ void SceneRenderer::render_viewport_background(core::D3D11Context& context,
 
 void SceneRenderer::render_grid_to(core::D3D11Context& context, ID3D11DeviceContext* target) {
     context.bind_render_targets_to(target);
-    context.set_viewport_on(target, static_cast<float>(context.width),
-                            static_cast<float>(context.height));
+    context.set_viewport_on(target, static_cast<float>(context.render_width),
+                            static_cast<float>(context.render_height));
     target->RSSetState(
         context.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
     target->RSSetScissorRects(0, nullptr);
@@ -319,8 +319,8 @@ void SceneRenderer::render_mesh_subsets_to(core::D3D11Context& context,
                                            const GpuSkinningBuffer& skinning,
                                            std::size_t first_subset, std::size_t last_subset) {
     context.bind_render_targets_to(target);
-    context.set_viewport_on(target, static_cast<float>(context.width),
-                            static_cast<float>(context.height));
+    context.set_viewport_on(target, static_cast<float>(context.render_width),
+                            static_cast<float>(context.render_height));
     target->IASetInputLayout(input_layout.Get());
     target->VSSetShader(default_vs.Get(), nullptr, 0);
     target->PSSetShader(default_ps.Get(), nullptr, 0);
@@ -487,8 +487,8 @@ void SceneRenderer::render_overlay_lines(core::D3D11Context& context,
 
     auto* target = context.context.Get();
     context.bind_render_targets_to(target);
-    context.set_viewport_on(target, static_cast<float>(context.width),
-                            static_cast<float>(context.height));
+    context.set_viewport_on(target, static_cast<float>(context.render_width),
+                            static_cast<float>(context.render_height));
     target->IASetInputLayout(grid_layout.Get());
     target->VSSetShader(grid_vs.Get(), nullptr, 0);
     target->PSSetShader(grid_ps.Get(), nullptr, 0);

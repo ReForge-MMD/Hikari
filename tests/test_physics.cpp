@@ -29,6 +29,40 @@ TEST_CASE("Jolt world steps a falling body", "[physics]") {
     REQUIRE(transforms[0].position.y < 10.0f);
 }
 
+TEST_CASE("Physics time scale speeds up motion without raising gravity", "[physics]") {
+    hikari::formats::PmxModel model;
+    hikari::formats::PmxRigidBody body;
+    body.name_local = "falling";
+    body.bone_index = -1;
+    body.shape = 0;
+    body.size = {0.5f, 0.5f, 0.5f};
+    body.position = {0.0f, 10.0f, 0.0f};
+    body.mass = 1.0f;
+    body.mode = 1;
+    body.collision_mask = 0xFFFF;
+    model.rigid_bodies = {body};
+
+    hikari::physics::PhysicsSettings slow;
+    slow.gravity = 9.8f;
+    slow.time_scale = 1.0f;
+    hikari::physics::PhysicsSettings fast = slow;
+    fast.time_scale = 3.0f;
+
+    auto slow_rig = hikari::physics::PhysicsRig::create(model, {}, slow);
+    auto fast_rig = hikari::physics::PhysicsRig::create(model, {}, fast);
+    REQUIRE(slow_rig.has_value());
+    REQUIRE(fast_rig.has_value());
+
+    const std::vector<hikari::physics::BodyTransform> bones;
+    for (int i = 0; i < 12; ++i) {
+        slow_rig->step(bones, 1.0f / 60.0f);
+        fast_rig->step(bones, 1.0f / 60.0f);
+    }
+    const float slow_y = slow_rig->body_transforms()[0].position.y;
+    const float fast_y = fast_rig->body_transforms()[0].position.y;
+    REQUIRE(fast_y < slow_y);
+}
+
 TEST_CASE("Physics rig builds bodies and joints from a PMX model", "[physics]") {
     hikari::formats::PmxModel model;
     hikari::formats::PmxBone bone;

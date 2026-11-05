@@ -62,8 +62,15 @@ bodies and jiggle regions. VMD motions drive the timeline; VPD poses can be load
 saved; frame sequences are captured to BMP.
 
 Viewport controls: right drag orbits, middle drag pans, wheel zooms, left click selects
-a bone. `Space` play/pause, `V` VSync, `P` physics, `J` jiggle, `M` multithreaded
-deferred rendering, `R` reset physics.
+a bone. The bottom-right gizmo rotates (first row) and moves (second row) the selected
+bone or the camera; click its title to switch between local and global axes. `Space`
+play/pause, `V` VSync, `P` physics, `J` jiggle, `M` multithreaded deferred rendering,
+`R` reset physics.
+
+Screen Size sets the offscreen viewport render resolution and aspect ratio; the
+application window keeps its size and the image is letterboxed. Physics speed
+(`Physical Operation > Simulation Speed`) scales the simulation rate without changing
+gravity, so hair and cloth react faster without extra sag.
 
 The editor provides model, bone, facial, camera, light, shadow, accessory, view,
 playback and interpolation panels. Skeleton bones and Jolt rigid bodies/joints are

@@ -5,6 +5,7 @@
 
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
+    application.setStyle(QStringLiteral("Fusion"));
     application.setApplicationName(QStringLiteral("Hikari Studio"));
     application.setOrganizationName(QStringLiteral("Hikari"));
     application.setApplicationVersion(QStringLiteral("1.0.0"));

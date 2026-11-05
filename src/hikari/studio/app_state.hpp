@@ -47,7 +47,7 @@ struct StudioAppState {
     std::array<float, 3> bone_pos_override{0.0f, 0.0f, 0.0f};
     std::array<float, 3> bone_rot_euler_deg{0.0f, 0.0f, 0.0f};
     bool bone_transform_dirty = false;
-    bool is_local_coord = false;
+    bool is_local_coord = true;
     BoneTransformMode bone_mode = BoneTransformMode::Select;
     bool box_select_active = false;
     bool show_bones = true;
@@ -90,9 +90,10 @@ struct StudioAppState {
     float accessory_alpha = 1.0f;
     bool accessory_shadow = true;
 
-    float camera_distance = 35.0f;
+    float camera_distance = 50.0f;
     float camera_yaw = 0.0f;
     float camera_pitch = 0.15f;
+    float camera_roll = 0.0f;
     std::array<float, 3> camera_pan{0.0f, 10.0f, 0.0f};
     float camera_fov_deg = 30.0f;
     bool camera_orthographic = false;
@@ -104,6 +105,7 @@ struct StudioAppState {
     bool show_joints = false;
     std::array<float, 3> gravity{0.0f, -9.8f, 0.0f};
     float gravity_noise = 0.0f;
+    float physics_speed = 3.0f;
     bool reset_physics_requested = false;
 
     FpsLimit fps_limit = FpsLimit::Fps60;
@@ -125,8 +127,8 @@ struct StudioAppState {
     bool vsync = false;
 
     EffectDialogState effect_state;
-    int screen_size_width = 1920;
-    int screen_size_height = 1080;
+    int screen_size_width = 1280;
+    int screen_size_height = 720;
     int video_render_start_frame = 0;
     int video_render_end_frame = 300;
     int video_render_fps = 30;

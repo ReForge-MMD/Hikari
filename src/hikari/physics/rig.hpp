@@ -23,6 +23,7 @@ struct PhysicsSettings {
     float spring_damping_ratio = 0.30f;
     float spring_scale = 1.0f;
     float extra_damping = 0.02f;
+    float time_scale = 1.0f;
     RestOverlaps rest_overlaps = RestOverlaps::IgnoreDynamic;
 };
 
@@ -68,6 +69,7 @@ public:
     void request_reset() { needs_reset_ = true; }
     void set_gravity(float gravity);
     void set_gravity_vec(const std::array<float, 3>& gravity);
+    void set_time_scale(float scale);
 
     const std::vector<std::optional<BoneOverride>>& step(const std::vector<BodyTransform>& bone_world,
                                                          float dt);

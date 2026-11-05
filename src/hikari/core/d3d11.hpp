@@ -51,6 +51,8 @@ public:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> depth_stencil_texture;
     std::uint32_t width = 1;
     std::uint32_t height = 1;
+    std::uint32_t render_width = 1;
+    std::uint32_t render_height = 1;
     HWND hwnd = nullptr;
     D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
 
@@ -121,6 +123,13 @@ public:
     void clear(const float color[4], float depth, std::uint8_t stencil) const;
     void present(std::uint32_t sync_interval) const;
 
+    void set_scene_resolution(std::uint32_t scene_width, std::uint32_t scene_height);
+    bool scene_target_ready() const { return scene_rtv_ != nullptr; }
+    void begin_scene();
+    void end_scene();
+    void clear_backbuffer(const float color[4]) const;
+    void blit_scene_to_backbuffer(float x, float y, float w, float h);
+
     void recreate_composite(std::uint32_t width, std::uint32_t height);
     void render_composite(ID3D11ShaderResourceView* scene_srv);
     std::vector<std::uint8_t> readback_model_layer();
@@ -158,8 +167,23 @@ public:
         std::vector<std::uint8_t> rgba;
     };
     CaptureResult capture_backbuffer();
+    CaptureResult capture_scene();
 
 private:
+    void ensure_blit_shaders();
+    void create_scene_targets(std::uint32_t scene_width, std::uint32_t scene_height);
+
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> backbuffer_rtv_;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> backbuffer_dsv_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_tex_;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> scene_rtv_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> scene_srv_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_depth_tex_;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> scene_dsv_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> scene_staging_;
+    std::pair<std::uint32_t, std::uint32_t> scene_size_{0, 0};
+    std::pair<std::uint32_t, std::uint32_t> scene_staging_size_{0, 0};
+    bool scene_active_ = false;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> capture_staging_;
     std::pair<std::uint32_t, std::uint32_t> capture_size_{0, 0};
 };

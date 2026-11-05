@@ -34,6 +34,12 @@ QSize TimelineWidget::sizeHint() const {
     return {300, 520};
 }
 
+void TimelineWidget::refresh_layout() {
+    const int rows = channels().size();
+    setMinimumHeight(kRulerHeight + rows * kRowHeight + 4);
+    updateGeometry();
+}
+
 QStringList TimelineWidget::channels() const {
     QStringList list;
     if (state_.mode == EditorMode::Camera) {

@@ -12,6 +12,7 @@ public:
     explicit TimelineWidget(StudioAppState& state, QWidget* parent = nullptr);
 
     QSize sizeHint() const override;
+    void refresh_layout();
 
 signals:
     void boneSelected(int index);
