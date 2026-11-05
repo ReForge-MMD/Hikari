@@ -1,6 +1,7 @@
 #include "hikari/studio/viewport_chrome.hpp"
 
 #include <QDoubleSpinBox>
+#include <QCursor>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMouseEvent>
@@ -8,7 +9,6 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QSpinBox>
-#include <QTimer>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -25,6 +25,9 @@ constexpr int kMargin = 6;
 constexpr int kHeader = 18;
 constexpr int kColumns = 3;
 constexpr int kRows = 2;
+
+constexpr float kRotateDegreesPerPixel = 0.5f;
+constexpr float kTranslateUnitsPerPixel = 0.02f;
 
 const QColor kAxisColor[3] = {QColor(0xd0, 0x5a, 0x5a), QColor(0x62, 0xb4, 0x5c),
                               QColor(0x5b, 0x86, 0xc8)};
@@ -97,20 +100,9 @@ ViewGizmo::ViewGizmo(QWidget* parent) : QWidget(parent) {
                  kMargin * 2 + kHeader + kRows * kCell + (kRows - 1) * kGap);
     setMouseTracking(true);
     setCursor(Qt::PointingHandCursor);
-    setToolTip(QStringLiteral("Row 1 rotates, row 2 moves the camera or the selected bone"));
-    repeat_ = new QTimer(this);
-    repeat_->setInterval(90);
-    connect(repeat_, &QTimer::timeout, this, [this] {
-        if (pressed_ < 0) {
-            stop_repeat();
-            return;
-        }
-        ++repeat_ticks_;
-        if (repeat_ticks_ == 6) {
-            repeat_->setInterval(45);
-        }
-        trigger(pressed_);
-    });
+    setToolTip(QStringLiteral(
+        "Row 1 rotates, row 2 moves the camera or the selected bone\n"
+        "Drag up or down to adjust"));
 }
 
 QSize ViewGizmo::sizeHint() const { return size(); }
@@ -189,17 +181,16 @@ void ViewGizmo::mousePressEvent(QMouseEvent* event) {
         return;
     }
     pressed_ = cell;
-    repeat_ticks_ = 0;
-    repeat_->setInterval(90);
-    trigger(cell);
-    repeat_->start();
+    drag_anchor_ = event->globalPosition().toPoint();
+    dragging_ = true;
+    grabMouse();
     update();
     event->accept();
 }
 
 void ViewGizmo::mouseReleaseEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton) {
-        stop_repeat();
+        end_drag();
         pressed_ = -1;
         update();
         event->accept();
@@ -207,6 +198,26 @@ void ViewGizmo::mouseReleaseEvent(QMouseEvent* event) {
 }
 
 void ViewGizmo::mouseMoveEvent(QMouseEvent* event) {
+    if (dragging_) {
+        if (!(event->buttons() & Qt::LeftButton)) {
+            end_drag();
+            pressed_ = -1;
+            update();
+            event->accept();
+            return;
+        }
+        const int delta_y = event->globalPosition().toPoint().y() - drag_anchor_.y();
+        if (delta_y != 0) {
+            if (!cursor_hidden_) {
+                setCursor(Qt::BlankCursor);
+                cursor_hidden_ = true;
+            }
+            drag_by(delta_y);
+            QCursor::setPos(drag_anchor_);
+        }
+        event->accept();
+        return;
+    }
     const int cell = cell_at(event->pos());
     if (cell != hovered_) {
         hovered_ = cell;
@@ -216,22 +227,32 @@ void ViewGizmo::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void ViewGizmo::leaveEvent(QEvent* event) {
-    hovered_ = -1;
-    update();
+    if (!dragging_) {
+        hovered_ = -1;
+        update();
+    }
     QWidget::leaveEvent(event);
 }
 
-void ViewGizmo::stop_repeat() {
-    repeat_->stop();
-    repeat_ticks_ = 0;
+void ViewGizmo::end_drag() {
+    if (!dragging_) {
+        return;
+    }
+    dragging_ = false;
+    if (cursor_hidden_) {
+        cursor_hidden_ = false;
+        setCursor(Qt::PointingHandCursor);
+    }
+    releaseMouse();
 }
 
-void ViewGizmo::trigger(int cell) {
-    const int axis = cell % kColumns;
-    if (cell < kColumns) {
-        emit rotateRequested(axis, 3.0f);
+void ViewGizmo::drag_by(int delta_y) {
+    const float pixels = -static_cast<float>(delta_y);
+    const int axis = pressed_ % kColumns;
+    if (pressed_ < kColumns) {
+        emit rotateRequested(axis, pixels * kRotateDegreesPerPixel);
     } else {
-        emit translateRequested(axis, 0.15f);
+        emit translateRequested(axis, pixels * kTranslateUnitsPerPixel);
     }
 }
 

@@ -6,14 +6,14 @@ class QDoubleSpinBox;
 class QLabel;
 class QPushButton;
 class QSpinBox;
-class QTimer;
 
 namespace hikari::studio {
 
 struct StudioAppState;
 
 // MMD-style local/global axis pad: the first row rotates the active target,
-// the second row translates it.
+// the second row translates it. Dragging up or down adjusts the value
+// continuously with a pointer-locked cursor; a plain press does nothing.
 class ViewGizmo : public QWidget {
     Q_OBJECT
 public:
@@ -36,14 +36,15 @@ protected:
 
 private:
     int cell_at(const QPoint& point) const;
-    void trigger(int cell);
-    void stop_repeat();
+    void drag_by(int delta_y);
+    void end_drag();
 
     bool local_ = true;
     int hovered_ = -1;
     int pressed_ = -1;
-    QTimer* repeat_ = nullptr;
-    int repeat_ticks_ = 0;
+    QPoint drag_anchor_;
+    bool dragging_ = false;
+    bool cursor_hidden_ = false;
 };
 
 // Top strip of the viewport: active target title and frame scrubber.
