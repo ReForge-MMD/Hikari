@@ -95,6 +95,7 @@ private:
     void update_stats();
     void tick();
     void tick_impl();
+    bool physics_active() const;
     void render_scene();
     render::OverlayGeometry build_overlay_geometry() const;
     void update_camera();
@@ -140,6 +141,7 @@ private:
     bool right_down_ = false;
     bool middle_down_ = false;
     bool initialized_ = false;
+    bool physics_was_active_ = false;
     float last_editor_frame_ = -1.0f;
 };
 

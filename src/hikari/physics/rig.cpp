@@ -262,6 +262,15 @@ std::size_t PhysicsRig::dynamic_count() const {
                       [](const RigBody& body) { return body.mode != 0; }));
 }
 
+void PhysicsRig::reset(const std::vector<BodyTransform>& bone_world) {
+    update_targets(bone_world);
+    world_.reset(targets_);
+    previous_targets_ = targets_;
+    current_ = targets_;
+    needs_reset_ = false;
+    accumulator_ = 0.0f;
+}
+
 void PhysicsRig::set_gravity(float gravity) {
     settings_.gravity = gravity;
     world_.set_gravity(Vec3(0.0f, -gravity, 0.0f));

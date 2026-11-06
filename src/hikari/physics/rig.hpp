@@ -67,6 +67,9 @@ public:
     const std::vector<std::string>& names() const { return names_; }
 
     void request_reset() { needs_reset_ = true; }
+    // Teleport every body to the pose derived from the supplied bones and clear
+    // accumulated simulation state. Used when physics is switched off.
+    void reset(const std::vector<BodyTransform>& bone_world);
     void set_gravity(float gravity);
     void set_gravity_vec(const std::array<float, 3>& gravity);
     void set_ground_enabled(bool enabled);

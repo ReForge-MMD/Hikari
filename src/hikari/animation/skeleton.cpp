@@ -558,6 +558,21 @@ std::vector<physics::BodyTransform> Skeleton::get_bone_world_transforms() const 
     return transforms;
 }
 
+void Skeleton::reset_physics_bones(const physics::PhysicsRig& rig) {
+    bool changed = false;
+    for (std::size_t i = 0; i < bones.size(); ++i) {
+        if (!rig.is_bone_driven(i)) {
+            continue;
+        }
+        local_translations[i] = Vec3::zero();
+        local_rotations[i] = Quat::identity();
+        changed = true;
+    }
+    if (changed) {
+        update_transforms();
+    }
+}
+
 void Skeleton::apply_physics(physics::PhysicsRig& rig, float dt) {
     fill_bone_world_transforms(bone_transform_scratch_);
     const auto& overrides = rig.step(bone_transform_scratch_, dt);

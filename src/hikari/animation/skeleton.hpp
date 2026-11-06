@@ -80,6 +80,9 @@ public:
     void update_subtree(std::size_t index);
 
     std::vector<physics::BodyTransform> get_bone_world_transforms() const;
+    // Restore physics-driven bones to the authored rest pose. Used when physics
+    // is disabled so the model does not freeze in its last simulated state.
+    void reset_physics_bones(const physics::PhysicsRig& rig);
     void apply_physics(physics::PhysicsRig& rig, float dt);
     void apply_jiggle(Jiggle& jiggle, float dt, const JiggleSettings& settings);
 

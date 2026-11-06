@@ -1243,7 +1243,7 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
                                                       impulse.velocity, impulse.torque);
                 }
             }
-            if (state_.physics_mode != PhysicsMode::Disabled && model->physics_rig) {
+            if (physics_active() && model->physics_rig) {
                 model->skeleton.apply_physics(*model->physics_rig,
                                               1.0f / static_cast<float>(std::max(fps, 1)));
             }
@@ -1339,10 +1339,17 @@ void D3DViewport::tick_impl() {
         state_.reset_physics_requested = false;
         request_physics_reset();
     }
-    const bool physics_active =
-        state_.physics_mode != PhysicsMode::Disabled &&
-        (!state_.playtime_only || state_.is_playing);
+    const bool physics_active_now = physics_active();
     for (auto& model : models_) {
+        if (!physics_active_now && model.get() != active) {
+            if (model->jiggle) {
+                model->jiggle->reset();
+            }
+            if (model->physics_rig) {
+                model->skeleton.reset_physics_bones(*model->physics_rig);
+            }
+            model->skeleton.update_transforms();
+        }
         const animation::MorphResult morph_result = model->morphs.evaluate();
         apply_bone_morphs(*model, morph_result);
         if (model.get() == active) {
@@ -1352,21 +1359,28 @@ void D3DViewport::tick_impl() {
             model->physics_rig->set_gravity_vec(state_.gravity);
             model->physics_rig->set_time_scale(state_.physics_speed);
             model->physics_rig->set_ground_enabled(state_.ground_collision);
-            for (const auto& impulse : morph_result.impulses) {
-                model->physics_rig->apply_impulse(impulse.body_index, impulse.local,
-                                                  impulse.velocity, impulse.torque);
+            if (physics_active_now) {
+                for (const auto& impulse : morph_result.impulses) {
+                    model->physics_rig->apply_impulse(impulse.body_index, impulse.local,
+                                                      impulse.velocity, impulse.torque);
+                }
+            }
+            if (!physics_active_now && physics_was_active_) {
+                // Switching physics off parks the bodies at the authored pose.
+                model->physics_rig->reset(model->skeleton.get_bone_world_transforms());
             }
         }
-        if (physics_active && model->physics_rig) {
+        if (physics_active_now && model->physics_rig) {
             model->skeleton.apply_physics(*model->physics_rig, dt);
         }
-        if (state_.jiggle_enabled && model->jiggle) {
+        if (physics_active_now && state_.jiggle_enabled && model->jiggle) {
             model->skeleton.apply_jiggle(*model->jiggle, dt, model->jiggle_settings);
         }
         apply_material_morphs(*model, morph_result);
         model->mesh.apply_morph_offsets(*context_, morph_result.position_offsets,
                                         morph_result.uv_offsets);
     }
+    physics_was_active_ = physics_active_now;
 
     render_scene();
     context_->present(state_.vsync || state_.fps_limit == FpsLimit::Fps60 ? 1 : 0);
@@ -1416,8 +1430,24 @@ void D3DViewport::update_camera() {
         (base_up * std::cos(state_.camera_roll) + right * std::sin(state_.camera_roll)).normalize();
 }
 
+bool D3DViewport::physics_active() const {
+    return state_.physics_mode != PhysicsMode::Disabled &&
+           (!state_.playtime_only || state_.is_playing);
+}
+
 void D3DViewport::evaluate_frame(float frame) {
     ModelInstance* model = active_model();
+    if (model != nullptr && !physics_active()) {
+        // MMD freezes physics off at the authored pose, not at the last simulated one.
+        // Breast/hip jiggle is a separate spring layer, so it must be cleared too.
+        if (model->jiggle) {
+            model->jiggle->reset();
+        }
+        if (model->physics_rig) {
+            model->skeleton.reset_physics_bones(*model->physics_rig);
+        }
+        model->skeleton.update_transforms();
+    }
     if (frame != last_editor_frame_) {
         // A pending scale edit belongs to the frame where it was made. Moving the
         // playhead hands control back to the authored scale track.
@@ -2127,6 +2157,9 @@ void D3DViewport::keyPressEvent(QKeyEvent* event) {
         state_.physics_mode = state_.physics_mode == PhysicsMode::Disabled
                                   ? PhysicsMode::Anytime
                                   : PhysicsMode::Disabled;
+        emit statusMessage(state_.physics_mode == PhysicsMode::Disabled
+                               ? QStringLiteral("Physics disabled")
+                               : QStringLiteral("Physics enabled"));
         break;
     case Qt::Key_J:
         state_.jiggle_enabled = !state_.jiggle_enabled;

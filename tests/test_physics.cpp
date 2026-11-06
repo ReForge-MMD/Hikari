@@ -1,6 +1,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include "hikari/animation/skeleton.hpp"
 #include "hikari/physics/rig.hpp"
 #include "hikari/physics/world.hpp"
 
@@ -95,6 +96,42 @@ TEST_CASE("Physics time scale speeds up motion without raising gravity", "[physi
     const float slow_y = slow_rig->body_transforms()[0].position.y;
     const float fast_y = fast_rig->body_transforms()[0].position.y;
     REQUIRE(fast_y < slow_y);
+}
+
+TEST_CASE("Disabling physics restores driven bones to the rest pose", "[physics]") {
+    hikari::formats::PmxModel model;
+    hikari::formats::PmxBone bone;
+    bone.name_local = "hair";
+    bone.position = {0.0f, 10.0f, 0.0f};
+    model.bones = {bone};
+
+    hikari::formats::PmxRigidBody body;
+    body.name_local = "hair_body";
+    body.bone_index = 0;
+    body.shape = 0;
+    body.size = {0.5f, 0.5f, 0.5f};
+    body.position = {0.0f, 10.0f, 0.0f};
+    body.mass = 1.0f;
+    body.mode = 1;
+    body.collision_mask = 0xFFFF;
+    model.rigid_bodies = {body};
+
+    auto rig = hikari::physics::PhysicsRig::create(model, {{0.0f, 10.0f, 0.0f}},
+                                                   hikari::physics::PhysicsSettings{});
+    REQUIRE(rig.has_value());
+    REQUIRE(rig->is_bone_driven(0));
+
+    auto skeleton = hikari::animation::Skeleton::from_pmx(model);
+    skeleton.local_translations[0] = {1.0f, 2.0f, 3.0f};
+    skeleton.local_rotations[0] =
+        hikari::Quat::from_axis_angle(hikari::Vec3::axis_z(), 0.5f);
+    skeleton.update_transforms();
+
+    skeleton.reset_physics_bones(*rig);
+    REQUIRE(skeleton.local_translations[0].x == Catch::Approx(0.0f));
+    REQUIRE(skeleton.local_translations[0].y == Catch::Approx(0.0f));
+    REQUIRE(skeleton.local_translations[0].z == Catch::Approx(0.0f));
+    REQUIRE(skeleton.local_rotations[0].w == Catch::Approx(1.0f));
 }
 
 TEST_CASE("Physics rig builds bodies and joints from a PMX model", "[physics]") {
