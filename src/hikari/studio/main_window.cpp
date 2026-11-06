@@ -984,6 +984,14 @@ QWidget* MainWindow::build_camera_tab() {
     add_row(grid, 2, QStringLiteral("Yaw"), yaw);
     add_row(grid, 3, QStringLiteral("Pitch"), pitch);
     add_row(grid, 4, QStringLiteral("Roll"), roll);
+    camera_target_ = new QComboBox();
+    camera_target_->addItems({QStringLiteral("Free"), QStringLiteral("Model"),
+                              QStringLiteral("Selected bone")});
+    camera_target_->setCurrentIndex(static_cast<int>(state_.camera_target));
+    camera_target_->setToolTip(
+        QStringLiteral("Camera rotation pivot in model mode: free point, model center, "
+                       "or the selected bone."));
+    add_row(grid, 5, QStringLiteral("Target"), camera_target_);
     layout->addLayout(grid);
 
     auto* row = new QHBoxLayout();
@@ -1025,6 +1033,14 @@ QWidget* MainWindow::build_camera_tab() {
         if (roll->hasFocus()) {
             state_.mode = EditorMode::Camera;
         }
+    });
+    connect(camera_target_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        state_.camera_target = static_cast<CameraTarget>(std::clamp(index, 0, 2));
+        statusBar()->showMessage(
+            index == 1 ? QStringLiteral("Camera target: model")
+                       : index == 2 ? QStringLiteral("Camera target: selected bone")
+                                    : QStringLiteral("Camera target: free"),
+            5000);
     });
     connect(reset, &QPushButton::clicked, this, [this, distance, fov, yaw, pitch, roll] {
         viewport_->reset_camera();
@@ -1502,6 +1518,11 @@ void MainWindow::refresh_morph_combos() {
 }
 
 void MainWindow::sync_bone_fields() {
+    if (camera_target_ != nullptr && !camera_target_->hasFocus()) {
+        camera_target_->blockSignals(true);
+        camera_target_->setCurrentIndex(static_cast<int>(state_.camera_target));
+        camera_target_->blockSignals(false);
+    }
     if (model_scale_ != nullptr && !model_scale_->hasFocus()) {
         model_scale_->blockSignals(true);
         model_scale_->setValue(state_.model_scale);

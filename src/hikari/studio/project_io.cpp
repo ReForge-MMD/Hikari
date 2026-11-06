@@ -364,6 +364,7 @@ QByteArray hkp_to_json(const ProjectData& project) {
     scene[QStringLiteral("camera_distance")] = project.scene.camera_distance;
     scene[QStringLiteral("camera_fov_deg")] = project.scene.camera_fov_deg;
     scene[QStringLiteral("camera_orthographic")] = project.scene.camera_orthographic;
+    scene[QStringLiteral("camera_target")] = static_cast<int>(project.scene.camera_target);
     scene[QStringLiteral("light_color")] = to_json(project.scene.light_color);
     scene[QStringLiteral("light_direction")] = to_json(project.scene.light_direction);
     scene[QStringLiteral("shadow_mode")] = static_cast<int>(project.scene.shadow_mode);
@@ -445,6 +446,8 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
         static_cast<float>(scene.value(QStringLiteral("camera_fov_deg")).toDouble(30.0));
     project.scene.camera_orthographic =
         scene.value(QStringLiteral("camera_orthographic")).toBool(false);
+    project.scene.camera_target = static_cast<CameraTarget>(
+        std::clamp(scene.value(QStringLiteral("camera_target")).toInt(0), 0, 2));
     project.scene.light_color =
         read_vec3(scene.value(QStringLiteral("light_color")), {0.6f, 0.6f, 0.6f});
     project.scene.light_direction =

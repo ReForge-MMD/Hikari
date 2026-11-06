@@ -87,6 +87,7 @@ private:
     QComboBox* physics_speed_ = nullptr;
     QActionGroup* physics_speed_group_ = nullptr;
     QComboBox* model_combo_ = nullptr;
+    QComboBox* camera_target_ = nullptr;
     QCheckBox* model_visible_ = nullptr;
     QDoubleSpinBox* model_scale_ = nullptr;
     QCheckBox* bone_ik_ = nullptr;

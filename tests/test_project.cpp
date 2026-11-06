@@ -108,6 +108,7 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     project.scene.camera_pan = {1.0f, 2.0f, 3.0f};
     project.scene.camera_yaw = 0.3f;
     project.scene.camera_distance = 25.0f;
+    project.scene.camera_target = hikari::studio::CameraTarget::SelectedBone;
     project.scene.shadow_mode = hikari::studio::ShadowMode::Mode2;
     project.scene.gravity = {0.0f, -9.8f, 0.5f};
 
@@ -147,6 +148,7 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE(parsed->play_end == 100);
     REQUIRE_FALSE(parsed->camera_mode);
     REQUIRE(parsed->scene.camera_pan[1] == Catch::Approx(2.0f));
+    REQUIRE(parsed->scene.camera_target == hikari::studio::CameraTarget::SelectedBone);
     REQUIRE(parsed->scene.shadow_mode == hikari::studio::ShadowMode::Mode2);
     REQUIRE(parsed->models.size() == 2);
     REQUIRE(parsed->models[0].path == "models/first.pmx");

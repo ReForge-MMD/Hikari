@@ -47,6 +47,7 @@ struct ProjectScene {
     float camera_distance = 50.0f;
     float camera_fov_deg = 30.0f;
     bool camera_orthographic = false;
+    CameraTarget camera_target = CameraTarget::Free;
     std::array<float, 3> light_color{0.6f, 0.6f, 0.6f};
     std::array<float, 3> light_direction{-0.5f, -1.0f, -0.5f};
     ShadowMode shadow_mode = ShadowMode::Mode1;

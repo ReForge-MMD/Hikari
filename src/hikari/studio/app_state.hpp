@@ -17,6 +17,7 @@
 namespace hikari::studio {
 
 enum class EditorMode { Model, Camera };
+enum class CameraTarget { Free, Model, SelectedBone };
 enum class BoneTransformMode { Select, Rotate, Move };
 enum class MorphCategory { Eyes = 0, Mouth = 1, Brow = 2, Other = 3 };
 enum class PhysicsMode { Always, Anytime, Trace, Disabled };
@@ -133,7 +134,7 @@ struct StudioAppState {
     std::array<float, 3> camera_pan{0.0f, 10.0f, 0.0f};
     float camera_fov_deg = 30.0f;
     bool camera_orthographic = false;
-    QString follow_bone;
+    CameraTarget camera_target = CameraTarget::Free;
 
     PhysicsMode physics_mode = PhysicsMode::Anytime;
     bool playtime_only = false;

@@ -836,6 +836,7 @@ bool D3DViewport::save_project(const QString& path) {
     project.scene.camera_distance = state_.camera_distance;
     project.scene.camera_fov_deg = state_.camera_fov_deg;
     project.scene.camera_orthographic = state_.camera_orthographic;
+    project.scene.camera_target = state_.camera_target;
     project.scene.light_color = state_.light_color;
     project.scene.light_direction = state_.light_direction;
     project.scene.shadow_mode = state_.shadow_mode;
@@ -936,6 +937,7 @@ bool D3DViewport::load_project(const QString& path) {
     state_.camera_distance = project->scene.camera_distance;
     state_.camera_fov_deg = project->scene.camera_fov_deg;
     state_.camera_orthographic = project->scene.camera_orthographic;
+    state_.camera_target = project->scene.camera_target;
     state_.light_color = project->scene.light_color;
     state_.light_direction = project->scene.light_direction;
     state_.shadow_mode = project->scene.shadow_mode;
@@ -1184,6 +1186,7 @@ void D3DViewport::reset_camera() {
     state_.camera_yaw = 0.0f;
     state_.camera_pitch = 0.15f;
     state_.camera_roll = 0.0f;
+    state_.camera_target = CameraTarget::Free;
     const ModelInstance* model = active_model();
     if (model == nullptr) {
         state_.camera_distance = 50.0f;
@@ -1330,12 +1333,12 @@ void D3DViewport::tick_impl() {
         remove_active_model();
     }
 
-    update_camera();
     ModelInstance* active = active_model();
     if (!motion_player_ && active != nullptr) {
         active->morphs.reset();
     }
     evaluate_frame(state_.current_frame);
+    update_camera();
 
     if (active != nullptr) {
         for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
@@ -1426,7 +1429,28 @@ void D3DViewport::update_camera() {
     const Vec3 eye_offset(state_.camera_distance * cp * sy,
                           state_.camera_distance * sp,
                           -state_.camera_distance * cp * cy);
-    const Vec3 pan = Vec3::from_array(state_.camera_pan);
+    Vec3 pan = Vec3::from_array(state_.camera_pan);
+    if (state_.mode == EditorMode::Model && state_.camera_target != CameraTarget::Free) {
+        if (const ModelInstance* model = active_model()) {
+            bool resolved = false;
+            if (state_.camera_target == CameraTarget::Model) {
+                pan = (model->bounds_min + model->bounds_max) * 0.5f * model->scale +
+                      model->offset;
+                resolved = true;
+            } else if (state_.camera_target == CameraTarget::SelectedBone &&
+                       state_.selected_bone_idx) {
+                const std::size_t index =
+                    static_cast<std::size_t>(*state_.selected_bone_idx);
+                if (index < model->skeleton.world_positions.size()) {
+                    pan = model->skeleton.world_positions[index] * model->scale + model->offset;
+                    resolved = true;
+                }
+            }
+            if (resolved) {
+                state_.camera_pan = pan.to_array();
+            }
+        }
+    }
     camera_.position = pan + eye_offset;
     camera_.target = pan;
 
@@ -2130,6 +2154,10 @@ void D3DViewport::mouseMoveEvent(QMouseEvent* event) {
         state_.camera_pitch =
             std::clamp(state_.camera_pitch + static_cast<float>(delta.y()) * 0.005f, -1.55f, 1.55f);
     } else if (middle_down_) {
+        if (state_.mode == EditorMode::Model && state_.camera_target != CameraTarget::Free) {
+            event->accept();
+            return;
+        }
         const float cy = std::cos(state_.camera_yaw);
         const float sy = std::sin(state_.camera_yaw);
         const float cp = std::cos(state_.camera_pitch);
