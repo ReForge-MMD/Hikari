@@ -5,6 +5,7 @@ add_executable(hikari_tests
   test_formats.cpp
   test_math.cpp
   test_physics.cpp
+  test_skinning.cpp
 )
 
 target_link_libraries(hikari_tests
@@ -13,6 +14,7 @@ target_link_libraries(hikari_tests
     hikari_formats
     hikari_animation
     hikari_physics
+    hikari_render
     hikari_core
     Catch2::Catch2WithMain
 )

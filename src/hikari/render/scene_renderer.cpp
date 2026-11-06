@@ -28,9 +28,7 @@ cbuffer MaterialParams : register(b1) {
     float EdgeSize;
     float4 EdgeColor;
 };
-cbuffer BoneMatrices : register(b2) {
-    row_major float4x4 Bones[512];
-};
+StructuredBuffer<float4> BoneRows : register(t0);
 struct VS_INPUT {
     float3 position : POSITION;
     float3 normal : NORMAL;
@@ -44,14 +42,19 @@ struct VS_OUTPUT {
     float2 uv : TEXCOORD;
     float3 pos_world : TEXCOORD1;
 };
+float4x4 load_bone(uint index) {
+    const uint base = index * 4u;
+    return float4x4(BoneRows[base], BoneRows[base + 1u], BoneRows[base + 2u],
+                    BoneRows[base + 3u]);
+}
 VS_OUTPUT VS_Main(VS_INPUT input) {
     VS_OUTPUT output;
     float total_w = input.bone_weights.x + input.bone_weights.y + input.bone_weights.z + input.bone_weights.w;
     float4 weights = (total_w > 0.0001f) ? (input.bone_weights / total_w) : float4(1.0f, 0.0f, 0.0f, 0.0f);
-    float4x4 skin_matrix = Bones[input.bone_indices.x] * weights.x
-                        + Bones[input.bone_indices.y] * weights.y
-                        + Bones[input.bone_indices.z] * weights.z
-                        + Bones[input.bone_indices.w] * weights.w;
+    float4x4 skin_matrix = load_bone(input.bone_indices.x) * weights.x
+                        + load_bone(input.bone_indices.y) * weights.y
+                        + load_bone(input.bone_indices.z) * weights.z
+                        + load_bone(input.bone_indices.w) * weights.w;
     float4 pos_world = mul(float4(input.position, 1.0f), skin_matrix);
     float3 norm_world = normalize(mul(float4(input.normal, 0.0f), skin_matrix).xyz);
     output.pos_world = pos_world.xyz;
@@ -131,7 +134,7 @@ Microsoft::WRL::ComPtr<T> make_shader(ID3D11Device* device,
 } // namespace
 
 SceneRenderer::SceneRenderer(core::D3D11Context& context)
-    : skinning_buffer(context), default_white_texture([&] {
+    : default_white_texture([&] {
           const std::uint8_t white[4] = {255, 255, 255, 255};
           return GpuTexture::create_solid_color(context, white);
       }()) {
@@ -417,7 +420,7 @@ void SceneRenderer::render_mesh_subsets_to(core::D3D11Context& context,
     ID3D11Buffer* camera_buffers[] = {camera_buffer.Get()};
     target->VSSetConstantBuffers(0, 1, camera_buffers);
     target->PSSetConstantBuffers(0, 1, camera_buffers);
-    skinning.bind_vs_to(target, 2);
+    skinning.bind_vs_to(target, 0);
     auto* sampler = context.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
     target->PSSetSamplers(0, 1, &sampler);
     target->RSSetState(context.state_manager->get_rasterizer(
