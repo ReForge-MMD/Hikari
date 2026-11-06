@@ -34,6 +34,11 @@ struct ModelInstance {
     animation::MorphEvaluator morphs;
 
     Vec3 offset{0.0f, 0.0f, 0.0f};
+    // Uniform model scale applied after skinning. Animation and physics stay in
+    // authored model space, so every pose and motion transforms consistently.
+    float scale = 1.0f;
+    Vec3 bounds_min{0.0f, 0.0f, 0.0f};
+    Vec3 bounds_max{0.0f, 0.0f, 0.0f};
     Vec3 shadow_center{0.0f, 0.0f, 0.0f};
     float shadow_radius = 10.0f;
     bool visible = true;

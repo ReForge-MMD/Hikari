@@ -282,6 +282,8 @@ bool D3DViewport::load_model(const QString& path) {
                     std::max(maximum[axis], vertex.position[static_cast<std::size_t>(axis)]);
             }
         }
+        instance->bounds_min = Vec3(minimum[0], minimum[1], minimum[2]);
+        instance->bounds_max = Vec3(maximum[0], maximum[1], maximum[2]);
         instance->shadow_center = Vec3((minimum[0] + maximum[0]) * 0.5f, 0.0f,
                                        (minimum[2] + maximum[2]) * 0.5f);
         instance->shadow_radius =
@@ -368,6 +370,7 @@ void D3DViewport::sync_active_model_state() {
     if (model == nullptr) {
         state_.model_loaded = false;
         state_.model_name.clear();
+        state_.model_scale = 1.0f;
         state_.model_bone_names.clear();
         state_.selected_bone_idx.reset();
         state_.morph_weights.clear();
@@ -383,6 +386,7 @@ void D3DViewport::sync_active_model_state() {
 
     state_.model_loaded = true;
     state_.model_name = model->name;
+    state_.model_scale = model->scale;
     state_.model_visible = model->visible;
     state_.model_bone_names.clear();
     for (std::size_t i = 0; i < model->skeleton.bones.size(); ++i) {
@@ -435,6 +439,22 @@ void D3DViewport::set_model_visible(int index, bool visible) {
     if (index == active_model_) {
         state_.model_visible = visible;
     }
+}
+
+void D3DViewport::set_model_scale(int index, float scale) {
+    if (index < 0 || index >= static_cast<int>(models_.size())) {
+        return;
+    }
+    scale = std::clamp(scale, 0.05f, 20.0f);
+    ModelInstance& model = *models_[static_cast<std::size_t>(index)];
+    if (std::abs(model.scale - scale) < 1.0e-6f) {
+        return;
+    }
+    model.scale = scale;
+    if (index == active_model_) {
+        state_.model_scale = scale;
+    }
+    state_.set_status(QStringLiteral("Model scale: %1x").arg(scale, 0, 'f', 3));
 }
 
 void D3DViewport::remove_active_model() {
@@ -849,9 +869,12 @@ void D3DViewport::translate_selection(int axis, float amount) {
     apply_editor_bone_override();
     // local_translations live in parent space. A local-axis move must therefore
     // be rotated by the bone's own local rotation; a world-axis move by the
-    // inverse parent world rotation.
-    Vec3 local_delta(axis == 0 ? amount : 0.0f, axis == 1 ? amount : 0.0f,
-                     axis == 2 ? amount : 0.0f);
+    // inverse parent world rotation. The gizmo emits world units, so convert
+    // them back into the model's authored units.
+    const float amount_in_model = amount / std::max(model->scale, 1.0e-3f);
+    Vec3 local_delta(axis == 0 ? amount_in_model : 0.0f,
+                     axis == 1 ? amount_in_model : 0.0f,
+                     axis == 2 ? amount_in_model : 0.0f);
     if (state_.is_local_coord) {
         local_delta = model->skeleton.local_rotations[index].rotate_vec3(local_delta);
     } else if (bone.parent_index) {
@@ -917,8 +940,19 @@ void D3DViewport::reset_camera() {
     state_.camera_yaw = 0.0f;
     state_.camera_pitch = 0.15f;
     state_.camera_roll = 0.0f;
-    state_.camera_distance = 50.0f;
-    state_.camera_pan = {0.0f, 10.0f, 0.0f};
+    const ModelInstance* model = active_model();
+    if (model == nullptr) {
+        state_.camera_distance = 50.0f;
+        state_.camera_pan = {0.0f, 10.0f, 0.0f};
+        return;
+    }
+    const Vec3 center =
+        (model->bounds_min + model->bounds_max) * 0.5f * model->scale + model->offset;
+    const float height =
+        std::max((model->bounds_max.y - model->bounds_min.y) * model->scale, 1.0f);
+    const float radius = std::max(model->shadow_radius * model->scale, 1.0f);
+    state_.camera_pan = center.to_array();
+    state_.camera_distance = std::max({height * 1.6f, radius * 3.0f, 10.0f});
 }
 
 bool D3DViewport::capture_image(const QString& path) {
@@ -1421,9 +1455,11 @@ void D3DViewport::render_scene() {
             if (!model->visible) {
                 continue;
             }
-            shadows.push_back({Vec3(model->shadow_center.x + model->offset.x, 0.0f,
-                                    model->shadow_center.z + model->offset.z),
-                               model->shadow_radius, {0.10f, 0.11f, 0.14f, 0.32f}});
+            shadows.push_back({Vec3(model->shadow_center.x * model->scale + model->offset.x,
+                                    0.0f,
+                                    model->shadow_center.z * model->scale + model->offset.z),
+                               model->shadow_radius * model->scale,
+                               {0.10f, 0.11f, 0.14f, 0.32f}});
         }
     }
     add_list(renderer_->record_ground_shadows(*context_, shadows));
@@ -1436,9 +1472,11 @@ void D3DViewport::render_scene() {
             continue;
         }
         render_palette_.resize(model->skeleton.skinning_palette.size());
-        const Mat4 offset = Mat4::from_translation(model->offset);
+        const Mat4 model_transform =
+            Mat4::from_scale(Vec3(model->scale, model->scale, model->scale)) *
+            Mat4::from_translation(model->offset);
         for (std::size_t i = 0; i < render_palette_.size(); ++i) {
-            render_palette_[i] = model->skeleton.skinning_palette[i] * offset;
+            render_palette_[i] = model->skeleton.skinning_palette[i] * model_transform;
         }
         model->skinning.update(*context_, render_palette_);
 
@@ -1589,6 +1627,7 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
 
     const auto append_bones = [&](const ModelInstance& bone_model, bool is_active_model) {
         const Vec3 offset = bone_model.offset;
+        const float scale = bone_model.scale;
         const animation::Skeleton& skeleton = bone_model.skeleton;
         const auto types = skeleton.bone_visual_types();
         const auto* rig = bone_model.physics_rig ? &*bone_model.physics_rig : nullptr;
@@ -1615,8 +1654,9 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
                 hidden(bone.ik_target_bone)) {
                 continue;
             }
-            ribbon(skeleton.world_positions[i] + offset,
-                   skeleton.world_positions[bone.ik_target_bone] + offset, 1.0f, ik_link_color);
+            ribbon(skeleton.world_positions[i] * scale + offset,
+                   skeleton.world_positions[bone.ik_target_bone] * scale + offset, 1.0f,
+                   ik_link_color);
         }
 
         for (std::size_t i = 0; i < skeleton.bones.size(); ++i) {
@@ -1637,8 +1677,8 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
                 color = selected_color;
             }
 
-            const Vec3 base = skeleton.world_positions[i] + offset;
-            const Vec3 tail = bone_tail_world(skeleton, i) + offset;
+            const Vec3 base = skeleton.world_positions[i] * scale + offset;
+            const Vec3 tail = bone_tail_world(skeleton, i) * scale + offset;
             const Vec3 direction = tail - base;
             Vec3 perpendicular = direction.cross(view_forward);
             perpendicular = perpendicular.length_squared() < 1.0e-8f
@@ -1666,7 +1706,7 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
         }
 
         if (has_selection && (skeleton.bones[selected].flags & 0x0008) != 0) {
-            const Vec3 origin = skeleton.world_positions[selected] + offset;
+            const Vec3 origin = skeleton.world_positions[selected] * scale + offset;
             const std::array<std::array<float, 4>, 3> axis_colors{
                 std::array<float, 4>{0.86f, 0.30f, 0.33f, 1.0f},
                 std::array<float, 4>{0.48f, 0.72f, 0.38f, 1.0f},
@@ -1703,11 +1743,13 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
     };
     if (active->visible && active->physics_rig) {
         const Vec3 offset = active->offset;
+        const float scale = active->scale;
         const auto* rig = &*active->physics_rig;
         if (state_.show_rigid_bodies) {
             for (const auto& body : rig->get_debug_rigid_bodies()) {
-                const Vec3 position(body.position[0] + offset.x, body.position[1] + offset.y,
-                                    body.position[2] + offset.z);
+                const Vec3 position(body.position[0] * scale + offset.x,
+                                    body.position[1] * scale + offset.y,
+                                    body.position[2] * scale + offset.z);
                 const std::array<float, 4> color =
                     body.mode == 0 ? std::array<float, 4>{0.47f, 0.70f, 0.47f, 0.9f}
                     : body.mode == 1 ? std::array<float, 4>{0.84f, 0.75f, 0.41f, 0.9f}
@@ -1717,8 +1759,9 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
         }
         if (state_.show_joints) {
             for (const auto& joint : rig->get_debug_joints()) {
-                debug_cross(Vec3(joint.position[0] + offset.x, joint.position[1] + offset.y,
-                                 joint.position[2] + offset.z),
+                debug_cross(Vec3(joint.position[0] * scale + offset.x,
+                                 joint.position[1] * scale + offset.y,
+                                 joint.position[2] * scale + offset.z),
                             {0.62f, 0.53f, 0.77f, 0.9f});
             }
         }
@@ -1746,8 +1789,8 @@ void D3DViewport::mousePressEvent(QMouseEvent* event) {
                     continue;
                 }
                 const auto projected = project_to_screen(
-                    model->skeleton.world_positions[i] + model->offset, view_projection,
-                    scene_rect());
+                    model->skeleton.world_positions[i] * model->scale + model->offset,
+                    view_projection, scene_rect());
                 if (!projected) {
                     continue;
                 }

@@ -701,6 +701,14 @@ QWidget* MainWindow::build_model_tab() {
 
     model_visible_ = make_check(QStringLiteral("Display"), state_.model_visible);
     layout->addWidget(model_visible_);
+    auto* scale_row = new QHBoxLayout();
+    scale_row->addWidget(new QLabel(QStringLiteral("Scale")));
+    model_scale_ = make_spin(0.05, 20.0, 0.01, 3, state_.model_scale);
+    model_scale_->setToolTip(
+        QStringLiteral("Uniform model scale. Poses, motions and physics keep their authored "
+                       "model-space units and scale together with the model."));
+    scale_row->addWidget(model_scale_, 1);
+    layout->addLayout(scale_row);
     auto* register_button = new QPushButton(QStringLiteral("Register Disp/IK"));
     register_button->setToolTip(
         QStringLiteral("Register IK on/off state for every IK bone at the current frame. "
@@ -719,6 +727,11 @@ QWidget* MainWindow::build_model_tab() {
     connect(model_visible_, &QCheckBox::toggled, this, [this](bool checked) {
         state_.model_visible = checked;
         viewport_->set_model_visible(viewport_->active_model_index(), checked);
+    });
+    connect(model_scale_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        const float scale = static_cast<float>(value);
+        state_.model_scale = scale;
+        viewport_->set_model_scale(viewport_->active_model_index(), scale);
     });
     connect(register_button, &QPushButton::clicked, this, [this] {
         state_.register_ik_keyframe(viewport_->ik_states(),
@@ -1324,6 +1337,12 @@ void MainWindow::refresh_model_list() {
         model_visible_->blockSignals(true);
         model_visible_->setChecked(state_.model_visible);
         model_visible_->blockSignals(false);
+    }
+    if (model_scale_ != nullptr) {
+        model_scale_->setEnabled(loaded);
+        model_scale_->blockSignals(true);
+        model_scale_->setValue(state_.model_scale);
+        model_scale_->blockSignals(false);
     }
 }
 

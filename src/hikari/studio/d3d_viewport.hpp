@@ -38,6 +38,7 @@ public:
     void remove_active_model();
     void set_active_model(int index);
     void set_model_visible(int index, bool visible);
+    void set_model_scale(int index, float scale);
     void request_physics_reset();
     bool capture_image(const QString& path);
     bool render_frames(const QString& directory, int start, int end, int fps);
