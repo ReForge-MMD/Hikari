@@ -695,6 +695,9 @@ QWidget* MainWindow::build_model_tab() {
     model_visible_ = make_check(QStringLiteral("Display"), state_.model_visible);
     layout->addWidget(model_visible_);
     auto* register_button = new QPushButton(QStringLiteral("Register Disp/IK"));
+    register_button->setToolTip(
+        QStringLiteral("Register IK on/off state for every IK bone at the current frame. "
+                       "Bone display is not stored in VMD."));
     layout->addWidget(register_button);
     layout->addStretch(1);
 
@@ -711,8 +714,8 @@ QWidget* MainWindow::build_model_tab() {
         viewport_->set_model_visible(viewport_->active_model_index(), checked);
     });
     connect(register_button, &QPushButton::clicked, this, [this] {
-        state_.register_keyframe(QStringLiteral("Disp/IK/OP"),
-                                 static_cast<unsigned int>(state_.current_frame));
+        state_.register_ik_keyframe(viewport_->ik_states(),
+                                    static_cast<unsigned int>(state_.current_frame));
         timeline_->update();
     });
     return page;
@@ -738,6 +741,11 @@ QWidget* MainWindow::build_bone_tab() {
     visibility_row->addWidget(show_bones);
     visibility_row->addWidget(show_physics);
     layout->addLayout(visibility_row);
+
+    bone_ik_ = make_check(QStringLiteral("IK"), false);
+    bone_ik_->setToolTip(
+        QStringLiteral("Enable or disable IK for the selected IK controller bone."));
+    layout->addWidget(bone_ik_);
 
     auto* grid = new QGridLayout();
     grid->setHorizontalSpacing(4);
@@ -774,6 +782,8 @@ QWidget* MainWindow::build_bone_tab() {
             [this](bool checked) { state_.show_bones = checked; });
     connect(show_physics, &QCheckBox::toggled, this,
             [this](bool checked) { state_.show_physics_bones = checked; });
+    connect(bone_ik_, &QCheckBox::toggled, this,
+            [this](bool checked) { viewport_->set_selected_bone_ik_enabled(checked); });
     for (int i = 0; i < 3; ++i) {
         connect(bone_pos_[static_cast<std::size_t>(i)], &QDoubleSpinBox::valueChanged, this,
                 [this, i](double value) {
@@ -1400,14 +1410,28 @@ void MainWindow::refresh_morph_combos() {
 }
 
 void MainWindow::sync_bone_fields() {
+    const auto set_ik_check = [this](bool enabled, bool checked) {
+        if (bone_ik_ == nullptr) {
+            return;
+        }
+        bone_ik_->blockSignals(true);
+        bone_ik_->setEnabled(enabled);
+        bone_ik_->setChecked(checked);
+        bone_ik_->blockSignals(false);
+    };
     const auto* skeleton = viewport_->skeleton();
     if (skeleton == nullptr || !state_.selected_bone_idx) {
+        set_ik_check(false, false);
         return;
     }
     const std::size_t index = static_cast<std::size_t>(*state_.selected_bone_idx);
     if (index >= skeleton->bones.size()) {
+        set_ik_check(false, false);
         return;
     }
+    const bool has_ik = skeleton->bones[index].has_ik;
+    const bool ik_enabled = index < skeleton->ik_enabled.size() && skeleton->ik_enabled[index];
+    set_ik_check(has_ik, has_ik && ik_enabled);
     const Vec3 translation = skeleton->local_translations[index];
     state_.bone_pos_override = translation.to_array();
     const Vec3 euler = skeleton->local_rotations[index].to_euler_xyz();

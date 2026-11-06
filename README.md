@@ -59,7 +59,8 @@ out\build\release\src\hikari\studio\hikari_studio.exe model.pmx motion.vmd
 
 The studio loads PMX models with materials, textures, morphs, skeleton, Jolt rigid
 bodies and jiggle regions. VMD motions drive the timeline; VPD poses can be loaded and
-saved; frame sequences are captured to BMP.
+saved; frame sequences are captured to BMP. VMD IK on/off frames drive the skeleton during
+playback, and authored IK states are written back on export.
 
 Viewport controls: right drag orbits, middle drag pans, wheel zooms, left click selects
 a bone. The bottom-right gizmo rotates (first row) and moves (second row) the selected

@@ -572,7 +572,20 @@ bool D3DViewport::save_motion(const QString& path) {
     std::size_t exported = 0;
     for (const auto& [track, keys] : state_.track_keyframes) {
         if (keys.empty() || track == QStringLiteral("view cnt") ||
-            track == QStringLiteral("Disp/IK/OP") || track == QStringLiteral("Facial")) {
+            track == QStringLiteral("Facial")) {
+            continue;
+        }
+        if (track == QStringLiteral("Disp/IK/OP")) {
+            for (const auto& [frame, key] : keys) {
+                formats::VmdIkFrame ik;
+                ik.frame = frame;
+                ik.show = true;
+                for (auto it = key.ik_enabled.begin(); it != key.ik_enabled.end(); ++it) {
+                    ik.ik_switches.push_back({it.key().toStdString(), it.value()});
+                }
+                motion.ik_frames.push_back(std::move(ik));
+                ++exported;
+            }
             continue;
         }
         if (track == QStringLiteral("camera")) {
@@ -837,6 +850,43 @@ void D3DViewport::reset_selection_transform() {
     model->skeleton.local_rotations[index] = Quat::identity();
     model->skeleton.update_transforms();
     state_.bone_transform_dirty = false;
+}
+
+void D3DViewport::set_selected_bone_ik_enabled(bool enabled) {
+    ModelInstance* model = active_model();
+    if (model == nullptr || !state_.selected_bone_idx) {
+        return;
+    }
+    const std::size_t index = static_cast<std::size_t>(*state_.selected_bone_idx);
+    if (index >= model->skeleton.bones.size() || !model->skeleton.bones[index].has_ik) {
+        return;
+    }
+    if (model->skeleton.ik_enabled.size() != model->skeleton.bones.size()) {
+        model->skeleton.ik_enabled.assign(model->skeleton.bones.size(), true);
+    }
+    model->skeleton.ik_enabled[index] = enabled;
+    model->skeleton.update_transforms();
+    state_.set_status(QStringLiteral("IK %1 for bone '%2'")
+                          .arg(enabled ? QStringLiteral("enabled") : QStringLiteral("disabled"))
+                          .arg(to_qstring(model->skeleton.bones[index].name)));
+}
+
+QMap<QString, bool> D3DViewport::ik_states() const {
+    QMap<QString, bool> states;
+    const ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return states;
+    }
+    for (std::size_t i = 0; i < model->skeleton.bones.size(); ++i) {
+        if (!model->skeleton.bones[i].has_ik) {
+            continue;
+        }
+        const bool enabled = i < model->skeleton.ik_enabled.size()
+                                 ? model->skeleton.ik_enabled[i]
+                                 : true;
+        states.insert(to_qstring(model->skeleton.bones[i].name), enabled);
+    }
+    return states;
 }
 
 void D3DViewport::reset_camera() {
@@ -1104,12 +1154,42 @@ void D3DViewport::evaluate_frame(float frame) {
             }
         }
     }
+    if (model != nullptr && scene_changed) {
+        apply_ik_states(*model, frame, evaluated);
+    }
     if (model != nullptr && motion_player_) {
         motion_player_->evaluate_pose(evaluated, model->skeleton, model->morphs);
     }
     apply_editor_tracks(model, frame, scene_changed);
     state_.track_keys_dirty = false;
     last_editor_frame_ = frame;
+}
+
+void D3DViewport::apply_ik_states(ModelInstance& model, float timeline_frame,
+                                  float motion_frame) {
+    animation::Skeleton& skeleton = model.skeleton;
+    if (skeleton.ik_enabled.size() != skeleton.bones.size()) {
+        skeleton.ik_enabled.assign(skeleton.bones.size(), true);
+    }
+    std::fill(skeleton.ik_enabled.begin(), skeleton.ik_enabled.end(), true);
+    if (motion_player_) {
+        motion_player_->apply_ik(motion_frame, skeleton);
+    }
+
+    const auto track = state_.track_keyframes.find(QStringLiteral("Disp/IK/OP"));
+    if (track == state_.track_keyframes.end() || track->second.empty()) {
+        return;
+    }
+    const auto next = track->second.upper_bound(
+        static_cast<unsigned int>(std::max(0.0f, std::floor(timeline_frame))));
+    const TrackKeyframe& key =
+        next == track->second.begin() ? track->second.begin()->second : std::prev(next)->second;
+    for (auto it = key.ik_enabled.begin(); it != key.ik_enabled.end(); ++it) {
+        const auto index = skeleton.find_bone_index(it.key().toStdString());
+        if (index && *index < skeleton.ik_enabled.size()) {
+            skeleton.ik_enabled[*index] = it.value();
+        }
+    }
 }
 
 void D3DViewport::apply_editor_tracks(ModelInstance* model, float frame,

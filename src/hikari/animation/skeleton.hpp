@@ -53,6 +53,9 @@ public:
     std::vector<Mat4> inv_bind_matrices;
     std::vector<Vec3> local_translations;
     std::vector<Quat> local_rotations;
+    // Runtime IK on/off state per bone. Only IK controller bones are toggled;
+    // every entry defaults to enabled.
+    std::vector<bool> ik_enabled;
     std::vector<Vec3> world_positions;
     std::vector<Quat> world_rotations;
     std::vector<Mat4> world_matrices;

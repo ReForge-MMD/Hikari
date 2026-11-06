@@ -43,6 +43,7 @@ public:
     explicit MotionPlayer(const formats::VmdMotion& motion);
 
     void evaluate_pose(float frame, Skeleton& skeleton, MorphEvaluator& morphs) const;
+    void apply_ik(float frame, Skeleton& skeleton) const;
     std::optional<SceneSample> evaluate_scene(float frame) const;
 
     std::uint32_t max_frame = 0;
@@ -53,6 +54,7 @@ private:
     std::vector<formats::VmdCameraFrame> camera_track_;
     std::vector<formats::VmdLightFrame> light_track_;
     std::vector<formats::VmdShadowFrame> shadow_track_;
+    std::vector<formats::VmdIkFrame> ik_track_;
 };
 
 } // namespace hikari::animation

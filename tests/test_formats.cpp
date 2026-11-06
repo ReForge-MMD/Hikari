@@ -175,6 +175,12 @@ TEST_CASE("VMD writer round trips every record type", "[formats]") {
     shadow.distance = 8875.0f;
     motion.shadow_frames = {shadow};
 
+    hikari::formats::VmdIkFrame ik;
+    ik.frame = 72;
+    ik.show = true;
+    ik.ik_switches = {{"左足ＩＫ", false}, {"右足ＩＫ", true}};
+    motion.ik_frames = {ik};
+
     const auto bytes = motion.to_bytes("テストモデル");
     const auto parsed = hikari::formats::VmdMotion::parse(bytes);
     REQUIRE(parsed.version == 2);
@@ -198,6 +204,13 @@ TEST_CASE("VMD writer round trips every record type", "[formats]") {
     REQUIRE(parsed.light_frames[0].direction[2] == Catch::Approx(-0.6f));
     REQUIRE(parsed.shadow_frames.size() == 1);
     REQUIRE(parsed.shadow_frames[0].mode == 2);
+    REQUIRE(parsed.ik_frames.size() == 1);
+    REQUIRE(parsed.ik_frames[0].frame == 72);
+    REQUIRE(parsed.ik_frames[0].ik_switches.size() == 2);
+    REQUIRE(parsed.ik_frames[0].ik_switches[0].name == "左足ＩＫ");
+    REQUIRE_FALSE(parsed.ik_frames[0].ik_switches[0].enabled);
+    REQUIRE(parsed.ik_frames[0].ik_switches[1].name == "右足ＩＫ");
+    REQUIRE(parsed.ik_frames[0].ik_switches[1].enabled);
 }
 
 TEST_CASE("VMD writer truncates long names on a Shift-JIS boundary", "[formats]") {

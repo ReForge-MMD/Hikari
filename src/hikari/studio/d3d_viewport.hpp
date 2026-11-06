@@ -49,6 +49,8 @@ public:
     void rotate_selection(int axis, float degrees);
     void translate_selection(int axis, float amount);
     void reset_selection_transform();
+    void set_selected_bone_ik_enabled(bool enabled);
+    QMap<QString, bool> ik_states() const;
     void reset_camera();
 
     int model_count() const { return static_cast<int>(models_.size()); }
@@ -91,6 +93,7 @@ private:
     std::vector<render::OverlayVertex> build_overlay_vertices() const;
     void update_camera();
     void evaluate_frame(float frame);
+    void apply_ik_states(ModelInstance& model, float timeline_frame, float motion_frame);
     void apply_editor_tracks(ModelInstance* model, float frame, bool apply_scene_values);
     void apply_editor_bone_override();
     void apply_bone_morphs(ModelInstance& model, const animation::MorphResult& result);

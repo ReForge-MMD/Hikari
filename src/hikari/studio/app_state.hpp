@@ -43,6 +43,8 @@ struct TrackKeyframe {
     // MMD Bezier control points (X1, Y1, X2, Y2) in the 0..127 byte range.
     // Equal X/Y pairs evaluate as linear.
     std::array<std::uint8_t, 4> interpolation{20, 20, 20, 20};
+    // IK on/off state per IK controller bone for the Disp/IK/OP track.
+    QMap<QString, bool> ik_enabled;
 };
 
 using TrackKeyframeMap = std::map<QString, std::map<unsigned int, TrackKeyframe>>;
@@ -179,6 +181,7 @@ struct StudioAppState {
     void redo_keyframes();
 
     void register_keyframe(const QString& track, unsigned int frame, bool record_undo = true);
+    void register_ik_keyframe(const QMap<QString, bool>& states, unsigned int frame);
     void delete_keyframe(const QString& track, unsigned int frame, bool record_undo = true);
     void delete_keyframes(const std::set<std::pair<QString, unsigned int>>& keys);
     void delete_frame_line(unsigned int frame);

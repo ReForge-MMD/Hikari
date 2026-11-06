@@ -124,6 +124,7 @@ MotionPlayer::MotionPlayer(const formats::VmdMotion& motion) {
     camera_track_ = motion.camera_frames;
     light_track_ = motion.light_frames;
     shadow_track_ = motion.shadow_frames;
+    ik_track_ = motion.ik_frames;
     for (const auto& frame : camera_track_) {
         max_frame = std::max(max_frame, frame.frame);
     }
@@ -133,10 +134,35 @@ MotionPlayer::MotionPlayer(const formats::VmdMotion& motion) {
     for (const auto& frame : shadow_track_) {
         max_frame = std::max(max_frame, frame.frame);
     }
+    for (const auto& frame : ik_track_) {
+        max_frame = std::max(max_frame, frame.frame);
+    }
     const auto by_frame = [](const auto& a, const auto& b) { return a.frame < b.frame; };
     std::stable_sort(camera_track_.begin(), camera_track_.end(), by_frame);
     std::stable_sort(light_track_.begin(), light_track_.end(), by_frame);
     std::stable_sort(shadow_track_.begin(), shadow_track_.end(), by_frame);
+    std::stable_sort(ik_track_.begin(), ik_track_.end(), by_frame);
+}
+
+void MotionPlayer::apply_ik(float frame, Skeleton& skeleton) const {
+    if (ik_track_.empty()) {
+        return;
+    }
+    if (skeleton.ik_enabled.size() != skeleton.bones.size()) {
+        skeleton.ik_enabled.assign(skeleton.bones.size(), true);
+    }
+    const auto upper = std::upper_bound(
+        ik_track_.begin(), ik_track_.end(), frame,
+        [](float value, const formats::VmdIkFrame& key) {
+            return value < static_cast<float>(key.frame);
+        });
+    const formats::VmdIkFrame& key = upper == ik_track_.begin() ? ik_track_.front() : *(upper - 1);
+    for (const auto& sw : key.ik_switches) {
+        const auto index = skeleton.find_bone_index(sw.name);
+        if (index && *index < skeleton.ik_enabled.size()) {
+            skeleton.ik_enabled[*index] = sw.enabled;
+        }
+    }
 }
 
 std::optional<SceneSample> MotionPlayer::evaluate_scene(float frame) const {

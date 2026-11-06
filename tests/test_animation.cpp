@@ -1,6 +1,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+
 #include "hikari/animation/bezier.hpp"
 #include "hikari/animation/morph.hpp"
 #include "hikari/animation/skeleton.hpp"
@@ -29,6 +31,48 @@ hikari::formats::PmxModel chain_model() {
     return model;
 }
 
+hikari::formats::PmxModel ik_model() {
+    hikari::formats::PmxModel model;
+    hikari::formats::PmxBone root;
+    root.name_local = "root";
+    root.name_universal = "root";
+    root.position = {0.0f, 0.0f, 0.0f};
+    root.parent_index = -1;
+    root.flags = 0x0008;
+
+    hikari::formats::PmxBone link;
+    link.name_local = "link";
+    link.name_universal = "link";
+    link.position = {0.0f, 2.0f, 0.0f};
+    link.parent_index = 0;
+    link.flags = 0x0008;
+
+    hikari::formats::PmxBone target;
+    target.name_local = "target";
+    target.name_universal = "target";
+    target.position = {0.0f, 4.0f, 0.0f};
+    target.parent_index = 1;
+    target.flags = 0x0008;
+
+    hikari::formats::PmxBone ik;
+    ik.name_local = "ik";
+    ik.name_universal = "ik";
+    ik.position = {0.0f, 4.0f, 0.0f};
+    ik.parent_index = 0;
+    ik.flags = 0x0008;
+    ik.has_ik = true;
+    ik.ik.target_bone = 2;
+    ik.ik.loop_count = 40;
+    ik.ik.angle_limit = 3.1415927f;
+    hikari::formats::PmxIkLink ik_link;
+    ik_link.bone_index = 1;
+    ik.ik.links.push_back(ik_link);
+
+    model.bones = {root, link, target, ik};
+    model.vertices.resize(4);
+    return model;
+}
+
 } // namespace
 
 TEST_CASE("Skeleton evaluates forward kinematics", "[animation]") {
@@ -50,6 +94,45 @@ TEST_CASE("Skeleton rotation propagates to children", "[animation]") {
     skeleton.update_transforms();
     REQUIRE(skeleton.world_positions[1].x == Catch::Approx(-5.0f).margin(1.0e-3f));
     REQUIRE(skeleton.world_positions[1].y == Catch::Approx(0.0f).margin(1.0e-3f));
+}
+
+TEST_CASE("Skeleton skips IK solving when the IK bone is disabled", "[animation]") {
+    auto skeleton = hikari::animation::Skeleton::from_pmx(ik_model());
+    REQUIRE(skeleton.ik_enabled.size() == 4);
+
+    skeleton.set_bone_transform(3, hikari::Vec3(2.0f, 0.0f, 0.0f), hikari::Quat::identity());
+    skeleton.update_transforms();
+    REQUIRE(std::abs(skeleton.local_rotations[1].to_euler_xyz().z) > 0.05f);
+
+    skeleton.reset_pose();
+    skeleton.ik_enabled[3] = false;
+    skeleton.set_bone_transform(3, hikari::Vec3(2.0f, 0.0f, 0.0f), hikari::Quat::identity());
+    skeleton.update_transforms();
+    REQUIRE(skeleton.local_rotations[1].to_euler_xyz().z ==
+            Catch::Approx(0.0f).margin(1.0e-4f));
+}
+
+TEST_CASE("Motion player applies VMD IK switches as stepped frames", "[animation]") {
+    hikari::formats::VmdMotion motion;
+    hikari::formats::VmdIkFrame off;
+    off.frame = 0;
+    off.ik_switches = {{"ik", false}};
+    hikari::formats::VmdIkFrame on;
+    on.frame = 10;
+    on.ik_switches = {{"ik", true}};
+    motion.ik_frames = {on, off};
+
+    const hikari::animation::MotionPlayer player(motion);
+    auto skeleton = hikari::animation::Skeleton::from_pmx(ik_model());
+    std::fill(skeleton.ik_enabled.begin(), skeleton.ik_enabled.end(), true);
+
+    player.apply_ik(5.0f, skeleton);
+    REQUIRE_FALSE(skeleton.ik_enabled[3]);
+    player.apply_ik(10.0f, skeleton);
+    REQUIRE(skeleton.ik_enabled[3]);
+    player.apply_ik(0.0f, skeleton);
+    REQUIRE_FALSE(skeleton.ik_enabled[3]);
+    REQUIRE(player.max_frame == 10);
 }
 
 TEST_CASE("Morph evaluator accumulates vertex and group weights", "[animation]") {

@@ -165,6 +165,20 @@ void StudioAppState::register_keyframe(const QString& track, unsigned int frame,
     set_status(QStringLiteral("Registered keyframe for '%1' at frame %2").arg(track).arg(frame));
 }
 
+void StudioAppState::register_ik_keyframe(const QMap<QString, bool>& states,
+                                         unsigned int frame) {
+    push_undo_snapshot();
+    TrackKeyframe key;
+    key.interpolation = default_interpolation;
+    key.ik_enabled = states;
+    track_keyframes[QStringLiteral("Disp/IK/OP")][frame] = std::move(key);
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Registered IK state for %1 bone(s) at frame %2")
+                   .arg(states.size())
+                   .arg(frame));
+}
+
 void StudioAppState::delete_keyframe(const QString& track, unsigned int frame, bool record_undo) {
     const auto it = track_keyframes.find(track);
     if (it == track_keyframes.end() || it->second.find(frame) == it->second.end()) {

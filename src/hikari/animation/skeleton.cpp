@@ -91,6 +91,7 @@ Skeleton Skeleton::from_pmx(const formats::PmxModel& pmx) {
 
     skeleton.local_translations.assign(count, Vec3::zero());
     skeleton.local_rotations.assign(count, Quat::identity());
+    skeleton.ik_enabled.assign(count, true);
     skeleton.world_positions.assign(count, Vec3::zero());
     skeleton.world_rotations.assign(count, Quat::identity());
     skeleton.world_matrices.assign(count, Mat4::identity());
@@ -449,6 +450,9 @@ void Skeleton::update_subtree(std::size_t index) {
 void Skeleton::solve_ik(bool after_physics) {
     for (std::size_t ik_bone = 0; ik_bone < bones.size(); ++ik_bone) {
         if (bones[ik_bone].after_physics != after_physics || !bones[ik_bone].has_ik) {
+            continue;
+        }
+        if (ik_bone < ik_enabled.size() && !ik_enabled[ik_bone]) {
             continue;
         }
         const auto& bone = bones[ik_bone];

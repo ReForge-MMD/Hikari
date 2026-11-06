@@ -88,6 +88,7 @@ private:
     QActionGroup* physics_speed_group_ = nullptr;
     QComboBox* model_combo_ = nullptr;
     QCheckBox* model_visible_ = nullptr;
+    QCheckBox* bone_ik_ = nullptr;
     QPushButton* copy_button_ = nullptr;
     QPushButton* paste_button_ = nullptr;
     QAction* undo_action_ = nullptr;
