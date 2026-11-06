@@ -132,6 +132,10 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
         refresh_targets();
         refresh_morph_combos();
         sync_bone_fields();
+        footer_->sync();
+        update_viewport_title();
+        timeline_->refresh_layout();
+        timeline_->update();
     });
     connect(timeline_, &TimelineWidget::boneSelected, this, [this](int index) {
         state_.selected_bone_idx = index;

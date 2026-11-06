@@ -311,6 +311,7 @@ bool D3DViewport::load_model(const QString& path) {
         motion_data_.reset();
         last_editor_frame_ = -1.0f;
         sync_active_model_state();
+        state_.mode = EditorMode::Model;
         update_stats();
         emit modelLoaded(state_.model_name, vertex_count_, bone_count_);
         emit modelsChanged();
@@ -423,11 +424,19 @@ void D3DViewport::sync_active_model_state() {
 }
 
 void D3DViewport::set_active_model(int index) {
-    if (index < 0 || index >= static_cast<int>(models_.size()) || index == active_model_) {
+    if (index < 0 || index >= static_cast<int>(models_.size())) {
+        return;
+    }
+    if (index == active_model_) {
+        if (state_.mode != EditorMode::Model) {
+            state_.mode = EditorMode::Model;
+            emit activeModelChanged();
+        }
         return;
     }
     active_model_ = index;
     last_editor_frame_ = -1.0f;
+    state_.mode = EditorMode::Model;
     sync_active_model_state();
     update_stats();
     emit activeModelChanged();
