@@ -36,6 +36,12 @@ struct OverlayVertex {
     std::array<float, 4> color{};
 };
 
+// Lines are drawn first, then triangles, so markers stay on top of bone shafts.
+struct OverlayGeometry {
+    std::vector<OverlayVertex> lines;
+    std::vector<OverlayVertex> triangles;
+};
+
 // One material subset draw. Depth is the view-space distance used to sort
 // transparent subsets back to front; it is ignored for opaque draws.
 struct SubsetDraw {
@@ -83,8 +89,8 @@ public:
     Microsoft::WRL::ComPtr<ID3D11CommandList> record_grid(core::D3D11Context& context);
     Microsoft::WRL::ComPtr<ID3D11CommandList> record_ground_shadows(
         core::D3D11Context& context, const std::vector<GroundShadow>& shadows);
-    Microsoft::WRL::ComPtr<ID3D11CommandList> record_overlay_lines(
-        core::D3D11Context& context, const std::vector<OverlayVertex>& vertices);
+    Microsoft::WRL::ComPtr<ID3D11CommandList> record_overlay_geometry(
+        core::D3D11Context& context, const OverlayGeometry& geometry);
     Microsoft::WRL::ComPtr<ID3D11CommandList> record_mesh_draws(
         core::D3D11Context& context, ID3D11DeviceContext* deferred, const SubsetDraw* draws,
         std::size_t count, bool transparent);

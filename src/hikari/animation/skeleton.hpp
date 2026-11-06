@@ -34,6 +34,10 @@ struct BoneNode {
     float append_ratio = 0.0f;
     bool has_fixed_axis = false;
     Vec3 fixed_axis;
+    // Display tail: either another bone or a local offset from this bone.
+    bool has_tail_bone = false;
+    std::size_t tail_bone = 0;
+    Vec3 tail_offset{};
     bool has_ik = false;
     std::size_t ik_target_bone = 0;
     std::int32_t ik_loop_count = 1;

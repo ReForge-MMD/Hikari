@@ -36,7 +36,7 @@ protected:
 
 private:
     int cell_at(const QPoint& point) const;
-    void drag_by(int delta_y);
+    void drag_by(int delta_y, Qt::KeyboardModifiers modifiers);
     void end_drag();
 
     bool local_ = true;

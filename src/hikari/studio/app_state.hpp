@@ -79,6 +79,7 @@ struct StudioAppState {
     bool box_select_active = false;
     bool show_bones = true;
     bool show_physics_bones = false;
+    bool show_all_model_bones = false;
 
     MorphCategory active_morph_category = MorphCategory::Eyes;
     std::array<QStringList, 4> category_morph_names;

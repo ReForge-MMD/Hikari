@@ -69,6 +69,13 @@ Skeleton Skeleton::from_pmx(const formats::PmxModel& pmx) {
             bone.has_fixed_axis = true;
             bone.fixed_axis = Vec3::from_array(source.fixed_axis);
         }
+        if (source.has_tail_bone && source.tail_bone >= 0 &&
+            static_cast<std::size_t>(source.tail_bone) < count) {
+            bone.has_tail_bone = true;
+            bone.tail_bone = static_cast<std::size_t>(source.tail_bone);
+        } else {
+            bone.tail_offset = Vec3::from_array(source.tail_offset);
+        }
         if (source.has_ik) {
             bone.has_ik = true;
             bone.ik_target_bone =

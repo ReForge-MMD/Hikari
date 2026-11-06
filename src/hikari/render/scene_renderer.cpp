@@ -551,11 +551,17 @@ SceneRenderer::record_mesh_draws_parallel(core::D3D11Context& context,
     return results;
 }
 
-Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_overlay_lines(
-    core::D3D11Context& context, const std::vector<OverlayVertex>& vertices) {
-    if (vertices.empty()) {
+Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_overlay_geometry(
+    core::D3D11Context& context, const OverlayGeometry& geometry) {
+    const std::size_t line_count = geometry.lines.size();
+    const std::size_t triangle_count = geometry.triangles.size();
+    if (line_count + triangle_count == 0) {
         return {};
     }
+    std::vector<OverlayVertex> vertices;
+    vertices.reserve(line_count + triangle_count);
+    vertices.insert(vertices.end(), geometry.lines.begin(), geometry.lines.end());
+    vertices.insert(vertices.end(), geometry.triangles.begin(), geometry.triangles.end());
     upload_overlay_vertices(context, overlay_vb, overlay_capacity, vertices);
 
     auto deferred = context.acquire_deferred_context();
@@ -572,7 +578,6 @@ Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_overlay_lines(
     const UINT offset = 0;
     ID3D11Buffer* buffers[] = {overlay_vb.Get()};
     target->IASetVertexBuffers(0, 1, buffers, &stride, &offset);
-    target->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
     target->OMSetDepthStencilState(
         context.state_manager->get_depth(core::DepthPreset::Disabled), 0);
     const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -580,7 +585,14 @@ Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_overlay_lines(
                             blend_factor, 0xFFFFFFFF);
     target->RSSetState(
         context.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
-    target->Draw(static_cast<UINT>(vertices.size()), 0);
+    if (line_count != 0) {
+        target->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+        target->Draw(static_cast<UINT>(line_count), 0);
+    }
+    if (triangle_count != 0) {
+        target->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        target->Draw(static_cast<UINT>(triangle_count), static_cast<UINT>(line_count));
+    }
     auto list = core::D3D11Context::finish_command_list(target, false);
     context.recycle_deferred_context(std::move(deferred));
     return list;

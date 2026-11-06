@@ -26,8 +26,10 @@ constexpr int kHeader = 18;
 constexpr int kColumns = 3;
 constexpr int kRows = 2;
 
-constexpr float kRotateDegreesPerPixel = 0.5f;
-constexpr float kTranslateUnitsPerPixel = 0.02f;
+// MMD uses 0.005 rad per pixel as the half angle, which reads as 0.01 rad
+// (0.573 degrees) per pixel after the quaternion construction.
+constexpr float kRotateDegreesPerPixel = 0.5729578f;
+constexpr float kTranslateUnitsPerPixel = 0.05f;
 
 const QColor kAxisColor[3] = {QColor(0xd0, 0x5a, 0x5a), QColor(0x62, 0xb4, 0x5c),
                               QColor(0x5b, 0x86, 0xc8)};
@@ -212,7 +214,7 @@ void ViewGizmo::mouseMoveEvent(QMouseEvent* event) {
                 setCursor(Qt::BlankCursor);
                 cursor_hidden_ = true;
             }
-            drag_by(delta_y);
+            drag_by(delta_y, event->modifiers());
             QCursor::setPos(drag_anchor_);
         }
         event->accept();
@@ -246,13 +248,17 @@ void ViewGizmo::end_drag() {
     releaseMouse();
 }
 
-void ViewGizmo::drag_by(int delta_y) {
+void ViewGizmo::drag_by(int delta_y, Qt::KeyboardModifiers modifiers) {
     const float pixels = -static_cast<float>(delta_y);
     const int axis = pressed_ % kColumns;
+    const bool coarse = modifiers.testFlag(Qt::ShiftModifier);
+    const bool fine = modifiers.testFlag(Qt::ControlModifier);
     if (pressed_ < kColumns) {
-        emit rotateRequested(axis, pixels * kRotateDegreesPerPixel);
+        const float scale = coarse ? 5.0f : (fine ? 0.1f : 1.0f);
+        emit rotateRequested(axis, pixels * kRotateDegreesPerPixel * scale);
     } else {
-        emit translateRequested(axis, pixels * kTranslateUnitsPerPixel);
+        const float scale = coarse ? 10.0f : (fine ? 0.1f : 1.0f);
+        emit translateRequested(axis, pixels * kTranslateUnitsPerPixel * scale);
     }
 }
 

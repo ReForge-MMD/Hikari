@@ -326,6 +326,13 @@ void MainWindow::build_menus() {
     bones_action->setChecked(state_.show_bones);
     connect(bones_action, &QAction::toggled, this,
             [this](bool checked) { state_.show_bones = checked; });
+    auto* all_bones_action = view_menu->addAction(QStringLiteral("Skeleton On All Models"));
+    all_bones_action->setCheckable(true);
+    all_bones_action->setChecked(state_.show_all_model_bones);
+    all_bones_action->setToolTip(
+        QStringLiteral("Show skeleton bones for every visible model, not only the active one"));
+    connect(all_bones_action, &QAction::toggled, this,
+            [this](bool checked) { state_.show_all_model_bones = checked; });
     auto* physics_bones_action = view_menu->addAction(QStringLiteral("Physics Bone Overlay"));
     physics_bones_action->setCheckable(true);
     physics_bones_action->setChecked(state_.show_physics_bones);

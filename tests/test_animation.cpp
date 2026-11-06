@@ -86,6 +86,18 @@ TEST_CASE("Skeleton evaluates forward kinematics", "[animation]") {
     REQUIRE(skeleton.world_positions[1].y == Catch::Approx(6.0f));
 }
 
+TEST_CASE("Skeleton keeps PMX display tails", "[animation]") {
+    auto model = chain_model();
+    model.bones[0].has_tail_bone = true;
+    model.bones[0].tail_bone = 1;
+    model.bones[1].tail_offset = {0.0f, 1.5f, 0.0f};
+
+    const auto skeleton = hikari::animation::Skeleton::from_pmx(model);
+    REQUIRE(skeleton.bones[0].has_tail_bone);
+    REQUIRE(skeleton.bones[0].tail_bone == 1);
+    REQUIRE(skeleton.bones[1].tail_offset.y == Catch::Approx(1.5f));
+}
+
 TEST_CASE("Skeleton rotation propagates to children", "[animation]") {
     const auto model = chain_model();
     auto skeleton = hikari::animation::Skeleton::from_pmx(model);

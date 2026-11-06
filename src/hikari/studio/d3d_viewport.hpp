@@ -90,7 +90,7 @@ private:
     void tick();
     void tick_impl();
     void render_scene();
-    std::vector<render::OverlayVertex> build_overlay_vertices() const;
+    render::OverlayGeometry build_overlay_geometry() const;
     void update_camera();
     void evaluate_frame(float frame);
     void apply_ik_states(ModelInstance& model, float timeline_frame, float motion_frame);

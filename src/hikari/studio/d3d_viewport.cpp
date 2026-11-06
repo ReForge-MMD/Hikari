@@ -96,6 +96,21 @@ Vec3 subset_world_center(const std::vector<std::uint32_t>& indices,
     return samples == 0 ? Vec3::zero() : sum / static_cast<float>(samples);
 }
 
+Vec3 bone_tail_world(const animation::Skeleton& skeleton, std::size_t index) {
+    const animation::BoneNode& bone = skeleton.bones[index];
+    if (bone.has_tail_bone && bone.tail_bone < skeleton.bones.size()) {
+        return skeleton.world_positions[bone.tail_bone];
+    }
+    Vec3 offset = bone.tail_offset;
+    if (offset.length_squared() < 1.0e-8f) {
+        if (index < skeleton.children.size() && !skeleton.children[index].empty()) {
+            return skeleton.world_positions[skeleton.children[index].front()];
+        }
+        offset = Vec3(0.0f, 0.8f, 0.0f);
+    }
+    return skeleton.world_positions[index] + skeleton.world_rotations[index].rotate_vec3(offset);
+}
+
 // PMX morph panels: 0 = system (hidden), 1 = brow, 2 = eye, 3 = mouth, 4 = other.
 // The facial tab uses Eyes, Mouth, Brow, Other in that order.
 std::optional<int> morph_panel_slot(std::uint8_t panel) {
@@ -783,6 +798,11 @@ void D3DViewport::rotate_selection(int axis, float degrees) {
         }
         return;
     }
+    const auto& bone = model->skeleton.bones[index];
+    const bool rotatable = (bone.flags & 0x0002) != 0 || bone.has_ik || !bone.parent_index;
+    if (!rotatable) {
+        return;
+    }
     apply_editor_bone_override();
     const Vec3 local_axis(axis == 0 ? 1.0f : 0.0f, axis == 1 ? 1.0f : 0.0f,
                           axis == 2 ? 1.0f : 0.0f);
@@ -792,7 +812,6 @@ void D3DViewport::rotate_selection(int axis, float degrees) {
             (model->skeleton.local_rotations[index] * delta).normalize();
     } else {
         const Quat world = (delta * model->skeleton.world_rotations[index]).normalize();
-        const auto& bone = model->skeleton.bones[index];
         const Quat parent = bone.parent_index
                                 ? model->skeleton.world_rotations[*bone.parent_index]
                                 : Quat::identity();
@@ -828,9 +847,14 @@ void D3DViewport::translate_selection(int axis, float amount) {
         return;
     }
     apply_editor_bone_override();
+    // local_translations live in parent space. A local-axis move must therefore
+    // be rotated by the bone's own local rotation; a world-axis move by the
+    // inverse parent world rotation.
     Vec3 local_delta(axis == 0 ? amount : 0.0f, axis == 1 ? amount : 0.0f,
                      axis == 2 ? amount : 0.0f);
-    if (!state_.is_local_coord && bone.parent_index) {
+    if (state_.is_local_coord) {
+        local_delta = model->skeleton.local_rotations[index].rotate_vec3(local_delta);
+    } else if (bone.parent_index) {
         local_delta =
             model->skeleton.world_rotations[*bone.parent_index].inverse().rotate_vec3(local_delta);
     }
@@ -1453,7 +1477,7 @@ void D3DViewport::render_scene() {
         renderer_->record_mesh_draws_parallel(*context_, transparent_draws, true);
     lists.insert(lists.end(), transparent_lists.begin(), transparent_lists.end());
 
-    add_list(renderer_->record_overlay_lines(*context_, build_overlay_vertices()));
+    add_list(renderer_->record_overlay_geometry(*context_, build_overlay_geometry()));
 
     for (const auto& list : lists) {
         context_->execute_command_list(list.Get(), false);
@@ -1471,74 +1495,215 @@ void D3DViewport::render_scene() {
     }
 }
 
-std::vector<render::OverlayVertex> D3DViewport::build_overlay_vertices() const {
-    std::vector<render::OverlayVertex> vertices;
-    const ModelInstance* model = active_model();
-    if (model == nullptr) {
-        return vertices;
+render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
+    render::OverlayGeometry geometry;
+    const ModelInstance* active = active_model();
+    // Skeleton and physics handles belong to model editing; camera mode is clean.
+    if (active == nullptr || state_.mode == EditorMode::Camera) {
+        return geometry;
     }
-    const Vec3 offset = model->offset;
-    const auto line = [&](const Vec3& a, const Vec3& b, const std::array<float, 4>& color) {
-        vertices.push_back({{a.x, a.y, a.z}, color});
-        vertices.push_back({{b.x, b.y, b.z}, color});
-    };
-    const auto cross = [&](const Vec3& point, float size, const std::array<float, 4>& color) {
-        line(point - Vec3(size, 0.0f, 0.0f), point + Vec3(size, 0.0f, 0.0f), color);
-        line(point - Vec3(0.0f, size, 0.0f), point + Vec3(0.0f, size, 0.0f), color);
-        line(point - Vec3(0.0f, 0.0f, size), point + Vec3(0.0f, 0.0f, size), color);
+    const QSize viewport = effective_screen_size();
+    const float viewport_height = std::max(1.0f, static_cast<float>(viewport.height()));
+    const Mat4 view = camera_.view_matrix();
+    const Vec3 view_right(view.m[0][0], view.m[1][0], view.m[2][0]);
+    const Vec3 view_up(view.m[0][1], view.m[1][1], view.m[2][1]);
+    const Vec3 view_forward(view.m[0][2], view.m[1][2], view.m[2][2]);
+
+    const auto world_per_pixel = [&](const Vec3& point) {
+        if (camera_.orthographic) {
+            const float height = camera_.ortho_height > 0.0f
+                                     ? camera_.ortho_height
+                                     : 2.0f * std::tan(camera_.fov_y * 0.5f);
+            return height / viewport_height;
+        }
+        const float depth = std::max((point - camera_.position).dot(view_forward), 0.1f);
+        return 2.0f * depth * std::tan(camera_.fov_y * 0.5f) / viewport_height;
     };
 
-    if (state_.show_bones) {
-        const auto& skeleton = model->skeleton;
+    const auto line = [&](const Vec3& a, const Vec3& b, const std::array<float, 4>& color) {
+        geometry.lines.push_back({{a.x, a.y, a.z}, color});
+        geometry.lines.push_back({{b.x, b.y, b.z}, color});
+    };
+    const auto triangle = [&](const Vec3& a, const Vec3& b, const Vec3& c,
+                              const std::array<float, 4>& color) {
+        geometry.triangles.push_back({{a.x, a.y, a.z}, color});
+        geometry.triangles.push_back({{b.x, b.y, b.z}, color});
+        geometry.triangles.push_back({{c.x, c.y, c.z}, color});
+    };
+    const auto quad = [&](const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d,
+                          const std::array<float, 4>& color) {
+        triangle(a, b, c, color);
+        triangle(a, c, d, color);
+    };
+    const auto ribbon = [&](const Vec3& a, const Vec3& b, float width_px,
+                            const std::array<float, 4>& color) {
+        const Vec3 axis = b - a;
+        const float length_sq = axis.length_squared();
+        if (length_sq < 1.0e-8f) {
+            return;
+        }
+        const Vec3 direction = axis * (1.0f / std::sqrt(length_sq));
+        Vec3 perpendicular = direction.cross(view_forward);
+        perpendicular = perpendicular.length_squared() < 1.0e-8f
+                            ? view_right
+                            : perpendicular.normalize();
+        const float half_a = width_px * world_per_pixel(a) * 0.5f;
+        const float half_b = width_px * world_per_pixel(b) * 0.5f;
+        quad(a - perpendicular * half_a, a + perpendicular * half_a,
+             b + perpendicular * half_b, b - perpendicular * half_b, color);
+    };
+    const std::array<float, 4> outline{0.06f, 0.07f, 0.10f, 0.9f};
+    const auto diamond = [&](const Vec3& center, float half_px,
+                             const std::array<float, 4>& color) {
+        const float step = world_per_pixel(center);
+        const float r = half_px * step;
+        const float o = r + 1.1f * step;
+        quad(center + view_up * o, center + view_right * o, center - view_up * o,
+             center - view_right * o, outline);
+        quad(center + view_up * r, center + view_right * r, center - view_up * r,
+             center - view_right * r, color);
+    };
+    const auto square_marker = [&](const Vec3& center, float half_px,
+                                   const std::array<float, 4>& color) {
+        const float step = world_per_pixel(center);
+        const float r = half_px * step;
+        const float o = r + 1.1f * step;
+        quad(center + view_up * o - view_right * o, center + view_up * o + view_right * o,
+             center - view_up * o + view_right * o, center - view_up * o - view_right * o,
+             outline);
+        quad(center + view_up * r - view_right * r, center + view_up * r + view_right * r,
+             center - view_up * r + view_right * r, center - view_up * r - view_right * r,
+             color);
+    };
+    const auto arrow = [&](const Vec3& origin, const Vec3& direction, float length_px,
+                           const std::array<float, 4>& color) {
+        const float length = length_px * world_per_pixel(origin);
+        const Vec3 tip = origin + direction * length;
+        ribbon(origin, tip, 2.4f, color);
+        Vec3 side = direction.cross(view_forward);
+        side = side.length_squared() < 1.0e-8f ? view_right : side.normalize();
+        const float head = 5.0f * world_per_pixel(tip);
+        triangle(tip, tip - direction * head + side * (head * 0.6f),
+                 tip - direction * head - side * (head * 0.6f), color);
+    };
+
+    const auto append_bones = [&](const ModelInstance& bone_model, bool is_active_model) {
+        const Vec3 offset = bone_model.offset;
+        const animation::Skeleton& skeleton = bone_model.skeleton;
         const auto types = skeleton.bone_visual_types();
-        const auto* rig = model->physics_rig ? &*model->physics_rig : nullptr;
+        const auto* rig = bone_model.physics_rig ? &*bone_model.physics_rig : nullptr;
         const auto hidden = [&](std::size_t index) {
             return !state_.show_physics_bones && rig != nullptr && rig->is_bone_driven(index);
         };
-        const std::array<float, 4> standard{0.55f, 0.68f, 0.80f, 0.85f};
-        const std::array<float, 4> ik_link{0.84f, 0.75f, 0.41f, 0.95f};
-        const std::array<float, 4> active{0.49f, 0.78f, 0.89f, 1.0f};
-        const std::array<float, 4> selected{0.95f, 0.42f, 0.42f, 1.0f};
+        const bool has_selection =
+            is_active_model && state_.selected_bone_idx &&
+            static_cast<std::size_t>(*state_.selected_bone_idx) < skeleton.bones.size();
+        const std::size_t selected =
+            has_selection ? static_cast<std::size_t>(*state_.selected_bone_idx) : 0;
+
+        const std::array<float, 4> normal{0.392f, 0.392f, 0.902f, 0.92f};
+        const std::array<float, 4> selected_color{1.0f, 0.196f, 0.196f, 1.0f};
+        const std::array<float, 4> selected_extra{1.0f, 0.42f, 0.42f, 0.95f};
+        const std::array<float, 4> ik_color{1.0f, 0.608f, 0.0f, 1.0f};
+        const std::array<float, 4> ik_link_color{0.08f, 0.08f, 0.12f, 0.8f};
+        const std::array<float, 4> physics_color{0.392f, 1.0f, 0.392f, 0.95f};
+
+        // IK chains first, so shafts and markers stay on top.
+        for (std::size_t i = 0; i < skeleton.bones.size(); ++i) {
+            const auto& bone = skeleton.bones[i];
+            if (!bone.has_ik || bone.ik_target_bone >= skeleton.bones.size() || hidden(i) ||
+                hidden(bone.ik_target_bone)) {
+                continue;
+            }
+            ribbon(skeleton.world_positions[i] + offset,
+                   skeleton.world_positions[bone.ik_target_bone] + offset, 1.0f, ik_link_color);
+        }
 
         for (std::size_t i = 0; i < skeleton.bones.size(); ++i) {
             const auto& bone = skeleton.bones[i];
             if ((bone.flags & 0x0008) == 0 || hidden(i)) {
                 continue;
             }
-            const Vec3 position = skeleton.world_positions[i] + offset;
-            const bool is_selected = state_.selected_bone_idx &&
-                                     static_cast<std::size_t>(*state_.selected_bone_idx) == i;
-            std::array<float, 4> color = standard;
-            if (is_selected) {
-                color = selected;
-            } else if (types[i] == animation::BoneVisualType::UnderIk ||
-                       types[i] == animation::BoneVisualType::IkController) {
-                color = ik_link;
+            const bool is_selected = has_selection && i == selected;
+            const bool physics_driven = rig != nullptr && rig->is_bone_driven(i);
+            std::array<float, 4> color = physics_driven ? physics_color : normal;
+            if (types[i] == animation::BoneVisualType::IkController) {
+                color = ik_color;
+            } else if (types[i] == animation::BoneVisualType::UnderIk) {
+                color = ik_color;
+                color[3] = 0.8f;
             }
             if (is_selected) {
-                const float axis = 1.4f;
-                line(position, position + Vec3(axis, 0.0f, 0.0f), {0.78f, 0.30f, 0.33f, 1.0f});
-                line(position, position + Vec3(0.0f, axis, 0.0f), {0.48f, 0.68f, 0.38f, 1.0f});
-                line(position, position + Vec3(0.0f, 0.0f, axis), {0.38f, 0.55f, 0.78f, 1.0f});
+                color = selected_color;
             }
-            cross(position, is_selected ? 0.45f : 0.25f, color);
 
-            if (bone.parent_index && !hidden(*bone.parent_index)) {
-                color = active;
-                if (!is_selected) {
-                    color = (types[i] == animation::BoneVisualType::UnderIk ||
-                             types[i] == animation::BoneVisualType::IkController)
-                                ? ik_link
-                                : standard;
-                    color[3] = 0.6f;
-                }
-                line(skeleton.world_positions[*bone.parent_index] + offset, position, color);
+            const Vec3 base = skeleton.world_positions[i] + offset;
+            const Vec3 tail = bone_tail_world(skeleton, i) + offset;
+            const Vec3 direction = tail - base;
+            Vec3 perpendicular = direction.cross(view_forward);
+            perpendicular = perpendicular.length_squared() < 1.0e-8f
+                                ? view_right
+                                : perpendicular.normalize();
+            const float width = is_selected ? 3.2f : 1.8f;
+            const float spread = 7.0f * world_per_pixel(base);
+            ribbon(base + perpendicular * spread, tail, width, color);
+            ribbon(base - perpendicular * spread, tail, width, color);
+
+            if (is_selected) {
+                ribbon(base + perpendicular * (spread * 1.5f), tail, width + 1.0f,
+                       selected_extra);
+                ribbon(base - perpendicular * (spread * 1.5f), tail, width + 1.0f,
+                       selected_extra);
             }
+
+            const bool translate_only =
+                (bone.flags & 0x0004) != 0 && (bone.flags & 0x0002) == 0;
+            if (types[i] == animation::BoneVisualType::IkController || translate_only) {
+                square_marker(base, is_selected ? 6.0f : 5.0f, color);
+            } else {
+                diamond(base, is_selected ? 6.0f : 4.5f, color);
+            }
+        }
+
+        if (has_selection && (skeleton.bones[selected].flags & 0x0008) != 0) {
+            const Vec3 origin = skeleton.world_positions[selected] + offset;
+            const std::array<std::array<float, 4>, 3> axis_colors{
+                std::array<float, 4>{0.86f, 0.30f, 0.33f, 1.0f},
+                std::array<float, 4>{0.48f, 0.72f, 0.38f, 1.0f},
+                std::array<float, 4>{0.38f, 0.55f, 0.86f, 1.0f}};
+            for (int axis = 0; axis < 3; ++axis) {
+                Vec3 direction(axis == 0 ? 1.0f : 0.0f, axis == 1 ? 1.0f : 0.0f,
+                               axis == 2 ? 1.0f : 0.0f);
+                if (state_.is_local_coord) {
+                    direction = skeleton.world_rotations[selected].rotate_vec3(direction);
+                }
+                arrow(origin, direction.normalize(), 34.0f,
+                      axis_colors[static_cast<std::size_t>(axis)]);
+            }
+        }
+    };
+
+    if (state_.show_bones) {
+        if (state_.show_all_model_bones) {
+            for (const auto& bone_model : models_) {
+                if (!bone_model->visible) {
+                    continue;
+                }
+                append_bones(*bone_model, bone_model.get() == active);
+            }
+        } else if (active->visible) {
+            append_bones(*active, true);
         }
     }
 
-    if (model->physics_rig) {
-        const auto* rig = &*model->physics_rig;
+    const auto debug_cross = [&](const Vec3& point, const std::array<float, 4>& color) {
+        const float size = 5.0f * world_per_pixel(point);
+        line(point - view_right * size, point + view_right * size, color);
+        line(point - view_up * size, point + view_up * size, color);
+    };
+    if (active->visible && active->physics_rig) {
+        const Vec3 offset = active->offset;
+        const auto* rig = &*active->physics_rig;
         if (state_.show_rigid_bodies) {
             for (const auto& body : rig->get_debug_rigid_bodies()) {
                 const Vec3 position(body.position[0] + offset.x, body.position[1] + offset.y,
@@ -1547,27 +1712,27 @@ std::vector<render::OverlayVertex> D3DViewport::build_overlay_vertices() const {
                     body.mode == 0 ? std::array<float, 4>{0.47f, 0.70f, 0.47f, 0.9f}
                     : body.mode == 1 ? std::array<float, 4>{0.84f, 0.75f, 0.41f, 0.9f}
                                      : std::array<float, 4>{0.49f, 0.78f, 0.89f, 0.9f};
-                const float size = std::max({body.size[0], body.size[1], body.size[2], 0.2f}) * 0.5f;
-                cross(position, std::min(size, 1.0f), color);
+                debug_cross(position, color);
             }
         }
         if (state_.show_joints) {
             for (const auto& joint : rig->get_debug_joints()) {
-                cross(Vec3(joint.position[0] + offset.x, joint.position[1] + offset.y,
-                           joint.position[2] + offset.z),
-                      0.2f, {0.62f, 0.53f, 0.77f, 0.9f});
+                debug_cross(Vec3(joint.position[0] + offset.x, joint.position[1] + offset.y,
+                                 joint.position[2] + offset.z),
+                            {0.62f, 0.53f, 0.77f, 0.9f});
             }
         }
     }
 
-    return vertices;
+    return geometry;
 }
 
 void D3DViewport::mousePressEvent(QMouseEvent* event) {
     last_mouse_ = event->pos();
     if (event->button() == Qt::LeftButton) {
         left_down_ = true;
-        if (ModelInstance* model = active_model()) {
+        if (ModelInstance* model = active_model();
+            model != nullptr && state_.mode == EditorMode::Model) {
             const Mat4 view_projection = camera_.view_projection_matrix();
             std::optional<std::size_t> best;
             float best_distance = 10.0f;
