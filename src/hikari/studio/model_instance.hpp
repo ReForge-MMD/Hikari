@@ -13,6 +13,7 @@
 #include "hikari/physics/rig.hpp"
 #include "hikari/render/material.hpp"
 #include "hikari/render/mesh.hpp"
+#include "hikari/render/skinning.hpp"
 #include "hikari/render/texture.hpp"
 
 namespace hikari::studio {
@@ -23,6 +24,7 @@ struct ModelInstance {
     QString path;
     formats::PmxModel pmx;
     render::GpuMesh mesh;
+    render::GpuSkinningBuffer skinning;
     std::vector<render::GpuMaterial> materials;
     std::vector<std::optional<render::GpuTexture>> textures;
     animation::Skeleton skeleton;

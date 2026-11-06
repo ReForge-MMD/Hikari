@@ -50,6 +50,52 @@ std::wstring to_wstring(const QString& text) {
     return text.toStdWString();
 }
 
+Vec3 skinned_position(const render::ModelVertex& vertex, const std::vector<Mat4>& palette) {
+    const Vec3 position = Vec3::from_array(vertex.position);
+    float total_weight = 0.0f;
+    for (const float weight : vertex.bone_weights) {
+        total_weight += weight;
+    }
+    if (total_weight <= 1.0e-4f) {
+        return palette.empty() ? position : palette[0].transform_point(position);
+    }
+    Vec3 result;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const float weight = vertex.bone_weights[i];
+        if (weight <= 0.0f) {
+            continue;
+        }
+        const std::size_t bone = vertex.bone_indices[i];
+        if (bone >= palette.size()) {
+            continue;
+        }
+        result += palette[bone].transform_point(position) * (weight / total_weight);
+    }
+    return result;
+}
+
+// Approximate world-space center of a material subset. Sampling caps the cost
+// while still giving stable back-to-front ordering for blended materials.
+Vec3 subset_world_center(const std::vector<std::uint32_t>& indices,
+                         const std::vector<render::ModelVertex>& vertices,
+                         const render::MeshSubset& subset, const std::vector<Mat4>& palette) {
+    if (subset.index_count == 0 || indices.empty()) {
+        return Vec3::zero();
+    }
+    const std::size_t step = std::max<std::size_t>(1, subset.index_count / 256);
+    Vec3 sum;
+    std::size_t samples = 0;
+    for (std::size_t i = 0; i < subset.index_count; i += step) {
+        const std::uint32_t vertex_index = indices[subset.index_start + i];
+        if (vertex_index >= vertices.size()) {
+            continue;
+        }
+        sum += skinned_position(vertices[vertex_index], palette);
+        ++samples;
+    }
+    return samples == 0 ? Vec3::zero() : sum / static_cast<float>(samples);
+}
+
 // PMX morph panels: 0 = system (hidden), 1 = brow, 2 = eye, 3 = mouth, 4 = other.
 // The facial tab uses Eyes, Mouth, Brow, Other in that order.
 std::optional<int> morph_panel_slot(std::uint8_t panel) {
@@ -1245,29 +1291,44 @@ void D3DViewport::render_scene() {
     context_->clear(clear_color, 1.0f, 0);
     context_->set_viewport(static_cast<float>(context_->render_width),
                            static_cast<float>(context_->render_height));
+    renderer_->set_light(state_.light_color, state_.light_direction);
+    renderer_->update_camera(*context_, camera_);
+    renderer_->wireframe = state_.wireframe;
+
+    std::vector<Microsoft::WRL::ComPtr<ID3D11CommandList>> lists;
+    const auto add_list = [&lists](Microsoft::WRL::ComPtr<ID3D11CommandList> list) {
+        if (list) {
+            lists.push_back(std::move(list));
+        }
+    };
+
     const std::array<float, 4> background =
         state_.viewport_white_bg ? std::array<float, 4>{0.98f, 0.98f, 0.99f, 1.0f}
                                  : std::array<float, 4>{0.19f, 0.22f, 0.27f, 1.0f};
-    renderer_->render_viewport_background(*context_, background);
-    renderer_->set_light(state_.light_color, state_.light_direction);
-    renderer_->update_camera(*context_, camera_);
+    add_list(renderer_->record_background(*context_, background));
     if (state_.show_grid) {
-        renderer_->render_grid_to(*context_, context_->context.Get());
+        add_list(renderer_->record_grid(*context_));
     }
+
+    std::vector<render::GroundShadow> shadows;
     if (state_.ground_shadow) {
+        shadows.reserve(models_.size());
         for (const auto& model : models_) {
             if (!model->visible) {
                 continue;
             }
-            const Vec3 center(model->shadow_center.x + model->offset.x, 0.0f,
-                              model->shadow_center.z + model->offset.z);
-            renderer_->render_ground_shadow(*context_, center, model->shadow_radius,
-                                            {0.10f, 0.11f, 0.14f, 0.32f});
+            shadows.push_back({Vec3(model->shadow_center.x + model->offset.x, 0.0f,
+                                    model->shadow_center.z + model->offset.z),
+                               model->shadow_radius, {0.10f, 0.11f, 0.14f, 0.32f}});
         }
     }
-    renderer_->wireframe = state_.wireframe;
+    add_list(renderer_->record_ground_shadows(*context_, shadows));
+
+    std::vector<render::SubsetDraw> opaque_draws;
+    std::vector<render::SubsetDraw> transparent_draws;
+    const Vec3 view_forward = camera_.target - camera_.position;
     for (const auto& model : models_) {
-        if (!model->visible) {
+        if (!model->visible || model->mesh.subsets.empty()) {
             continue;
         }
         render_palette_.resize(model->skeleton.skinning_palette.size());
@@ -1275,22 +1336,48 @@ void D3DViewport::render_scene() {
         for (std::size_t i = 0; i < render_palette_.size(); ++i) {
             render_palette_[i] = model->skeleton.skinning_palette[i] * offset;
         }
-        if (state_.multithreaded) {
-            renderer_->skinning_buffer.update(*context_, render_palette_);
-            const auto lists = renderer_->record_mesh_subsets_parallel(
-                *context_, model->mesh, model->materials, model->textures,
-                renderer_->skinning_buffer, 4);
-            for (const auto& list : lists) {
-                context_->execute_command_list(list.Get(), false);
+        model->skinning.update(*context_, render_palette_);
+
+        for (std::size_t i = 0; i < model->mesh.subsets.size(); ++i) {
+            const render::MeshSubset& subset = model->mesh.subsets[i];
+            const bool transparent =
+                subset.material_index < model->materials.size() &&
+                model->materials[subset.material_index].constants.diffuse[3] < 0.999f;
+            render::SubsetDraw draw;
+            draw.mesh = &model->mesh;
+            draw.materials = &model->materials;
+            draw.textures = &model->textures;
+            draw.skinning = &model->skinning;
+            draw.subset = i;
+            if (transparent) {
+                const Vec3 center = subset_world_center(model->pmx.indices,
+                                                        model->mesh.current_vertices, subset,
+                                                        render_palette_);
+                draw.depth = (center - camera_.position).dot(view_forward);
+                transparent_draws.push_back(draw);
+            } else {
+                opaque_draws.push_back(draw);
             }
-        } else {
-            renderer_->skinning_buffer.update(*context_, render_palette_);
-            renderer_->render_mesh_to(*context_, context_->context.Get(), model->mesh,
-                                      model->materials, model->textures,
-                                      renderer_->skinning_buffer);
         }
     }
-    draw_overlay();
+
+    const auto opaque_lists =
+        renderer_->record_mesh_draws_parallel(*context_, opaque_draws, false);
+    lists.insert(lists.end(), opaque_lists.begin(), opaque_lists.end());
+
+    std::stable_sort(transparent_draws.begin(), transparent_draws.end(),
+                     [](const render::SubsetDraw& a, const render::SubsetDraw& b) {
+                         return a.depth > b.depth;
+                     });
+    const auto transparent_lists =
+        renderer_->record_mesh_draws_parallel(*context_, transparent_draws, true);
+    lists.insert(lists.end(), transparent_lists.begin(), transparent_lists.end());
+
+    add_list(renderer_->record_overlay_lines(*context_, build_overlay_vertices()));
+
+    for (const auto& list : lists) {
+        context_->execute_command_list(list.Get(), false);
+    }
     context_->end_scene();
 
     if (context_->scene_target_ready()) {
@@ -1304,16 +1391,13 @@ void D3DViewport::render_scene() {
     }
 }
 
-void D3DViewport::draw_overlay() {
-    if (!context_ || !renderer_) {
-        return;
-    }
+std::vector<render::OverlayVertex> D3DViewport::build_overlay_vertices() const {
+    std::vector<render::OverlayVertex> vertices;
     const ModelInstance* model = active_model();
     if (model == nullptr) {
-        return;
+        return vertices;
     }
     const Vec3 offset = model->offset;
-    std::vector<render::OverlayVertex> vertices;
     const auto line = [&](const Vec3& a, const Vec3& b, const std::array<float, 4>& color) {
         vertices.push_back({{a.x, a.y, a.z}, color});
         vertices.push_back({{b.x, b.y, b.z}, color});
@@ -1396,13 +1480,7 @@ void D3DViewport::draw_overlay() {
         }
     }
 
-    if (!vertices.empty()) {
-        try {
-            renderer_->render_overlay_lines(*context_, vertices);
-        } catch (const std::exception& error) {
-            core::log_msg(std::string("[studio] overlay failed: ") + error.what());
-        }
-    }
+    return vertices;
 }
 
 void D3DViewport::mousePressEvent(QMouseEvent* event) {
@@ -1516,9 +1594,6 @@ void D3DViewport::keyPressEvent(QKeyEvent* event) {
         break;
     case Qt::Key_J:
         state_.jiggle_enabled = !state_.jiggle_enabled;
-        break;
-    case Qt::Key_M:
-        state_.multithreaded = !state_.multithreaded;
         break;
     case Qt::Key_R:
         request_physics_reset();

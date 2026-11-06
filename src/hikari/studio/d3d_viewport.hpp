@@ -88,7 +88,7 @@ private:
     void tick();
     void tick_impl();
     void render_scene();
-    void draw_overlay();
+    std::vector<render::OverlayVertex> build_overlay_vertices() const;
     void update_camera();
     void evaluate_frame(float frame);
     void apply_editor_tracks(ModelInstance* model, float frame, bool apply_scene_values);

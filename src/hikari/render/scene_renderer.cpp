@@ -266,61 +266,76 @@ void SceneRenderer::set_light(const std::array<float, 3>& color,
     light_direction = {direction[0], direction[1], direction[2], 0.0f};
 }
 
-void SceneRenderer::render_ground_shadow(core::D3D11Context& context, const Vec3& center,
-                                         float radius, const std::array<float, 4>& color) {
-    std::vector<OverlayVertex> vertices;
-    constexpr int kSegments = 48;
-    const auto ring = [&](float scale, float alpha) {
-        const std::array<float, 4> ring_color{color[0], color[1], color[2], color[3] * alpha};
-        const Vec3 origin(center.x, 0.02f, center.z);
-        for (int i = 0; i < kSegments; ++i) {
-            const float a0 = static_cast<float>(i) * 2.0f * 3.14159265358979323846f /
-                             static_cast<float>(kSegments);
-            const float a1 = static_cast<float>(i + 1) * 2.0f * 3.14159265358979323846f /
-                             static_cast<float>(kSegments);
-            vertices.push_back({{origin.x, origin.y, origin.z}, ring_color});
-            vertices.push_back(
-                {{origin.x + std::cos(a0) * radius * scale, origin.y,
-                  origin.z + std::sin(a0) * radius * scale},
-                 ring_color});
-            vertices.push_back(
-                {{origin.x + std::cos(a1) * radius * scale, origin.y,
-                  origin.z + std::sin(a1) * radius * scale},
-                 ring_color});
-        }
-    };
-    ring(1.0f, 0.35f);
-    ring(0.72f, 0.55f);
-    ring(0.45f, 0.8f);
-    if (vertices.empty()) {
-        return;
-    }
-
-    if (!overlay_vb || overlay_capacity < vertices.size()) {
-        std::size_t capacity = 4096;
-        while (capacity < vertices.size()) {
-            capacity *= 2;
+void SceneRenderer::upload_overlay_vertices(core::D3D11Context& context,
+                                            Microsoft::WRL::ComPtr<ID3D11Buffer>& buffer,
+                                            std::size_t& capacity,
+                                            const std::vector<OverlayVertex>& vertices) {
+    if (!buffer || capacity < vertices.size()) {
+        std::size_t new_capacity = 4096;
+        while (new_capacity < vertices.size()) {
+            new_capacity *= 2;
         }
         D3D11_BUFFER_DESC desc{};
-        desc.ByteWidth = static_cast<UINT>(capacity * sizeof(OverlayVertex));
+        desc.ByteWidth = static_cast<UINT>(new_capacity * sizeof(OverlayVertex));
         desc.Usage = D3D11_USAGE_DYNAMIC;
         desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(context.device->CreateBuffer(&desc, nullptr,
-                                                overlay_vb.ReleaseAndGetAddressOf()))) {
-            throw std::runtime_error("CreateBuffer ground shadow failed");
+                                                buffer.ReleaseAndGetAddressOf()))) {
+            throw std::runtime_error("CreateBuffer overlay failed");
         }
-        overlay_capacity = capacity;
+        capacity = new_capacity;
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context.context->Map(overlay_vb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        throw std::runtime_error("Map ground shadow buffer failed");
+    if (FAILED(context.context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        throw std::runtime_error("Map overlay buffer failed");
     }
     std::memcpy(mapped.pData, vertices.data(), vertices.size() * sizeof(OverlayVertex));
-    context.context->Unmap(overlay_vb.Get(), 0);
+    context.context->Unmap(buffer.Get(), 0);
+}
 
-    auto* target = context.context.Get();
+Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_ground_shadows(
+    core::D3D11Context& context, const std::vector<GroundShadow>& shadows) {
+    if (shadows.empty()) {
+        return {};
+    }
+    std::vector<OverlayVertex> vertices;
+    constexpr int kSegments = 48;
+    for (const auto& shadow : shadows) {
+        const auto ring = [&](float scale, float alpha) {
+            const std::array<float, 4> ring_color{shadow.color[0], shadow.color[1],
+                                                  shadow.color[2],
+                                                  shadow.color[3] * alpha};
+            const Vec3 origin(shadow.center.x, 0.02f, shadow.center.z);
+            for (int i = 0; i < kSegments; ++i) {
+                const float a0 = static_cast<float>(i) * 2.0f * 3.14159265358979323846f /
+                                 static_cast<float>(kSegments);
+                const float a1 = static_cast<float>(i + 1) * 2.0f * 3.14159265358979323846f /
+                                 static_cast<float>(kSegments);
+                vertices.push_back({{origin.x, origin.y, origin.z}, ring_color});
+                vertices.push_back(
+                    {{origin.x + std::cos(a0) * shadow.radius * scale, origin.y,
+                      origin.z + std::sin(a0) * shadow.radius * scale},
+                     ring_color});
+                vertices.push_back(
+                    {{origin.x + std::cos(a1) * shadow.radius * scale, origin.y,
+                      origin.z + std::sin(a1) * shadow.radius * scale},
+                     ring_color});
+            }
+        };
+        ring(1.0f, 0.35f);
+        ring(0.72f, 0.55f);
+        ring(0.45f, 0.8f);
+    }
+    if (vertices.empty()) {
+        return {};
+    }
+
+    upload_overlay_vertices(context, shadow_vb, shadow_capacity, vertices);
+
+    auto deferred = context.acquire_deferred_context();
+    auto* target = deferred.Get();
     context.bind_render_targets_to(target);
     context.set_viewport_on(target, static_cast<float>(context.render_width),
                             static_cast<float>(context.render_height));
@@ -331,7 +346,7 @@ void SceneRenderer::render_ground_shadow(core::D3D11Context& context, const Vec3
     target->VSSetConstantBuffers(0, 1, camera_buffers);
     const UINT stride = sizeof(OverlayVertex);
     const UINT offset = 0;
-    ID3D11Buffer* buffers[] = {overlay_vb.Get()};
+    ID3D11Buffer* buffers[] = {shadow_vb.Get()};
     target->IASetVertexBuffers(0, 1, buffers, &stride, &offset);
     target->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     target->OMSetDepthStencilState(
@@ -342,19 +357,25 @@ void SceneRenderer::render_ground_shadow(core::D3D11Context& context, const Vec3
     target->RSSetState(
         context.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
     target->Draw(static_cast<UINT>(vertices.size()), 0);
+    auto list = core::D3D11Context::finish_command_list(target, false);
+    context.recycle_deferred_context(std::move(deferred));
+    return list;
 }
 
-void SceneRenderer::render_viewport_background(core::D3D11Context& context,
-                                               const std::array<float, 4>& color) {
-    auto* target = context.context.Get();
-    context.bind_render_targets_to(target);
+Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_background(
+    core::D3D11Context& context, const std::array<float, 4>& color) {
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(target->Map(bg_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+    if (FAILED(context.context->Map(bg_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         throw std::runtime_error("Map background buffer failed");
     }
     std::memcpy(mapped.pData, color.data(), 16);
-    target->Unmap(bg_buffer.Get(), 0);
+    context.context->Unmap(bg_buffer.Get(), 0);
 
+    auto deferred = context.acquire_deferred_context();
+    auto* target = deferred.Get();
+    context.bind_render_targets_to(target);
+    context.set_viewport_on(target, static_cast<float>(context.render_width),
+                            static_cast<float>(context.render_height));
     target->IASetInputLayout(nullptr);
     target->VSSetShader(bg_vs.Get(), nullptr, 0);
     target->PSSetShader(bg_ps.Get(), nullptr, 0);
@@ -366,10 +387,18 @@ void SceneRenderer::render_viewport_background(core::D3D11Context& context,
     const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     target->OMSetBlendState(context.state_manager->get_blend(core::BlendPreset::Opaque),
                             blend_factor, 0xFFFFFFFF);
+    target->RSSetState(
+        context.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
     target->Draw(3, 0);
+    auto list = core::D3D11Context::finish_command_list(target, false);
+    context.recycle_deferred_context(std::move(deferred));
+    return list;
 }
 
-void SceneRenderer::render_grid_to(core::D3D11Context& context, ID3D11DeviceContext* target) {
+Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_grid(
+    core::D3D11Context& context) {
+    auto deferred = context.acquire_deferred_context();
+    auto* target = deferred.Get();
     context.bind_render_targets_to(target);
     context.set_viewport_on(target, static_cast<float>(context.render_width),
                             static_cast<float>(context.render_height));
@@ -392,25 +421,17 @@ void SceneRenderer::render_grid_to(core::D3D11Context& context, ID3D11DeviceCont
     target->OMSetBlendState(context.state_manager->get_blend(core::BlendPreset::Opaque),
                             blend_factor, 0xFFFFFFFF);
     target->Draw(grid_vertex_count, 0);
+    auto list = core::D3D11Context::finish_command_list(target, false);
+    context.recycle_deferred_context(std::move(deferred));
+    return list;
 }
 
-void SceneRenderer::render_grid(core::D3D11Context& context, const Camera& camera) {
-    update_camera(context, camera);
-    render_grid_to(context, context.context.Get());
-}
-
-Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_grid(
-    core::D3D11Context& context, ID3D11DeviceContext* deferred) {
-    render_grid_to(context, deferred);
-    return core::D3D11Context::finish_command_list(deferred, false);
-}
-
-void SceneRenderer::render_mesh_subsets_to(core::D3D11Context& context,
-                                           ID3D11DeviceContext* target, const GpuMesh& mesh,
-                                           const std::vector<GpuMaterial>& materials,
-                                           const std::vector<std::optional<GpuTexture>>& textures,
-                                           const GpuSkinningBuffer& skinning,
-                                           std::size_t first_subset, std::size_t last_subset) {
+void SceneRenderer::render_mesh_draws_to(core::D3D11Context& context,
+                                         ID3D11DeviceContext* target, const SubsetDraw* draws,
+                                         std::size_t count, bool transparent) {
+    if (count == 0) {
+        return;
+    }
     context.bind_render_targets_to(target);
     context.set_viewport_on(target, static_cast<float>(context.render_width),
                             static_cast<float>(context.render_height));
@@ -420,102 +441,91 @@ void SceneRenderer::render_mesh_subsets_to(core::D3D11Context& context,
     ID3D11Buffer* camera_buffers[] = {camera_buffer.Get()};
     target->VSSetConstantBuffers(0, 1, camera_buffers);
     target->PSSetConstantBuffers(0, 1, camera_buffers);
-    skinning.bind_vs_to(target, 0);
     auto* sampler = context.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
     target->PSSetSamplers(0, 1, &sampler);
     target->RSSetState(context.state_manager->get_rasterizer(
         wireframe ? core::RasterizerPreset::Wireframe : core::RasterizerPreset::CullNoneSolid));
     const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    target->OMSetBlendState(context.state_manager->get_blend(core::BlendPreset::AlphaBlend),
-                            blend_factor, 0xFFFFFFFF);
-    mesh.bind_to(target);
+    target->OMSetBlendState(
+        context.state_manager->get_blend(transparent ? core::BlendPreset::AlphaBlend
+                                                     : core::BlendPreset::Opaque),
+        blend_factor, 0xFFFFFFFF);
+    target->OMSetDepthStencilState(
+        context.state_manager->get_depth(transparent ? core::DepthPreset::ReadOnlyLessEqual
+                                                     : core::DepthPreset::ReadWriteLessEqual),
+        1);
 
-    const std::size_t start = std::min(first_subset, mesh.subsets.size());
-    const std::size_t end = std::min(last_subset, mesh.subsets.size());
-    const auto is_transparent = [&](const MeshSubset& subset) {
-        return subset.material_index < materials.size() &&
-               materials[subset.material_index].constants.diffuse[3] < 0.999f;
-    };
-    const auto draw_subset = [&](const MeshSubset& subset) {
+    const GpuMesh* bound_mesh = nullptr;
+    const GpuSkinningBuffer* bound_skinning = nullptr;
+    for (std::size_t i = 0; i < count; ++i) {
+        const SubsetDraw& draw = draws[i];
+        if (draw.mesh == nullptr || draw.materials == nullptr || draw.textures == nullptr ||
+            draw.skinning == nullptr || draw.subset >= draw.mesh->subsets.size()) {
+            continue;
+        }
+        if (draw.mesh != bound_mesh) {
+            draw.mesh->bind_to(target);
+            bound_mesh = draw.mesh;
+        }
+        if (draw.skinning != bound_skinning) {
+            draw.skinning->bind_vs_to(target, 0);
+            bound_skinning = draw.skinning;
+        }
+
+        const MeshSubset& subset = draw.mesh->subsets[draw.subset];
         ID3D11ShaderResourceView* srv = default_white_texture.srv.Get();
-        if (subset.material_index < materials.size()) {
-            const auto& material = materials[subset.material_index];
+        if (subset.material_index < draw.materials->size()) {
+            const GpuMaterial& material = (*draw.materials)[subset.material_index];
             material.bind_to(target, 1);
             if (material.texture_index >= 0 &&
-                static_cast<std::size_t>(material.texture_index) < textures.size() &&
-                textures[static_cast<std::size_t>(material.texture_index)]) {
-                srv = textures[static_cast<std::size_t>(material.texture_index)]->srv.Get();
+                static_cast<std::size_t>(material.texture_index) < draw.textures->size() &&
+                (*draw.textures)[static_cast<std::size_t>(material.texture_index)]) {
+                srv = (*draw.textures)[static_cast<std::size_t>(material.texture_index)]->srv.Get();
             }
         }
         target->PSSetShaderResources(0, 1, &srv);
         target->DrawIndexed(subset.index_count, subset.index_start, 0);
-    };
-
-    target->OMSetDepthStencilState(
-        context.state_manager->get_depth(core::DepthPreset::ReadWriteLessEqual), 1);
-    for (std::size_t i = start; i < end; ++i) {
-        if (!is_transparent(mesh.subsets[i])) {
-            draw_subset(mesh.subsets[i]);
-        }
-    }
-    const bool any_transparent = std::any_of(mesh.subsets.begin() + static_cast<std::ptrdiff_t>(start),
-                                             mesh.subsets.begin() + static_cast<std::ptrdiff_t>(end),
-                                             is_transparent);
-    if (any_transparent) {
-        target->OMSetDepthStencilState(
-            context.state_manager->get_depth(core::DepthPreset::ReadOnlyLessEqual), 1);
-        for (std::size_t i = end; i > start; --i) {
-            if (is_transparent(mesh.subsets[i - 1])) {
-                draw_subset(mesh.subsets[i - 1]);
-            }
-        }
     }
 }
 
-void SceneRenderer::render_mesh_to(core::D3D11Context& context, ID3D11DeviceContext* target,
-                                   const GpuMesh& mesh,
-                                   const std::vector<GpuMaterial>& materials,
-                                   const std::vector<std::optional<GpuTexture>>& textures,
-                                   const GpuSkinningBuffer& skinning) {
-    render_mesh_subsets_to(context, target, mesh, materials, textures, skinning, 0,
-                           mesh.subsets.size());
-}
-
-Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_mesh_subsets(
-    core::D3D11Context& context, ID3D11DeviceContext* deferred, const GpuMesh& mesh,
-    const std::vector<GpuMaterial>& materials,
-    const std::vector<std::optional<GpuTexture>>& textures, const GpuSkinningBuffer& skinning,
-    std::size_t first_subset, std::size_t last_subset) {
-    render_mesh_subsets_to(context, deferred, mesh, materials, textures, skinning, first_subset,
-                           last_subset);
+Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_mesh_draws(
+    core::D3D11Context& context, ID3D11DeviceContext* deferred, const SubsetDraw* draws,
+    std::size_t count, bool transparent) {
+    render_mesh_draws_to(context, deferred, draws, count, transparent);
     return core::D3D11Context::finish_command_list(deferred, false);
 }
 
 std::vector<Microsoft::WRL::ComPtr<ID3D11CommandList>>
-SceneRenderer::record_mesh_subsets_parallel(core::D3D11Context& context, const GpuMesh& mesh,
-                                            const std::vector<GpuMaterial>& materials,
-                                            const std::vector<std::optional<GpuTexture>>& textures,
-                                            const GpuSkinningBuffer& skinning,
-                                            std::size_t num_threads) {
-    const std::size_t total = mesh.subsets.size();
-    if (total == 0) {
+SceneRenderer::record_mesh_draws_parallel(core::D3D11Context& context,
+                                          const std::vector<SubsetDraw>& draws,
+                                          bool transparent, std::size_t max_threads) {
+    if (draws.empty()) {
         return {};
     }
-    const std::size_t threads = std::clamp<std::size_t>(num_threads, 1, total);
+    constexpr std::size_t kMaxRecordingThreads = 4;
+    std::size_t requested = max_threads;
+    if (requested == 0) {
+        const unsigned hardware = std::thread::hardware_concurrency();
+        requested = hardware == 0 ? kMaxRecordingThreads : static_cast<std::size_t>(hardware);
+    }
+    requested = std::min(requested, kMaxRecordingThreads);
+    // Transparent subsets must stay in a single list to preserve the sorted order.
+    const std::size_t threads =
+        transparent ? 1 : std::clamp<std::size_t>(requested, 1, draws.size());
     if (threads <= 1) {
         auto deferred = context.acquire_deferred_context();
-        auto list = record_mesh_subsets(context, deferred.Get(), mesh, materials, textures,
-                                        skinning, 0, total);
+        auto list =
+            record_mesh_draws(context, deferred.Get(), draws.data(), draws.size(), transparent);
         context.recycle_deferred_context(std::move(deferred));
         return {std::move(list)};
     }
 
-    const std::size_t chunk = (total + threads - 1) / threads;
+    const std::size_t chunk = (draws.size() + threads - 1) / threads;
     std::vector<std::pair<std::size_t, std::size_t>> ranges;
     for (std::size_t i = 0; i < threads; ++i) {
         const std::size_t start = i * chunk;
-        if (start < total) {
-            ranges.push_back({start, std::min(start + chunk, total)});
+        if (start < draws.size()) {
+            ranges.push_back({start, std::min(start + chunk, draws.size())});
         }
     }
 
@@ -527,9 +537,9 @@ SceneRenderer::record_mesh_subsets_parallel(core::D3D11Context& context, const G
     std::vector<std::thread> workers;
     for (std::size_t i = 0; i < ranges.size(); ++i) {
         workers.emplace_back([&, i] {
-            results[i] = record_mesh_subsets(context, deferred_contexts[i].Get(), mesh, materials,
-                                             textures, skinning, ranges[i].first,
-                                             ranges[i].second);
+            results[i] = record_mesh_draws(context, deferred_contexts[i].Get(),
+                                           draws.data() + ranges[i].first,
+                                           ranges[i].second - ranges[i].first, transparent);
         });
     }
     for (auto& worker : workers) {
@@ -541,44 +551,15 @@ SceneRenderer::record_mesh_subsets_parallel(core::D3D11Context& context, const G
     return results;
 }
 
-void SceneRenderer::render_mesh(core::D3D11Context& context, const GpuMesh& mesh,
-                                const std::vector<GpuMaterial>& materials,
-                                const std::vector<std::optional<GpuTexture>>& textures,
-                                const std::vector<Mat4>& skinning_palette, const Camera& camera) {
-    update_camera(context, camera);
-    skinning_buffer.update(context, skinning_palette);
-    render_mesh_to(context, context.context.Get(), mesh, materials, textures, skinning_buffer);
-}
-
-void SceneRenderer::render_overlay_lines(core::D3D11Context& context,
-                                         const std::vector<OverlayVertex>& vertices) {
+Microsoft::WRL::ComPtr<ID3D11CommandList> SceneRenderer::record_overlay_lines(
+    core::D3D11Context& context, const std::vector<OverlayVertex>& vertices) {
     if (vertices.empty()) {
-        return;
+        return {};
     }
-    if (!overlay_vb || overlay_capacity < vertices.size()) {
-        std::size_t capacity = 4096;
-        while (capacity < vertices.size()) {
-            capacity *= 2;
-        }
-        D3D11_BUFFER_DESC desc{};
-        desc.ByteWidth = static_cast<UINT>(capacity * sizeof(OverlayVertex));
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(context.device->CreateBuffer(&desc, nullptr, overlay_vb.ReleaseAndGetAddressOf()))) {
-            throw std::runtime_error("CreateBuffer overlay failed");
-        }
-        overlay_capacity = capacity;
-    }
+    upload_overlay_vertices(context, overlay_vb, overlay_capacity, vertices);
 
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context.context->Map(overlay_vb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-        throw std::runtime_error("Map overlay buffer failed");
-    }
-    std::memcpy(mapped.pData, vertices.data(), vertices.size() * sizeof(OverlayVertex));
-    context.context->Unmap(overlay_vb.Get(), 0);
-
-    auto* target = context.context.Get();
+    auto deferred = context.acquire_deferred_context();
+    auto* target = deferred.Get();
     context.bind_render_targets_to(target);
     context.set_viewport_on(target, static_cast<float>(context.render_width),
                             static_cast<float>(context.render_height));
@@ -600,6 +581,9 @@ void SceneRenderer::render_overlay_lines(core::D3D11Context& context,
     target->RSSetState(
         context.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
     target->Draw(static_cast<UINT>(vertices.size()), 0);
+    auto list = core::D3D11Context::finish_command_list(target, false);
+    context.recycle_deferred_context(std::move(deferred));
+    return list;
 }
 
 } // namespace hikari::render

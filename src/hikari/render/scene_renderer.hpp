@@ -36,12 +36,28 @@ struct OverlayVertex {
     std::array<float, 4> color{};
 };
 
+// One material subset draw. Depth is the view-space distance used to sort
+// transparent subsets back to front; it is ignored for opaque draws.
+struct SubsetDraw {
+    const GpuMesh* mesh = nullptr;
+    const std::vector<GpuMaterial>* materials = nullptr;
+    const std::vector<std::optional<GpuTexture>>* textures = nullptr;
+    const GpuSkinningBuffer* skinning = nullptr;
+    std::size_t subset = 0;
+    float depth = 0.0f;
+};
+
+struct GroundShadow {
+    Vec3 center;
+    float radius = 1.0f;
+    std::array<float, 4> color{};
+};
+
 class SceneRenderer {
 public:
     explicit SceneRenderer(core::D3D11Context& context);
 
     Microsoft::WRL::ComPtr<ID3D11Buffer> camera_buffer;
-    GpuSkinningBuffer skinning_buffer;
     GpuTexture default_white_texture;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> default_vs;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> default_ps;
@@ -55,47 +71,39 @@ public:
     Microsoft::WRL::ComPtr<ID3D11VertexShader> bg_vs;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> bg_ps;
     bool wireframe = false;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> overlay_vb;
-    std::size_t overlay_capacity = 0;
     std::array<float, 4> light_color{0.6f, 0.6f, 0.6f, 1.0f};
     std::array<float, 4> light_direction{-0.5f, -1.0f, -0.5f, 0.0f};
-
-    void render_overlay_lines(core::D3D11Context& context,
-                              const std::vector<OverlayVertex>& vertices);
 
     void set_light(const std::array<float, 3>& color, const std::array<float, 3>& direction);
     void update_camera_on(ID3D11DeviceContext* context, const Camera& camera) const;
     void update_camera(core::D3D11Context& context, const Camera& camera) const;
-    void render_viewport_background(core::D3D11Context& context, const std::array<float, 4>& color);
-    void render_ground_shadow(core::D3D11Context& context, const Vec3& center, float radius,
-                              const std::array<float, 4>& color);
-    void render_grid_to(core::D3D11Context& context, ID3D11DeviceContext* target);
-    void render_grid(core::D3D11Context& context, const Camera& camera);
-    Microsoft::WRL::ComPtr<ID3D11CommandList> record_grid(core::D3D11Context& context,
-                                                          ID3D11DeviceContext* deferred);
-    void render_mesh_subsets_to(core::D3D11Context& context, ID3D11DeviceContext* target,
-                                const GpuMesh& mesh, const std::vector<GpuMaterial>& materials,
-                                const std::vector<std::optional<GpuTexture>>& textures,
-                                const GpuSkinningBuffer& skinning, std::size_t first_subset,
-                                std::size_t last_subset);
-    void render_mesh_to(core::D3D11Context& context, ID3D11DeviceContext* target,
-                        const GpuMesh& mesh, const std::vector<GpuMaterial>& materials,
-                        const std::vector<std::optional<GpuTexture>>& textures,
-                        const GpuSkinningBuffer& skinning);
-    Microsoft::WRL::ComPtr<ID3D11CommandList> record_mesh_subsets(
-        core::D3D11Context& context, ID3D11DeviceContext* deferred, const GpuMesh& mesh,
-        const std::vector<GpuMaterial>& materials,
-        const std::vector<std::optional<GpuTexture>>& textures, const GpuSkinningBuffer& skinning,
-        std::size_t first_subset, std::size_t last_subset);
-    std::vector<Microsoft::WRL::ComPtr<ID3D11CommandList>> record_mesh_subsets_parallel(
-        core::D3D11Context& context, const GpuMesh& mesh,
-        const std::vector<GpuMaterial>& materials,
-        const std::vector<std::optional<GpuTexture>>& textures, const GpuSkinningBuffer& skinning,
-        std::size_t num_threads);
-    void render_mesh(core::D3D11Context& context, const GpuMesh& mesh,
-                     const std::vector<GpuMaterial>& materials,
-                     const std::vector<std::optional<GpuTexture>>& textures,
-                     const std::vector<Mat4>& skinning_palette, const Camera& camera);
+
+    Microsoft::WRL::ComPtr<ID3D11CommandList> record_background(
+        core::D3D11Context& context, const std::array<float, 4>& color);
+    Microsoft::WRL::ComPtr<ID3D11CommandList> record_grid(core::D3D11Context& context);
+    Microsoft::WRL::ComPtr<ID3D11CommandList> record_ground_shadows(
+        core::D3D11Context& context, const std::vector<GroundShadow>& shadows);
+    Microsoft::WRL::ComPtr<ID3D11CommandList> record_overlay_lines(
+        core::D3D11Context& context, const std::vector<OverlayVertex>& vertices);
+    Microsoft::WRL::ComPtr<ID3D11CommandList> record_mesh_draws(
+        core::D3D11Context& context, ID3D11DeviceContext* deferred, const SubsetDraw* draws,
+        std::size_t count, bool transparent);
+    std::vector<Microsoft::WRL::ComPtr<ID3D11CommandList>> record_mesh_draws_parallel(
+        core::D3D11Context& context, const std::vector<SubsetDraw>& draws, bool transparent,
+        std::size_t max_threads = 0);
+
+private:
+    void render_mesh_draws_to(core::D3D11Context& context, ID3D11DeviceContext* target,
+                              const SubsetDraw* draws, std::size_t count, bool transparent);
+    void upload_overlay_vertices(core::D3D11Context& context,
+                                 Microsoft::WRL::ComPtr<ID3D11Buffer>& buffer,
+                                 std::size_t& capacity,
+                                 const std::vector<OverlayVertex>& vertices);
+
+    Microsoft::WRL::ComPtr<ID3D11Buffer> overlay_vb;
+    std::size_t overlay_capacity = 0;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> shadow_vb;
+    std::size_t shadow_capacity = 0;
 };
 
 } // namespace hikari::render

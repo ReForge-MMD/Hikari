@@ -64,8 +64,7 @@ saved; frame sequences are captured to BMP.
 Viewport controls: right drag orbits, middle drag pans, wheel zooms, left click selects
 a bone. The bottom-right gizmo rotates (first row) and moves (second row) the selected
 bone or the camera; click its title to switch between local and global axes. `Space`
-play/pause, `V` VSync, `P` physics, `J` jiggle, `M` multithreaded deferred rendering,
-`R` reset physics.
+play/pause, `V` VSync, `P` physics, `J` jiggle, `R` reset physics.
 
 Screen Size sets the offscreen viewport render resolution and aspect ratio; the
 application window keeps its size and the image is letterboxed. Physics speed
@@ -97,8 +96,10 @@ selection, parameter setters and getters, annotations, `SetTexture`, `BeginPass`
 
 ## Notes
 
-- The renderer records mesh passes on deferred contexts and executes the resulting
-  command lists on the immediate context; `M` toggles that path.
+- The renderer records the whole scene on deferred contexts and executes the resulting
+  command lists on the immediate context. Opaque material subsets are recorded in parallel;
+  blended subsets are sorted back to front across all visible models and drawn in one pass
+  with depth writes disabled.
 - PMX rigid body and joint rotations use the intrinsic YXZ convention (`qy * qx * qz`),
   matching the MMD authoring convention rather than glam's static-frame helper.
 - HMM/HMD mapping files are supported, including legacy EMM/EMD section syntax.

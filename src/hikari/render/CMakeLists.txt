@@ -1,7 +1,6 @@
 add_library(hikari_render STATIC
   material.cpp
   mesh.cpp
-  parallel.cpp
   scene_renderer.cpp
   skinning.cpp
   stb_impl.cpp

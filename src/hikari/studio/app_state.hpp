@@ -152,7 +152,6 @@ struct StudioAppState {
     bool fullscreen = false;
     bool info_display = true;
 
-    bool multithreaded = true;
     bool jiggle_enabled = true;
     bool vsync = false;
 

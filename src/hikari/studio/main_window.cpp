@@ -1193,13 +1193,11 @@ QWidget* MainWindow::build_playback_tab() {
     physics_speed_ = speed;
     layout->addLayout(speed_row);
     auto* loop = make_check(QStringLiteral("Loop"), state_.loop_playback);
-    auto* multithreaded = make_check(QStringLiteral("Deferred rendering"), state_.multithreaded);
     auto* jiggle = make_check(QStringLiteral("Jiggle dynamics"), state_.jiggle_enabled);
     auto* vsync = make_check(QStringLiteral("VSync"), state_.vsync);
     auto* physics = make_check(QStringLiteral("Physics"), state_.physics_mode != PhysicsMode::Disabled);
     auto* playtime = make_check(QStringLiteral("Only while playing"), state_.playtime_only);
     layout->addWidget(loop);
-    layout->addWidget(multithreaded);
     layout->addWidget(jiggle);
     layout->addWidget(vsync);
     layout->addWidget(physics);
@@ -1224,8 +1222,6 @@ QWidget* MainWindow::build_playback_tab() {
     });
     connect(loop, &QCheckBox::toggled, this,
             [this](bool checked) { state_.loop_playback = checked; });
-    connect(multithreaded, &QCheckBox::toggled, this,
-            [this](bool checked) { state_.multithreaded = checked; });
     connect(jiggle, &QCheckBox::toggled, this,
             [this](bool checked) { state_.jiggle_enabled = checked; });
     connect(vsync, &QCheckBox::toggled, this,
@@ -1593,7 +1589,6 @@ void MainWindow::show_shortcuts_dialog() {
                        "V - VSync\n"
                        "P - physics simulation\n"
                        "J - jiggle dynamics\n"
-                       "M - multithreaded rendering\n"
                        "R - reset physics"));
 }
 
