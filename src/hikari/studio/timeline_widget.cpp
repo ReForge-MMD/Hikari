@@ -153,6 +153,7 @@ void TimelineWidget::rebuild_rows() const {
 
     rows_cache_.push_back({QStringLiteral("view cnt"), TimelineRowKind::Channel, 0});
     rows_cache_.push_back({QStringLiteral("Disp/IK/OP"), TimelineRowKind::Channel, 0});
+    rows_cache_.push_back({QStringLiteral("model scale"), TimelineRowKind::Channel, 0});
     rows_cache_.push_back({QStringLiteral("Facial"), TimelineRowKind::Channel, 0});
 
     QSet<QString> bone_names;

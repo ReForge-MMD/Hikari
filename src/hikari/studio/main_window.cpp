@@ -240,10 +240,55 @@ void MainWindow::build_menus() {
         state_.set_status(QStringLiteral("Created new project"));
         refresh_targets();
     });
+    auto* open_project = file_menu->addAction(QStringLiteral("Open Project (.hkp)..."), this, [this] {
+        const QString path = QFileDialog::getOpenFileName(
+            this, QStringLiteral("Open Hikari project"), state_.default_directory,
+            QStringLiteral("Hikari Project (*.hkp)"));
+        if (path.isEmpty()) {
+            return;
+        }
+        if (viewport_->load_project(path)) {
+            refresh_targets();
+            refresh_model_list();
+            refresh_morph_combos();
+            timeline_->refresh_layout();
+            timeline_->update();
+            header_->set_frame(static_cast<int>(state_.current_frame));
+            footer_->sync();
+            update_viewport_title();
+        }
+    });
+    open_project->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+O")));
+    auto* save_project = file_menu->addAction(QStringLiteral("Save Project (.hkp)..."), this, [this] {
+        const QString path = QFileDialog::getSaveFileName(
+            this, QStringLiteral("Save Hikari project"), state_.default_directory,
+            QStringLiteral("Hikari Project (*.hkp)"));
+        if (!path.isEmpty()) {
+            viewport_->save_project(path);
+        }
+    });
+    save_project->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+S")));
+    file_menu->addSeparator();
     file_menu->addAction(QStringLiteral("Load PMX Model..."), this,
                          [this] { choose_model(); });
     file_menu->addAction(QStringLiteral("Load Motion (.VMD)..."), this,
                          [this] { choose_motion(); });
+    auto* load_hkm = file_menu->addAction(QStringLiteral("Load Hikari Motion (.hkm)..."), this, [this] {
+        const QString path = QFileDialog::getOpenFileName(
+            this, QStringLiteral("Load Hikari motion"), state_.default_directory,
+            QStringLiteral("Hikari Motion (*.hkm)"));
+        if (path.isEmpty()) {
+            return;
+        }
+        if (viewport_->load_motion_hkm(path)) {
+            refresh_targets();
+            timeline_->refresh_layout();
+            timeline_->update();
+            header_->set_frame(static_cast<int>(state_.current_frame));
+            footer_->sync();
+        }
+    });
+    load_hkm->setShortcut(QKeySequence(QStringLiteral("Ctrl+Alt+O")));
     file_menu->addSeparator();
     file_menu->addAction(QStringLiteral("Load Pose (.VPD)..."), this,
                          [this] { choose_vpd_load(); });
@@ -251,6 +296,15 @@ void MainWindow::build_menus() {
                          [this] { choose_vpd_save(); });
     file_menu->addAction(QStringLiteral("Save Motion (.VMD)..."), this,
                          [this] { choose_motion_save(); });
+    auto* save_hkm = file_menu->addAction(QStringLiteral("Save Hikari Motion (.hkm)..."), this, [this] {
+        const QString path = QFileDialog::getSaveFileName(
+            this, QStringLiteral("Save Hikari motion"), state_.default_directory,
+            QStringLiteral("Hikari Motion (*.hkm)"));
+        if (!path.isEmpty()) {
+            viewport_->save_motion_hkm(path);
+        }
+    });
+    save_hkm->setShortcut(QKeySequence(QStringLiteral("Ctrl+Alt+S")));
     file_menu->addSeparator();
     file_menu->addAction(QStringLiteral("Render Image (BMP)..."), this,
                          [this] { choose_render_image(); });
@@ -708,6 +762,9 @@ QWidget* MainWindow::build_model_tab() {
         QStringLiteral("Uniform model scale. Poses, motions and physics keep their authored "
                        "model-space units and scale together with the model."));
     scale_row->addWidget(model_scale_, 1);
+    auto* key_scale = new QPushButton(QStringLiteral("Key"));
+    key_scale->setToolTip(QStringLiteral("Register the model scale at the current frame"));
+    scale_row->addWidget(key_scale);
     layout->addLayout(scale_row);
     auto* register_button = new QPushButton(QStringLiteral("Register Disp/IK"));
     register_button->setToolTip(
@@ -732,6 +789,11 @@ QWidget* MainWindow::build_model_tab() {
         const float scale = static_cast<float>(value);
         state_.model_scale = scale;
         viewport_->set_model_scale(viewport_->active_model_index(), scale);
+    });
+    connect(key_scale, &QPushButton::clicked, this, [this] {
+        state_.register_keyframe(QStringLiteral("model scale"),
+                                 static_cast<unsigned int>(state_.current_frame));
+        timeline_->update();
     });
     connect(register_button, &QPushButton::clicked, this, [this] {
         state_.register_ik_keyframe(viewport_->ik_states(),
@@ -1436,6 +1498,11 @@ void MainWindow::refresh_morph_combos() {
 }
 
 void MainWindow::sync_bone_fields() {
+    if (model_scale_ != nullptr && !model_scale_->hasFocus()) {
+        model_scale_->blockSignals(true);
+        model_scale_->setValue(state_.model_scale);
+        model_scale_->blockSignals(false);
+    }
     const auto set_ik_check = [this](bool enabled, bool checked) {
         if (bone_ik_ == nullptr) {
             return;

@@ -308,6 +308,7 @@ bool D3DViewport::load_model(const QString& path) {
         models_.push_back(std::move(instance));
         active_model_ = static_cast<int>(models_.size()) - 1;
         motion_player_.reset();
+        motion_data_.reset();
         last_editor_frame_ = -1.0f;
         sync_active_model_state();
         update_stats();
@@ -371,6 +372,7 @@ void D3DViewport::sync_active_model_state() {
         state_.model_loaded = false;
         state_.model_name.clear();
         state_.model_scale = 1.0f;
+        state_.model_scale_dirty = false;
         state_.model_bone_names.clear();
         state_.selected_bone_idx.reset();
         state_.morph_weights.clear();
@@ -387,6 +389,7 @@ void D3DViewport::sync_active_model_state() {
     state_.model_loaded = true;
     state_.model_name = model->name;
     state_.model_scale = model->scale;
+    state_.model_scale_dirty = false;
     state_.model_visible = model->visible;
     state_.model_bone_names.clear();
     for (std::size_t i = 0; i < model->skeleton.bones.size(); ++i) {
@@ -453,6 +456,8 @@ void D3DViewport::set_model_scale(int index, float scale) {
     model.scale = scale;
     if (index == active_model_) {
         state_.model_scale = scale;
+        // Keep the edited value visible until the user registers a scale key.
+        state_.model_scale_dirty = true;
     }
     state_.set_status(QStringLiteral("Model scale: %1x").arg(scale, 0, 'f', 3));
 }
@@ -468,6 +473,7 @@ void D3DViewport::remove_active_model() {
         active_model_ = std::min(active_model_, static_cast<int>(models_.size()) - 1);
     }
     motion_player_.reset();
+    motion_data_.reset();
     last_editor_frame_ = -1.0f;
     sync_active_model_state();
     update_stats();
@@ -488,28 +494,7 @@ bool D3DViewport::load_motion(const QString& path) {
     try {
         const auto motion = formats::VmdMotion::parse(
             std::vector<std::uint8_t>(bytes.begin(), bytes.end()));
-        // A loaded motion owns the scene animation; authored scene tracks are cleared so
-        // VMD camera/light/shadow can drive the viewport. Any keys registered afterwards
-        // keep priority over the VMD data.
-        for (const QString& track :
-             {QStringLiteral("camera"), QStringLiteral("light"), QStringLiteral("shadow"),
-              QStringLiteral("gravity"), QStringLiteral("accessory")}) {
-            state_.track_keyframes.erase(track);
-        }
-        state_.selected_keyframes.clear();
-        state_.undo_stack.clear();
-        state_.redo_stack.clear();
-        ++state_.keyframe_revision;
-        motion_player_.emplace(motion);
-        state_.max_timeline_frame = static_cast<int>(motion_player_->max_frame);
-        state_.play_range = {0, state_.max_timeline_frame};
-        last_editor_frame_ = -1.0f;
-        state_.track_keys_dirty = true;
-        if (ModelInstance* model = active_model(); model != nullptr && model->physics_rig) {
-            model->physics_rig->request_reset();
-        }
-        emit statusMessage(QStringLiteral("Loaded motion: %1").arg(path));
-        return true;
+        return apply_parsed_motion(motion, path);
     } catch (const std::exception& error) {
         emit statusMessage(QStringLiteral("Failed to parse motion: %1")
                                .arg(QString::fromUtf8(error.what())));
@@ -580,7 +565,7 @@ bool D3DViewport::save_vpd(const QString& path) {
     return true;
 }
 
-bool D3DViewport::save_motion(const QString& path) {
+formats::VmdMotion D3DViewport::build_authored_vmd() const {
     const ModelInstance* model = active_model();
     formats::VmdMotion motion;
     motion.version = 2;
@@ -661,7 +646,8 @@ bool D3DViewport::save_motion(const QString& path) {
             }
             continue;
         }
-        if (track == QStringLiteral("gravity") || track == QStringLiteral("accessory")) {
+        if (track == QStringLiteral("gravity") || track == QStringLiteral("accessory") ||
+            track == QStringLiteral("model scale")) {
             continue;
         }
 
@@ -697,6 +683,14 @@ bool D3DViewport::save_motion(const QString& path) {
         }
     }
 
+    return motion;
+}
+
+bool D3DViewport::save_motion(const QString& path) {
+    const formats::VmdMotion motion = build_authored_vmd();
+    const std::size_t exported = motion.bone_frames.size() + motion.morph_frames.size() +
+                                 motion.camera_frames.size() + motion.light_frames.size() +
+                                 motion.shadow_frames.size() + motion.ik_frames.size();
     const std::vector<std::uint8_t> bytes = motion.to_bytes(motion.model_name);
     QFile file(path);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -711,10 +705,251 @@ bool D3DViewport::save_motion(const QString& path) {
     return true;
 }
 
+bool D3DViewport::apply_parsed_motion(const formats::VmdMotion& motion, const QString& label) {
+    // A loaded motion owns the scene animation; authored scene tracks are cleared so
+    // VMD camera/light/shadow can drive the viewport. Any keys registered afterwards
+    // keep priority over the VMD data.
+    for (const QString& track :
+         {QStringLiteral("camera"), QStringLiteral("light"), QStringLiteral("shadow"),
+          QStringLiteral("gravity"), QStringLiteral("accessory")}) {
+        state_.track_keyframes.erase(track);
+    }
+    state_.selected_keyframes.clear();
+    state_.undo_stack.clear();
+    state_.redo_stack.clear();
+    ++state_.keyframe_revision;
+    motion_player_.emplace(motion);
+    motion_data_ = motion;
+    state_.max_timeline_frame = static_cast<int>(motion_player_->max_frame);
+    state_.play_range = {0, state_.max_timeline_frame};
+    last_editor_frame_ = -1.0f;
+    state_.track_keys_dirty = true;
+    state_.model_scale_dirty = false;
+    if (ModelInstance* model = active_model(); model != nullptr && model->physics_rig) {
+        model->physics_rig->request_reset();
+    }
+    emit statusMessage(QStringLiteral("Loaded motion: %1").arg(label));
+    return true;
+}
+
+HikariMotion D3DViewport::build_hikari_motion() const {
+    HikariMotion result;
+    result.vmd = build_authored_vmd();
+    const ModelInstance* model = active_model();
+    const auto track = state_.track_keyframes.find(QStringLiteral("model scale"));
+    if (track != state_.track_keyframes.end() && !track->second.empty()) {
+        for (const auto& [frame, key] : track->second) {
+            ModelTransformKey transform;
+            transform.frame = frame;
+            transform.scale = key.scale;
+            if (model != nullptr) {
+                transform.position = model->offset.to_array();
+                transform.visible = model->visible;
+            }
+            result.model_keys.push_back(transform);
+        }
+    } else if (model != nullptr) {
+        ModelTransformKey transform;
+        transform.frame = 0;
+        transform.scale = model->scale;
+        transform.position = model->offset.to_array();
+        transform.visible = model->visible;
+        result.model_keys.push_back(transform);
+    }
+    return result;
+}
+
+bool D3DViewport::save_motion_hkm(const QString& path) {
+    const QByteArray bytes = hkm_to_json(build_hikari_motion());
+    QString error;
+    if (!write_project_file(path, bytes, &error)) {
+        emit statusMessage(QStringLiteral("Failed to save Hikari motion: %1").arg(error));
+        return false;
+    }
+    emit statusMessage(QStringLiteral("Saved Hikari motion: %1").arg(path));
+    return true;
+}
+
+bool D3DViewport::load_motion_hkm(const QString& path) {
+    QString error;
+    const auto bytes = read_project_file(path, &error);
+    if (!bytes) {
+        emit statusMessage(QStringLiteral("Failed to read Hikari motion: %1").arg(error));
+        return false;
+    }
+    auto motion = hkm_from_json(*bytes, &error);
+    if (!motion) {
+        emit statusMessage(QStringLiteral("Failed to parse Hikari motion: %1").arg(error));
+        return false;
+    }
+    if (!apply_parsed_motion(motion->vmd, path)) {
+        return false;
+    }
+    if (!motion->model_keys.empty()) {
+        std::stable_sort(motion->model_keys.begin(), motion->model_keys.end(),
+                         [](const ModelTransformKey& a, const ModelTransformKey& b) {
+                             return a.frame < b.frame;
+                         });
+        auto& track = state_.track_keyframes[QStringLiteral("model scale")];
+        track.clear();
+        for (const auto& transform : motion->model_keys) {
+            TrackKeyframe key;
+            key.scale = transform.scale;
+            track[transform.frame] = key;
+        }
+        state_.max_timeline_frame =
+            std::max(state_.max_timeline_frame,
+                     static_cast<int>(motion->model_keys.back().frame));
+        state_.play_range.second = state_.max_timeline_frame;
+        if (ModelInstance* model = active_model()) {
+            model->scale = motion->model_keys.front().scale;
+            state_.model_scale = model->scale;
+        }
+    }
+    state_.model_scale_dirty = false;
+    state_.track_keys_dirty = true;
+    emit statusMessage(QStringLiteral("Loaded Hikari motion: %1").arg(path));
+    return true;
+}
+
+bool D3DViewport::save_project(const QString& path) {
+    ProjectData project;
+    project.active_model = active_model_;
+    project.current_frame = static_cast<int>(state_.current_frame);
+    project.max_frame = state_.max_timeline_frame;
+    project.play_start = state_.play_range.first;
+    project.play_end = state_.play_range.second;
+    project.camera_mode = state_.mode == EditorMode::Camera;
+    project.scene.camera_pan = state_.camera_pan;
+    project.scene.camera_yaw = state_.camera_yaw;
+    project.scene.camera_pitch = state_.camera_pitch;
+    project.scene.camera_roll = state_.camera_roll;
+    project.scene.camera_distance = state_.camera_distance;
+    project.scene.camera_fov_deg = state_.camera_fov_deg;
+    project.scene.camera_orthographic = state_.camera_orthographic;
+    project.scene.light_color = state_.light_color;
+    project.scene.light_direction = state_.light_direction;
+    project.scene.shadow_mode = state_.shadow_mode;
+    project.scene.shadow_range = state_.shadow_range;
+    project.scene.shadow_detail = state_.shadow_detail;
+    project.scene.gravity = state_.gravity;
+    project.scene.gravity_noise = state_.gravity_noise;
+
+    for (const auto& model : models_) {
+        ProjectModel entry;
+        entry.path = model->path;
+        entry.name = model->name;
+        entry.offset = model->offset;
+        entry.scale = model->scale;
+        entry.visible = model->visible;
+        project.models.push_back(std::move(entry));
+    }
+
+    for (const auto& [track, keys] : state_.track_keyframes) {
+        for (const auto& [frame, key] : keys) {
+            project.tracks.push_back({track, frame, key});
+        }
+    }
+
+    if (motion_data_) {
+        HikariMotion motion;
+        motion.vmd = *motion_data_;
+        project.motion = std::move(motion);
+    }
+
+    QString error;
+    if (!write_project_file(path, hkp_to_json(project), &error)) {
+        emit statusMessage(QStringLiteral("Failed to save project: %1").arg(error));
+        return false;
+    }
+    emit statusMessage(QStringLiteral("Saved project: %1").arg(path));
+    return true;
+}
+
+bool D3DViewport::load_project(const QString& path) {
+    QString error;
+    const auto bytes = read_project_file(path, &error);
+    if (!bytes) {
+        emit statusMessage(QStringLiteral("Failed to read project: %1").arg(error));
+        return false;
+    }
+    auto project = hkp_from_json(*bytes, &error);
+    if (!project) {
+        emit statusMessage(QStringLiteral("Failed to parse project: %1").arg(error));
+        return false;
+    }
+
+    models_.clear();
+    active_model_ = -1;
+    motion_player_.reset();
+    motion_data_.reset();
+    for (const auto& entry : project->models) {
+        if (entry.path.isEmpty() || !load_model(entry.path)) {
+            emit statusMessage(QStringLiteral("Project model could not be loaded: %1")
+                                   .arg(entry.path));
+            continue;
+        }
+        ModelInstance& model = *models_.back();
+        model.offset = entry.offset;
+        model.scale = entry.scale;
+        model.visible = entry.visible;
+    }
+    if (models_.empty()) {
+        sync_active_model_state();
+        update_stats();
+        emit modelsChanged();
+        emit activeModelChanged();
+        emit statusMessage(QStringLiteral("Project contains no loadable models: %1").arg(path));
+        return false;
+    }
+
+    active_model_ = std::clamp(project->active_model, 0, static_cast<int>(models_.size()) - 1);
+    if (project->motion) {
+        apply_parsed_motion(project->motion->vmd, path);
+    } else {
+        motion_player_.reset();
+        motion_data_.reset();
+    }
+
+    state_.track_keyframes.clear();
+    for (const auto& track : project->tracks) {
+        state_.track_keyframes[track.name][track.frame] = track.key;
+    }
+    state_.selected_keyframes.clear();
+    state_.max_timeline_frame = project->max_frame;
+    state_.play_range = {project->play_start, project->play_end};
+    state_.current_frame = static_cast<float>(project->current_frame);
+    state_.mode = project->camera_mode ? EditorMode::Camera : EditorMode::Model;
+    state_.camera_pan = project->scene.camera_pan;
+    state_.camera_yaw = project->scene.camera_yaw;
+    state_.camera_pitch = project->scene.camera_pitch;
+    state_.camera_roll = project->scene.camera_roll;
+    state_.camera_distance = project->scene.camera_distance;
+    state_.camera_fov_deg = project->scene.camera_fov_deg;
+    state_.camera_orthographic = project->scene.camera_orthographic;
+    state_.light_color = project->scene.light_color;
+    state_.light_direction = project->scene.light_direction;
+    state_.shadow_mode = project->scene.shadow_mode;
+    state_.shadow_range = project->scene.shadow_range;
+    state_.shadow_detail = project->scene.shadow_detail;
+    state_.gravity = project->scene.gravity;
+    state_.gravity_noise = project->scene.gravity_noise;
+    last_editor_frame_ = -1.0f;
+    state_.track_keys_dirty = true;
+    state_.model_scale_dirty = false;
+    sync_active_model_state();
+    update_stats();
+    emit modelsChanged();
+    emit activeModelChanged();
+    emit statusMessage(QStringLiteral("Loaded project: %1").arg(path));
+    return true;
+}
+
 void D3DViewport::clear_model() {
     models_.clear();
     active_model_ = -1;
     motion_player_.reset();
+    motion_data_.reset();
     last_editor_frame_ = -1.0f;
     sync_active_model_state();
     update_stats();
@@ -1183,6 +1418,11 @@ void D3DViewport::update_camera() {
 
 void D3DViewport::evaluate_frame(float frame) {
     ModelInstance* model = active_model();
+    if (frame != last_editor_frame_) {
+        // A pending scale edit belongs to the frame where it was made. Moving the
+        // playhead hands control back to the authored scale track.
+        state_.model_scale_dirty = false;
+    }
     const float evaluated =
         motion_player_ && motion_player_->max_frame > 0
             ? std::fmod(frame, static_cast<float>(motion_player_->max_frame) + 1.0f)
@@ -1285,6 +1525,14 @@ void D3DViewport::apply_editor_tracks(ModelInstance* model, float frame,
                                  const std::array<float, 3>& b) {
             return std::array<float, 3>{mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])};
         };
+
+        if (track == QStringLiteral("model scale")) {
+            if (model != nullptr && !state_.model_scale_dirty) {
+                model->scale = std::clamp(mix(first->scale, second->scale), 0.05f, 20.0f);
+                state_.model_scale = model->scale;
+            }
+            continue;
+        }
 
         const bool scene_track =
             track == QStringLiteral("camera") || track == QStringLiteral("light") ||

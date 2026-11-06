@@ -15,6 +15,7 @@
 #include "hikari/render/scene_renderer.hpp"
 #include "hikari/studio/app_state.hpp"
 #include "hikari/studio/model_instance.hpp"
+#include "hikari/studio/project_io.hpp"
 
 class QTimer;
 
@@ -34,6 +35,10 @@ public:
     bool load_vpd(const QString& path);
     bool save_vpd(const QString& path);
     bool save_motion(const QString& path);
+    bool load_motion_hkm(const QString& path);
+    bool save_motion_hkm(const QString& path);
+    bool load_project(const QString& path);
+    bool save_project(const QString& path);
     void clear_model();
     void remove_active_model();
     void set_active_model(int index);
@@ -94,6 +99,9 @@ private:
     render::OverlayGeometry build_overlay_geometry() const;
     void update_camera();
     void evaluate_frame(float frame);
+    formats::VmdMotion build_authored_vmd() const;
+    HikariMotion build_hikari_motion() const;
+    bool apply_parsed_motion(const formats::VmdMotion& motion, const QString& label);
     void apply_ik_states(ModelInstance& model, float timeline_frame, float motion_frame);
     void apply_editor_tracks(ModelInstance* model, float frame, bool apply_scene_values);
     void apply_editor_bone_override();
@@ -112,6 +120,7 @@ private:
     std::vector<std::unique_ptr<ModelInstance>> models_;
     int active_model_ = -1;
     std::optional<animation::MotionPlayer> motion_player_;
+    std::optional<formats::VmdMotion> motion_data_;
     std::vector<Mat4> render_palette_;
 
     QTimer* timer_ = nullptr;

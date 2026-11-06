@@ -9,6 +9,8 @@ add_executable(hikari_studio WIN32
   main_window.cpp
   main_window.hpp
   model_instance.hpp
+  project_io.cpp
+  project_io.hpp
   theme.hpp
   timeline_widget.cpp
   timeline_widget.hpp

@@ -86,6 +86,10 @@ TrackKeyframe StudioAppState::capture_keyframe(const QString& track) const {
         key.weight = gravity_noise;
         return key;
     }
+    if (track == QStringLiteral("model scale")) {
+        key.scale = model_scale;
+        return key;
+    }
     if (track == QStringLiteral("accessory")) {
         key.position = accessory_pos;
         key.angles = accessory_rot;
@@ -160,6 +164,9 @@ void StudioAppState::register_keyframe(const QString& track, unsigned int frame,
         push_undo_snapshot();
     }
     track_keyframes[track][frame] = capture_keyframe(track);
+    if (track == QStringLiteral("model scale")) {
+        model_scale_dirty = false;
+    }
     track_keys_dirty = true;
     ++keyframe_revision;
     set_status(QStringLiteral("Registered keyframe for '%1' at frame %2").arg(track).arg(frame));

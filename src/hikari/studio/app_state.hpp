@@ -67,6 +67,7 @@ struct StudioAppState {
     QStringList loaded_models;
     int selected_model_idx = 0;
     float model_scale = 1.0f;
+    bool model_scale_dirty = false;
     bool model_visible = true;
     bool model_delete_requested = false;
     QStringList model_bone_names;
