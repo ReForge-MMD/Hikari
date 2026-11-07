@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <limits>
 
 #include "hikari/animation/bezier.hpp"
 #include "hikari/core/log.hpp"
@@ -505,7 +506,37 @@ void D3DViewport::remove_active_model() {
     if (active_model_ < 0 || active_model_ >= static_cast<int>(models_.size())) {
         return;
     }
+    const int removed = active_model_;
     models_.erase(models_.begin() + active_model_);
+    for (auto& model : models_) {
+        for (auto& attachment : model->skeleton.attachments) {
+            if (attachment.target_model == removed) {
+                attachment.target_model = -1;
+                attachment.target_bone = 0;
+            } else if (attachment.target_model > removed) {
+                --attachment.target_model;
+            }
+        }
+    }
+    if (state_.camera_parent_model == removed) {
+        state_.camera_parent_model = -1;
+        state_.camera_parent_bone = 0;
+    } else if (state_.camera_parent_model > removed) {
+        --state_.camera_parent_model;
+    }
+    for (auto& [track, frames] : state_.track_keyframes) {
+        if (track != QStringLiteral("camera")) {
+            continue;
+        }
+        for (auto& [frame, key] : frames) {
+            if (key.parent_model == removed) {
+                key.parent_model = -1;
+                key.parent_bone = 0;
+            } else if (key.parent_model > removed) {
+                --key.parent_model;
+            }
+        }
+    }
     if (models_.empty()) {
         active_model_ = -1;
     } else {
@@ -867,6 +898,9 @@ bool D3DViewport::save_project(const QString& path) {
     project.scene.camera_fov_deg = state_.camera_fov_deg;
     project.scene.camera_orthographic = state_.camera_orthographic;
     project.scene.camera_target = state_.camera_target;
+    project.scene.camera_follow = state_.camera_follow;
+    project.scene.camera_parent_model = state_.camera_parent_model;
+    project.scene.camera_parent_bone = state_.camera_parent_bone;
     project.scene.light_color = state_.light_color;
     project.scene.light_direction = state_.light_direction;
     project.scene.shadow_mode = state_.shadow_mode;
@@ -968,6 +1002,10 @@ bool D3DViewport::load_project(const QString& path) {
     state_.camera_fov_deg = project->scene.camera_fov_deg;
     state_.camera_orthographic = project->scene.camera_orthographic;
     state_.camera_target = project->scene.camera_target;
+    state_.camera_follow = project->scene.camera_follow;
+    state_.camera_parent_model = std::clamp(project->scene.camera_parent_model, -1,
+                                            static_cast<int>(models_.size()) - 1);
+    state_.camera_parent_bone = std::max(project->scene.camera_parent_bone, 0);
     state_.light_color = project->scene.light_color;
     state_.light_direction = project->scene.light_direction;
     state_.shadow_mode = project->scene.shadow_mode;
@@ -989,6 +1027,8 @@ bool D3DViewport::load_project(const QString& path) {
 void D3DViewport::clear_model() {
     models_.clear();
     active_model_ = -1;
+    state_.camera_parent_model = -1;
+    state_.camera_parent_bone = 0;
     motion_player_.reset();
     motion_data_.reset();
     last_editor_frame_ = -1.0f;
@@ -1219,6 +1259,301 @@ QMap<QString, bool> D3DViewport::ik_states() const {
     return states;
 }
 
+ModelInstance* D3DViewport::model_by_name(const QString& name) {
+    for (auto& model : models_) {
+        if (model->name == name) {
+            return model.get();
+        }
+    }
+    return nullptr;
+}
+
+namespace {
+
+Mat4 model_scene_matrix(const ModelInstance& model) {
+    const float scale = std::max(model.scale, 1.0e-4f);
+    return Mat4::from_scale(Vec3(scale, scale, scale)) * Mat4::from_translation(model.offset);
+}
+
+Mat4 model_scene_inverse(const ModelInstance& model) {
+    const float scale = std::max(model.scale, 1.0e-4f);
+    Mat4 inverse = Mat4::identity();
+    const float inv = 1.0f / scale;
+    inverse.m[0][0] = inv;
+    inverse.m[1][1] = inv;
+    inverse.m[2][2] = inv;
+    inverse.m[3][0] = -model.offset.x * inv;
+    inverse.m[3][1] = -model.offset.y * inv;
+    inverse.m[3][2] = -model.offset.z * inv;
+    return inverse;
+}
+
+std::optional<std::size_t> op_attachment_index(const animation::Skeleton& skeleton,
+                                               const QString& subject) {
+    if (subject == op_root_subject()) {
+        return skeleton.attachments.empty() ? std::nullopt
+                                            : std::optional<std::size_t>(0);
+    }
+    const auto bone = skeleton.find_bone_index(subject.toStdString());
+    if (!bone) {
+        return std::nullopt;
+    }
+    return skeleton.find_attachment_for_bone(*bone);
+}
+
+} // namespace
+
+QMap<QString, OpTarget> D3DViewport::op_states() const {
+    QMap<QString, OpTarget> states;
+    const ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return states;
+    }
+    const auto& skeleton = model->skeleton;
+    for (const auto& attachment : skeleton.attachments) {
+        const QString subject =
+            attachment.is_root ? op_root_subject()
+                               : to_qstring(skeleton.bones[attachment.bone_index].name);
+        OpTarget target;
+        if (attachment.target_model == -2) {
+            target.model = op_ground_target();
+        } else if (attachment.target_model >= 0 &&
+                   attachment.target_model < static_cast<std::int32_t>(models_.size())) {
+            const ModelInstance& target_model = *models_[static_cast<std::size_t>(
+                attachment.target_model)];
+            target.model = target_model.name;
+            if (attachment.target_bone < target_model.skeleton.bones.size()) {
+                target.bone =
+                    to_qstring(target_model.skeleton.bones[attachment.target_bone].name);
+            }
+        }
+        states.insert(subject, target);
+    }
+    return states;
+}
+
+QStringList D3DViewport::op_subject_names() const {
+    QStringList names;
+    const ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return names;
+    }
+    const auto& skeleton = model->skeleton;
+    for (const auto& attachment : skeleton.attachments) {
+        names.push_back(attachment.is_root
+                            ? op_root_subject()
+                            : to_qstring(skeleton.bones[attachment.bone_index].name));
+    }
+    return names;
+}
+
+QStringList D3DViewport::op_target_bone_names(int model_index) const {
+    QStringList names;
+    if (model_index < 0 || model_index >= static_cast<int>(models_.size())) {
+        return names;
+    }
+    const auto& skeleton = models_[static_cast<std::size_t>(model_index)]->skeleton;
+    for (const auto& bone : skeleton.bones) {
+        const bool tip = (bone.flags & 0x0008) == 0;
+        const bool fixed_axis = (bone.flags & 0x0400) != 0;
+        if (!tip || fixed_axis) {
+            names.push_back(to_qstring(bone.name));
+        }
+    }
+    return names;
+}
+
+QList<int> D3DViewport::op_target_bone_indices(int model_index) const {
+    QList<int> indices;
+    if (model_index < 0 || model_index >= static_cast<int>(models_.size())) {
+        return indices;
+    }
+    const auto& skeleton = models_[static_cast<std::size_t>(model_index)]->skeleton;
+    for (std::size_t i = 0; i < skeleton.bones.size(); ++i) {
+        const auto& bone = skeleton.bones[i];
+        const bool tip = (bone.flags & 0x0008) == 0;
+        const bool fixed_axis = (bone.flags & 0x0400) != 0;
+        if (!tip || fixed_axis) {
+            indices.push_back(static_cast<int>(i));
+        }
+    }
+    return indices;
+}
+
+D3DViewport::OpPreview D3DViewport::op_preview(const QString& subject,
+                                               const QString& target_model,
+                                               const QString& target_bone) const {
+    OpPreview preview;
+    const ModelInstance* model = active_model();
+    if (model == nullptr || target_model.isEmpty() ||
+        target_model == op_ground_target()) {
+        return preview;
+    }
+    const auto index = op_attachment_index(model->skeleton, subject);
+    const ModelInstance* target = nullptr;
+    for (const auto& candidate : models_) {
+        if (candidate->name == target_model) {
+            target = candidate.get();
+            break;
+        }
+    }
+    if (!index || target == nullptr) {
+        return preview;
+    }
+    const auto target_bone_index = target->skeleton.find_bone_index(target_bone.toStdString());
+    if (!target_bone_index ||
+        *target_bone_index >= target->skeleton.world_matrices.size()) {
+        return preview;
+    }
+    const auto& attachment = model->skeleton.attachments[*index];
+    const std::size_t bone_index =
+        attachment.is_root ? 0 : attachment.bone_index;
+    if (bone_index >= model->skeleton.world_matrices.size()) {
+        return preview;
+    }
+    const Mat4 target_matrix = target->skeleton.world_matrices[*target_bone_index] *
+                               model_scene_matrix(*target) * model_scene_inverse(*model);
+    const Mat4 palette =
+        Mat4::from_translation(-model->skeleton.bones[bone_index].initial_position) *
+        model->skeleton.world_matrices[bone_index];
+    const Mat4 local = palette * target_matrix.inverse_transform();
+    const Vec3 rest = attachment.is_root ? Vec3::zero()
+                                         : model->skeleton.bones[bone_index].initial_position;
+    preview.valid = true;
+    preview.position = local.transform_point(rest).to_array();
+    const Vec3 euler = local.rotation().to_euler_xyz();
+    constexpr float kRadToDeg = 180.0f / 3.14159265358979323846f;
+    preview.angles_deg = {euler.x * kRadToDeg, euler.y * kRadToDeg, euler.z * kRadToDeg};
+    return preview;
+}
+
+void D3DViewport::apply_op_bindings(ModelInstance& model,
+                                    const QMap<QString, OpTarget>& bindings) {
+    auto& skeleton = model.skeleton;
+    for (auto& attachment : skeleton.attachments) {
+        attachment.target_model = -1;
+        attachment.target_bone = 0;
+    }
+    for (auto it = bindings.begin(); it != bindings.end(); ++it) {
+        const auto index = op_attachment_index(skeleton, it.key());
+        if (!index) {
+            continue;
+        }
+        auto& attachment = skeleton.attachments[*index];
+        const OpTarget& target = it.value();
+        if (target.model == op_ground_target()) {
+            attachment.target_model = -2;
+        } else if (!target.model.isEmpty()) {
+            for (std::size_t i = 0; i < models_.size(); ++i) {
+                if (models_[i]->name != target.model) {
+                    continue;
+                }
+                attachment.target_model = static_cast<std::int32_t>(i);
+                if (const auto bone =
+                        models_[i]->skeleton.find_bone_index(target.bone.toStdString())) {
+                    attachment.target_bone = *bone;
+                }
+                break;
+            }
+        }
+    }
+}
+
+void D3DViewport::op_register(const QMap<QString, OpTarget>& bindings) {
+    ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return;
+    }
+    apply_op_bindings(*model, bindings);
+    state_.register_display_keyframe(model->name, ik_states(), op_states(),
+                                     static_cast<unsigned int>(
+                                         std::max(0.0f, std::floor(state_.current_frame))));
+    resolve_op_bindings();
+    emit statusMessage(QStringLiteral("OP registration applied to '%1'")
+                           .arg(model->name));
+}
+
+void D3DViewport::op_frame_register(const QString& subject, const QString& target_model,
+                                    const QString& target_bone) {
+    ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return;
+    }
+    const auto index = op_attachment_index(model->skeleton, subject);
+    if (!index) {
+        return;
+    }
+    auto& attachment = model->skeleton.attachments[*index];
+    const std::size_t bone_index = attachment.is_root ? 0 : attachment.bone_index;
+    if (bone_index >= model->skeleton.bones.size()) {
+        return;
+    }
+
+    const auto finish = [&](const Vec3& translation, const Quat& rotation) {
+        const QString track = to_qstring(model->skeleton.bones[bone_index].name);
+        state_.selected_bone_idx = static_cast<int>(bone_index);
+        state_.bone_pos_override = translation.to_array();
+        const Vec3 euler = rotation.to_euler_xyz();
+        constexpr float kRadToDeg = 180.0f / 3.14159265358979323846f;
+        state_.bone_rot_euler_deg = {euler.x * kRadToDeg, euler.y * kRadToDeg,
+                                     euler.z * kRadToDeg};
+        state_.bone_transform_dirty = true;
+        state_.register_keyframe(track,
+                                 static_cast<unsigned int>(
+                                     std::max(0.0f, std::floor(state_.current_frame))));
+        emit statusMessage(QStringLiteral("Registered relative pose for '%1'").arg(track));
+    };
+
+    if (target_model == op_ground_target()) {
+        attachment.target_model = -2;
+        attachment.target_bone = 0;
+        if (attachment.is_root) {
+            finish(Vec3::zero(), Quat::identity());
+            return;
+        }
+        const Vec3 world_position = model->skeleton.world_positions[bone_index];
+        const Quat world_rotation = model->skeleton.world_rotations[bone_index];
+        const Vec3 translation =
+            world_position - model->skeleton.bones[bone_index].initial_position;
+        model->skeleton.set_bone_transform(bone_index, translation, world_rotation);
+        model->skeleton.update_transforms();
+        finish(translation, world_rotation);
+        return;
+    }
+
+    ModelInstance* target = model_by_name(target_model);
+    if (target == nullptr) {
+        return;
+    }
+    const auto target_bone_index =
+        target->skeleton.find_bone_index(target_bone.toStdString());
+    if (!target_bone_index ||
+        *target_bone_index >= target->skeleton.world_matrices.size()) {
+        return;
+    }
+    // Bind the live registration without re-evaluating yet: the bake below
+    // must start from the pose the user currently sees.
+    attachment.target_model = static_cast<std::int32_t>(
+        std::distance(models_.begin(),
+                      std::find_if(models_.begin(), models_.end(),
+                                   [target](const auto& entry) {
+                                       return entry.get() == target;
+                                   })));
+    attachment.target_bone = *target_bone_index;
+    const Vec3 rest = attachment.is_root ? Vec3::zero()
+                                         : model->skeleton.bones[bone_index].initial_position;
+    const Mat4 target_matrix = target->skeleton.world_matrices[*target_bone_index] *
+                               model_scene_matrix(*target) * model_scene_inverse(*model);
+    const Mat4 palette =
+        Mat4::from_translation(-rest) * model->skeleton.world_matrices[bone_index];
+    const Mat4 local = palette * target_matrix.inverse_transform();
+    const Vec3 translation = local.transform_point(rest);
+    const Quat rotation = local.rotation();
+    model->skeleton.set_bone_transform(bone_index, translation, rotation);
+    model->skeleton.update_transforms();
+    finish(translation, rotation);
+}
+
 void D3DViewport::reset_camera() {
     state_.camera_yaw = 0.0f;
     state_.camera_pitch = 0.15f;
@@ -1274,6 +1609,8 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
             active->morphs.reset();
         }
         evaluate_frame(static_cast<float>(frame));
+        std::vector<animation::MorphResult> morph_results;
+        morph_results.reserve(models_.size());
         for (auto& model : models_) {
             if (model.get() == active) {
                 for (auto it = state_.morph_weights.begin();
@@ -1281,25 +1618,31 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
                     model->morphs.set_weight(it.key().toStdString(), it.value());
                 }
             }
-            const animation::MorphResult morph_result = model->morphs.evaluate();
-            apply_bone_morphs(*model, morph_result);
+            morph_results.push_back(model->morphs.evaluate());
+            apply_bone_morphs(*model, morph_results.back());
             if (model.get() == active) {
                 apply_editor_bone_override();
             }
-            if (model->physics_rig) {
+        }
+        resolve_op_bindings();
+        for (std::size_t i = 0; i < models_.size(); ++i) {
+            ModelInstance& model = *models_[i];
+            const animation::MorphResult& morph_result = morph_results[i];
+            if (model.physics_rig) {
                 for (const auto& impulse : morph_result.impulses) {
-                    model->physics_rig->apply_impulse(impulse.body_index, impulse.local,
-                                                      impulse.velocity, impulse.torque);
+                    model.physics_rig->apply_impulse(impulse.body_index, impulse.local,
+                                                     impulse.velocity, impulse.torque);
                 }
             }
-            if (physics_active() && model->physics_rig) {
-                model->skeleton.apply_physics(*model->physics_rig,
-                                              1.0f / static_cast<float>(std::max(fps, 1)));
+            if (physics_active() && model.physics_rig) {
+                model.skeleton.apply_physics(*model.physics_rig,
+                                             1.0f / static_cast<float>(std::max(fps, 1)));
             }
-            apply_material_morphs(*model, morph_result);
-            model->mesh.apply_morph_offsets(*context_, morph_result.position_offsets,
-                                            morph_result.uv_offsets);
+            apply_material_morphs(model, morph_result);
+            model.mesh.apply_morph_offsets(*context_, morph_result.position_offsets,
+                                           morph_result.uv_offsets);
         }
+        update_camera();
         render_scene();
         try {
             const auto capture = context_->capture_scene();
@@ -1375,7 +1718,6 @@ void D3DViewport::tick_impl() {
         active->morphs.reset();
     }
     evaluate_frame(state_.current_frame);
-    update_camera();
 
     if (active != nullptr) {
         for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
@@ -1383,6 +1725,7 @@ void D3DViewport::tick_impl() {
         }
         apply_editor_bone_override();
     }
+    resolve_op_bindings();
 
     if (state_.reset_physics_requested) {
         state_.reset_physics_requested = false;
@@ -1431,6 +1774,7 @@ void D3DViewport::tick_impl() {
     }
     physics_was_active_ = physics_active_now;
 
+    update_camera();
     render_scene();
     context_->present(state_.vsync || state_.fps_limit == FpsLimit::Fps60 ? 1 : 0);
 
@@ -1463,9 +1807,9 @@ void D3DViewport::update_camera() {
     const float sy = std::sin(state_.camera_yaw);
     const float cp = std::cos(state_.camera_pitch);
     const float sp = std::sin(state_.camera_pitch);
-    const Vec3 eye_offset(state_.camera_distance * cp * sy,
-                          state_.camera_distance * sp,
-                          -state_.camera_distance * cp * cy);
+    Vec3 eye_offset(state_.camera_distance * cp * sy,
+                    state_.camera_distance * sp,
+                    -state_.camera_distance * cp * cy);
     Vec3 pan = Vec3::from_array(state_.camera_pan);
     if (state_.mode == EditorMode::Model && state_.camera_target != CameraTarget::Free) {
         if (const ModelInstance* model = active_model()) {
@@ -1488,16 +1832,44 @@ void D3DViewport::update_camera() {
             }
         }
     }
+    // Follow bone (MMD "Track"): the pivot becomes the bone's world position
+    // and the whole camera basis inherits the bone's world rotation.
+    bool following = false;
+    Quat follow_rotation = Quat::identity();
+    const bool follow_enabled =
+        state_.camera_follow && state_.camera_parent_model >= 0 &&
+        (state_.mode == EditorMode::Camera || state_.is_playing ||
+         active_model_ == state_.camera_parent_model);
+    if (follow_enabled &&
+        state_.camera_parent_model < static_cast<int>(models_.size())) {
+        const ModelInstance& parent =
+            *models_[static_cast<std::size_t>(state_.camera_parent_model)];
+        const int bone_index = state_.camera_parent_bone;
+        if (bone_index >= 0 &&
+            static_cast<std::size_t>(bone_index) < parent.skeleton.world_positions.size()) {
+            const std::size_t index = static_cast<std::size_t>(bone_index);
+            pan = parent.skeleton.world_positions[index] * parent.scale + parent.offset;
+            follow_rotation = parent.skeleton.world_rotations[index];
+            following = true;
+            state_.camera_pan = pan.to_array();
+        }
+    }
+
+    const Vec3 base_forward = (-eye_offset).normalize();
+    const Vec3 world_up(0.0f, 1.0f, 0.0f);
+    Vec3 right = world_up.cross(base_forward);
+    right = right.length() > 1.0e-4f ? right.normalize() : Vec3(1.0f, 0.0f, 0.0f);
+    const Vec3 base_up = base_forward.cross(right).normalize();
+    Vec3 up =
+        (base_up * std::cos(state_.camera_roll) + right * std::sin(state_.camera_roll)).normalize();
+    if (following) {
+        eye_offset = follow_rotation.rotate_vec3(eye_offset);
+        up = follow_rotation.rotate_vec3(up);
+    }
+
     camera_.position = pan + eye_offset;
     camera_.target = pan;
-
-    const Vec3 forward = (camera_.target - camera_.position).normalize();
-    const Vec3 world_up(0.0f, 1.0f, 0.0f);
-    Vec3 right = world_up.cross(forward);
-    right = right.length() > 1.0e-4f ? right.normalize() : Vec3(1.0f, 0.0f, 0.0f);
-    const Vec3 base_up = forward.cross(right).normalize();
-    camera_.up =
-        (base_up * std::cos(state_.camera_roll) + right * std::sin(state_.camera_roll)).normalize();
+    camera_.up = up.normalize();
 }
 
 bool D3DViewport::physics_active() const {
@@ -1552,8 +1924,10 @@ void D3DViewport::evaluate_frame(float frame) {
             }
         }
     }
-    if (model != nullptr && scene_changed) {
-        apply_ik_states(*model, frame, evaluated);
+    if (scene_changed) {
+        for (auto& candidate : models_) {
+            apply_ik_states(*candidate, frame, evaluated);
+        }
     }
     if (model != nullptr && motion_player_) {
         motion_player_->evaluate_pose(evaluated, model->skeleton, model->morphs);
@@ -1570,7 +1944,8 @@ void D3DViewport::apply_ik_states(ModelInstance& model, float timeline_frame,
         skeleton.ik_enabled.assign(skeleton.bones.size(), true);
     }
     std::fill(skeleton.ik_enabled.begin(), skeleton.ik_enabled.end(), true);
-    if (motion_player_) {
+    const bool active = &model == active_model();
+    if (active && motion_player_) {
         motion_player_->apply_ik(motion_frame, skeleton);
     }
 
@@ -1582,10 +1957,174 @@ void D3DViewport::apply_ik_states(ModelInstance& model, float timeline_frame,
         static_cast<unsigned int>(std::max(0.0f, std::floor(timeline_frame))));
     const TrackKeyframe& key =
         next == track->second.begin() ? track->second.begin()->second : std::prev(next)->second;
-    for (auto it = key.ik_enabled.begin(); it != key.ik_enabled.end(); ++it) {
-        const auto index = skeleton.find_bone_index(it.key().toStdString());
-        if (index && *index < skeleton.ik_enabled.size()) {
-            skeleton.ik_enabled[*index] = it.value();
+
+    const auto apply_ik = [&skeleton](const QMap<QString, bool>& states) {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            const auto index = skeleton.find_bone_index(it.key().toStdString());
+            if (index && *index < skeleton.ik_enabled.size()) {
+                skeleton.ik_enabled[*index] = it.value();
+            }
+        }
+    };
+
+    if (!key.model_ik.isEmpty()) {
+        const auto per_model_ik = key.model_ik.find(model.name);
+        if (per_model_ik != key.model_ik.end()) {
+            apply_ik(*per_model_ik);
+        }
+    } else if (active) {
+        apply_ik(key.ik_enabled);
+    }
+
+    if (!key.model_op.isEmpty()) {
+        const auto per_model_op = key.model_op.find(model.name);
+        if (per_model_op != key.model_op.end()) {
+            apply_op_bindings(model, *per_model_op);
+        }
+    } else if (active && !key.op_bindings.isEmpty()) {
+        apply_op_bindings(model, key.op_bindings);
+    }
+}
+
+QMap<QString, D3DViewport::OpWindow> D3DViewport::op_windows(float timeline_frame) const {
+    QMap<QString, OpWindow> windows;
+    const ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return windows;
+    }
+    const auto track = state_.track_keyframes.find(QStringLiteral("Disp/IK/OP"));
+    if (track == state_.track_keyframes.end() || track->second.empty()) {
+        return windows;
+    }
+    std::vector<std::pair<unsigned int, const TrackKeyframe*>> keys;
+    keys.reserve(track->second.size());
+    for (const auto& [frame, key] : track->second) {
+        keys.emplace_back(frame, &key);
+    }
+    const auto next = track->second.upper_bound(
+        static_cast<unsigned int>(std::max(0.0f, std::floor(timeline_frame))));
+    std::size_t current = 0;
+    if (next != track->second.begin()) {
+        current = static_cast<std::size_t>(
+            std::distance(track->second.begin(), std::prev(next)));
+    }
+
+    const auto pair_for = [&](const TrackKeyframe& key, const QString& subject) {
+        if (!key.model_op.isEmpty()) {
+            const auto per_model = key.model_op.find(model->name);
+            if (per_model == key.model_op.end()) {
+                return QString();
+            }
+            const auto entry = per_model->find(subject);
+            return entry != per_model->end() ? entry->model + QLatin1Char('\n') + entry->bone
+                                             : QString();
+        }
+        const auto legacy = key.op_bindings.find(subject);
+        return legacy != key.op_bindings.end()
+                   ? legacy->model + QLatin1Char('\n') + legacy->bone
+                   : QString();
+    };
+
+    for (const auto& attachment : model->skeleton.attachments) {
+        const QString subject = attachment.is_root
+                                    ? op_root_subject()
+                                    : to_qstring(model->skeleton.bones[attachment.bone_index].name);
+        const QString active_pair = pair_for(*keys[current].second, subject);
+        OpWindow window;
+        std::size_t index = current;
+        while (index > 0 && pair_for(*keys[index - 1].second, subject) == active_pair) {
+            --index;
+        }
+        window.start = index == 0 ? 0 : keys[index].first;
+        index = current;
+        while (index + 1 < keys.size() &&
+               pair_for(*keys[index + 1].second, subject) == active_pair) {
+            ++index;
+        }
+        window.end = index + 1 < keys.size() ? keys[index + 1].first : 0;
+        windows.insert(subject, window);
+    }
+    return windows;
+}
+
+void D3DViewport::resolve_op_bindings() {
+    bool any_attachments = false;
+    for (auto& model : models_) {
+        if (model->skeleton.has_active_attachments()) {
+            any_attachments = true;
+            break;
+        }
+    }
+    if (!any_attachments) {
+        for (auto& model : models_) {
+            model->skeleton.clear_external_parents();
+        }
+        return;
+    }
+
+    // Base pose first so every target matrix describes the current frame.
+    for (auto& model : models_) {
+        model->skeleton.clear_external_parents();
+        model->skeleton.update_transforms();
+    }
+
+    // Chains settle one link per pass; a cycle simply stops changing when the
+    // pass budget runs out, matching MMD's fixed evaluation order fallback.
+    const int passes = std::max<int>(1, static_cast<int>(models_.size()));
+    for (int pass = 0; pass < passes; ++pass) {
+        for (std::size_t subject_index = 0; subject_index < models_.size();
+             ++subject_index) {
+            ModelInstance& subject = *models_[subject_index];
+            auto& skeleton = subject.skeleton;
+            skeleton.clear_external_parents();
+            if (!skeleton.has_active_attachments()) {
+                continue;
+            }
+            bool changed = false;
+            for (const auto& attachment : skeleton.attachments) {
+                if (attachment.target_model == -1) {
+                    continue;
+                }
+                if (attachment.target_model == -2) {
+                    if (attachment.is_root) {
+                        continue; // the model root already sits on the ground
+                    }
+                    if (attachment.bone_index >= skeleton.external_parents.size()) {
+                        continue;
+                    }
+                    auto& frame = skeleton.external_parents[attachment.bone_index];
+                    frame.active = true;
+                    frame.ground = true;
+                    changed = true;
+                    continue;
+                }
+                if (attachment.target_model < 0 ||
+                    attachment.target_model >= static_cast<std::int32_t>(models_.size())) {
+                    continue;
+                }
+                const ModelInstance& target =
+                    *models_[static_cast<std::size_t>(attachment.target_model)];
+                if (attachment.target_bone >= target.skeleton.world_matrices.size()) {
+                    continue;
+                }
+                const Mat4 target_matrix =
+                    target.skeleton.world_matrices[attachment.target_bone] *
+                    model_scene_matrix(target) * model_scene_inverse(subject);
+                if (attachment.is_root) {
+                    skeleton.root_external_active = true;
+                    skeleton.root_external_matrix = target_matrix;
+                    changed = true;
+                } else if (attachment.bone_index < skeleton.external_parents.size()) {
+                    auto& frame = skeleton.external_parents[attachment.bone_index];
+                    frame.active = true;
+                    frame.ground = false;
+                    frame.target_matrix = target_matrix;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                skeleton.update_transforms();
+            }
         }
     }
 }
@@ -1593,6 +2132,8 @@ void D3DViewport::apply_ik_states(ModelInstance& model, float timeline_frame,
 void D3DViewport::apply_editor_tracks(ModelInstance* model, float frame,
                                       bool apply_scene_values) {
     bool bones_changed = false;
+    const QMap<QString, OpWindow> windows =
+        model != nullptr ? op_windows(frame) : QMap<QString, OpWindow>{};
     for (const auto& [track, keys] : state_.track_keyframes) {
         if (keys.empty()) {
             continue;
@@ -1649,6 +2190,10 @@ void D3DViewport::apply_editor_tracks(ModelInstance* model, float frame,
                 state_.camera_roll = mix(first->angles[2], second->angles[2]);
                 state_.camera_distance = mix(first->distance, second->distance);
                 state_.camera_fov_deg = mix(first->fov, second->fov);
+                // MMD copies the parent pair from the lower key without
+                // interpolating it.
+                state_.camera_parent_model = first->parent_model;
+                state_.camera_parent_bone = first->parent_bone;
             } else if (track == QStringLiteral("light")) {
                 state_.light_color = mix3(first->position, second->position);
                 state_.light_direction = mix3(first->angles, second->angles);
@@ -1678,11 +2223,34 @@ void D3DViewport::apply_editor_tracks(ModelInstance* model, float frame,
         }
 
         if (const auto index = model->skeleton.find_bone_index(track.toStdString())) {
+            // MMD display-key windows snap the bone at an OP/IK change instead
+            // of blending the authored keys across the boundary.
+            float bone_ease = ease;
+            const auto window = windows.find(track);
+            if (window != windows.end()) {
+                const unsigned int lower =
+                    next == keys.begin() ? 0 : std::prev(next)->first;
+                const unsigned int upper =
+                    next == keys.end() ? std::numeric_limits<unsigned int>::max()
+                                       : next->first;
+                const unsigned int current = static_cast<unsigned int>(
+                    std::max(0.0f, std::floor(frame)));
+                if (window->start > lower && window->start <= upper) {
+                    bone_ease = current >= window->start ? 1.0f : 0.0f;
+                } else if (window->end > lower && window->end <= upper) {
+                    bone_ease = current >= window->end ? 1.0f : 0.0f;
+                }
+            }
+            const auto bone_mix = [bone_ease](float a, float b) {
+                return a + (b - a) * bone_ease;
+            };
             model->skeleton.local_translations[*index] =
-                Vec3::from_array(mix3(first->position, second->position));
+                Vec3(bone_mix(first->position[0], second->position[0]),
+                     bone_mix(first->position[1], second->position[1]),
+                     bone_mix(first->position[2], second->position[2]));
             model->skeleton.local_rotations[*index] =
                 Quat::from_array(first->rotation)
-                    .slerp(Quat::from_array(second->rotation), ease);
+                    .slerp(Quat::from_array(second->rotation), bone_ease);
             bones_changed = true;
         } else {
             model->morphs.set_weight(track.toStdString(), mix(first->weight, second->weight));

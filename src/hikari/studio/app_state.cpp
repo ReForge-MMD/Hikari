@@ -68,6 +68,8 @@ TrackKeyframe StudioAppState::capture_keyframe(const QString& track) const {
         key.angles = {camera_yaw, camera_pitch, camera_roll};
         key.distance = camera_distance;
         key.fov = camera_fov_deg;
+        key.parent_model = camera_parent_model;
+        key.parent_bone = camera_parent_bone;
         return key;
     }
     if (track == QStringLiteral("light")) {
@@ -175,14 +177,40 @@ void StudioAppState::register_keyframe(const QString& track, unsigned int frame,
 void StudioAppState::register_ik_keyframe(const QMap<QString, bool>& states,
                                          unsigned int frame) {
     push_undo_snapshot();
-    TrackKeyframe key;
-    key.interpolation = default_interpolation;
+    TrackKeyframe& key = track_keyframes[QStringLiteral("Disp/IK/OP")][frame];
+    if (key.interpolation == std::array<std::uint8_t, 4>{0, 0, 0, 0}) {
+        key.interpolation = default_interpolation;
+    }
     key.ik_enabled = states;
-    track_keyframes[QStringLiteral("Disp/IK/OP")][frame] = std::move(key);
     track_keys_dirty = true;
     ++keyframe_revision;
     set_status(QStringLiteral("Registered IK state for %1 bone(s) at frame %2")
                    .arg(states.size())
+                   .arg(frame));
+}
+
+void StudioAppState::register_display_keyframe(const QString& track_model_name,
+                                               const QMap<QString, bool>& ik_states,
+                                               const QMap<QString, OpTarget>& op_bindings,
+                                               unsigned int frame) {
+    push_undo_snapshot();
+    TrackKeyframe& key = track_keyframes[QStringLiteral("Disp/IK/OP")][frame];
+    if (key.interpolation == std::array<std::uint8_t, 4>{0, 0, 0, 0}) {
+        key.interpolation = default_interpolation;
+    }
+    key.ik_enabled = ik_states;
+    key.op_bindings = op_bindings;
+    if (!track_model_name.isEmpty()) {
+        key.model_ik[track_model_name] = ik_states;
+        key.model_op[track_model_name] = op_bindings;
+    }
+    track_keys_dirty = true;
+    ++keyframe_revision;
+    set_status(QStringLiteral("Registered display/IK/OP state for '%1' (%2 OP link(s)) at "
+                              "frame %3")
+                   .arg(track_model_name.isEmpty() ? QStringLiteral("model")
+                                                   : track_model_name)
+                   .arg(op_bindings.size())
                    .arg(frame));
 }
 

@@ -109,6 +109,9 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     project.scene.camera_yaw = 0.3f;
     project.scene.camera_distance = 25.0f;
     project.scene.camera_target = hikari::studio::CameraTarget::SelectedBone;
+    project.scene.camera_follow = true;
+    project.scene.camera_parent_model = 1;
+    project.scene.camera_parent_bone = 7;
     project.scene.shadow_mode = hikari::studio::ShadowMode::Mode2;
     project.scene.gravity = {0.0f, -9.8f, 0.5f};
 
@@ -130,6 +133,15 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     key.scale = 1.25f;
     key.interpolation = {13, 114, 114, 13};
     key.ik_enabled.insert("左足ＩＫ", false);
+    key.parent_model = 1;
+    key.parent_bone = 7;
+    key.op_bindings.insert(hikari::studio::op_root_subject(),
+                           hikari::studio::OpTarget{QStringLiteral("Second"),
+                                                    QStringLiteral("センター")});
+    key.model_ik[QStringLiteral("First")].insert(QStringLiteral("左足ＩＫ"), false);
+    key.model_op[QStringLiteral("First")].insert(
+        hikari::studio::op_root_subject(),
+        hikari::studio::OpTarget{QStringLiteral("Second"), QStringLiteral("センター")});
     project.tracks.push_back({QStringLiteral("センター"), 12, key});
     project.tracks.push_back({QStringLiteral("model scale"), 12, key});
     project.motion = sample_motion();
@@ -149,6 +161,9 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE_FALSE(parsed->camera_mode);
     REQUIRE(parsed->scene.camera_pan[1] == Catch::Approx(2.0f));
     REQUIRE(parsed->scene.camera_target == hikari::studio::CameraTarget::SelectedBone);
+    REQUIRE(parsed->scene.camera_follow);
+    REQUIRE(parsed->scene.camera_parent_model == 1);
+    REQUIRE(parsed->scene.camera_parent_bone == 7);
     REQUIRE(parsed->scene.shadow_mode == hikari::studio::ShadowMode::Mode2);
     REQUIRE(parsed->models.size() == 2);
     REQUIRE(parsed->models[0].path == "models/first.pmx");
@@ -158,6 +173,16 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE(parsed->tracks[0].name == "センター");
     REQUIRE(parsed->tracks[0].key.interpolation[1] == 114);
     REQUIRE(parsed->tracks[0].key.ik_enabled.value("左足ＩＫ", true) == false);
+    REQUIRE(parsed->tracks[0].key.parent_model == 1);
+    REQUIRE(parsed->tracks[0].key.parent_bone == 7);
+    const auto op = parsed->tracks[0].key.op_bindings.value(
+        hikari::studio::op_root_subject());
+    REQUIRE(op.model == "Second");
+    REQUIRE(op.bone == "センター");
+    REQUIRE_FALSE(parsed->tracks[0].key.model_ik.value("First").value("左足ＩＫ", true));
+    const auto model_op = parsed->tracks[0].key.model_op.value("First").value(
+        hikari::studio::op_root_subject());
+    REQUIRE(model_op.model == "Second");
     REQUIRE(parsed->motion.has_value());
     REQUIRE(parsed->motion->model_keys.size() == 2);
 }

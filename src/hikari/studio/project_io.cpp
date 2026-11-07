@@ -261,12 +261,43 @@ QJsonObject key_to_json(const TrackKeyframe& key) {
     object[QStringLiteral("distance")] = key.distance;
     object[QStringLiteral("fov")] = key.fov;
     object[QStringLiteral("scale")] = key.scale;
+    object[QStringLiteral("parent_model")] = key.parent_model;
+    object[QStringLiteral("parent_bone")] = key.parent_bone;
     object[QStringLiteral("interpolation")] = bytes_to_json(key.interpolation);
     QJsonObject ik;
     for (auto it = key.ik_enabled.begin(); it != key.ik_enabled.end(); ++it) {
         ik[it.key()] = it.value();
     }
     object[QStringLiteral("ik")] = ik;
+    QJsonObject op;
+    for (auto it = key.op_bindings.begin(); it != key.op_bindings.end(); ++it) {
+        QJsonObject entry;
+        entry[QStringLiteral("model")] = it.value().model;
+        entry[QStringLiteral("bone")] = it.value().bone;
+        op[it.key()] = entry;
+    }
+    object[QStringLiteral("op")] = op;
+    QJsonObject model_ik;
+    for (auto model = key.model_ik.begin(); model != key.model_ik.end(); ++model) {
+        QJsonObject states;
+        for (auto it = model.value().begin(); it != model.value().end(); ++it) {
+            states[it.key()] = it.value();
+        }
+        model_ik[model.key()] = states;
+    }
+    object[QStringLiteral("model_ik")] = model_ik;
+    QJsonObject model_op;
+    for (auto model = key.model_op.begin(); model != key.model_op.end(); ++model) {
+        QJsonObject entries;
+        for (auto it = model.value().begin(); it != model.value().end(); ++it) {
+            QJsonObject entry;
+            entry[QStringLiteral("model")] = it.value().model;
+            entry[QStringLiteral("bone")] = it.value().bone;
+            entries[it.key()] = entry;
+        }
+        model_op[model.key()] = entries;
+    }
+    object[QStringLiteral("model_op")] = model_op;
     return object;
 }
 
@@ -280,6 +311,9 @@ TrackKeyframe key_from_json(const QJsonObject& object) {
     key.distance = static_cast<float>(object.value(QStringLiteral("distance")).toDouble());
     key.fov = static_cast<float>(object.value(QStringLiteral("fov")).toDouble());
     key.scale = static_cast<float>(object.value(QStringLiteral("scale")).toDouble(1.0));
+    key.parent_model = std::max(object.value(QStringLiteral("parent_model")).toInt(-1), -1);
+    key.parent_bone =
+        std::max(object.value(QStringLiteral("parent_bone")).toInt(0), 0);
     key.interpolation = json_to_bytes<4>(object.value(QStringLiteral("interpolation")));
     if (key.interpolation == std::array<std::uint8_t, 4>{0, 0, 0, 0}) {
         key.interpolation = {20, 20, 20, 20};
@@ -287,6 +321,36 @@ TrackKeyframe key_from_json(const QJsonObject& object) {
     const QJsonObject ik = object.value(QStringLiteral("ik")).toObject();
     for (auto it = ik.begin(); it != ik.end(); ++it) {
         key.ik_enabled.insert(it.key(), it.value().toBool(true));
+    }
+    const QJsonObject op = object.value(QStringLiteral("op")).toObject();
+    for (auto it = op.begin(); it != op.end(); ++it) {
+        const QJsonObject entry = it.value().toObject();
+        OpTarget target;
+        target.model = entry.value(QStringLiteral("model")).toString();
+        target.bone = entry.value(QStringLiteral("bone")).toString();
+        key.op_bindings.insert(it.key(), target);
+    }
+    const QJsonObject model_ik = object.value(QStringLiteral("model_ik")).toObject();
+    for (auto model = model_ik.begin(); model != model_ik.end(); ++model) {
+        QMap<QString, bool> states;
+        const QJsonObject entries = model.value().toObject();
+        for (auto it = entries.begin(); it != entries.end(); ++it) {
+            states.insert(it.key(), it.value().toBool(true));
+        }
+        key.model_ik.insert(model.key(), states);
+    }
+    const QJsonObject model_op = object.value(QStringLiteral("model_op")).toObject();
+    for (auto model = model_op.begin(); model != model_op.end(); ++model) {
+        QMap<QString, OpTarget> entries;
+        const QJsonObject objects = model.value().toObject();
+        for (auto it = objects.begin(); it != objects.end(); ++it) {
+            const QJsonObject entry = it.value().toObject();
+            OpTarget target;
+            target.model = entry.value(QStringLiteral("model")).toString();
+            target.bone = entry.value(QStringLiteral("bone")).toString();
+            entries.insert(it.key(), target);
+        }
+        key.model_op.insert(model.key(), entries);
     }
     return key;
 }
@@ -365,6 +429,9 @@ QByteArray hkp_to_json(const ProjectData& project) {
     scene[QStringLiteral("camera_fov_deg")] = project.scene.camera_fov_deg;
     scene[QStringLiteral("camera_orthographic")] = project.scene.camera_orthographic;
     scene[QStringLiteral("camera_target")] = static_cast<int>(project.scene.camera_target);
+    scene[QStringLiteral("camera_follow")] = project.scene.camera_follow;
+    scene[QStringLiteral("camera_parent_model")] = project.scene.camera_parent_model;
+    scene[QStringLiteral("camera_parent_bone")] = project.scene.camera_parent_bone;
     scene[QStringLiteral("light_color")] = to_json(project.scene.light_color);
     scene[QStringLiteral("light_direction")] = to_json(project.scene.light_direction);
     scene[QStringLiteral("shadow_mode")] = static_cast<int>(project.scene.shadow_mode);
@@ -448,6 +515,12 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
         scene.value(QStringLiteral("camera_orthographic")).toBool(false);
     project.scene.camera_target = static_cast<CameraTarget>(
         std::clamp(scene.value(QStringLiteral("camera_target")).toInt(0), 0, 2));
+    project.scene.camera_follow =
+        scene.value(QStringLiteral("camera_follow")).toBool(false);
+    project.scene.camera_parent_model =
+        std::max(scene.value(QStringLiteral("camera_parent_model")).toInt(-1), -1);
+    project.scene.camera_parent_bone =
+        std::max(scene.value(QStringLiteral("camera_parent_bone")).toInt(0), 0);
     project.scene.light_color =
         read_vec3(scene.value(QStringLiteral("light_color")), {0.6f, 0.6f, 0.6f});
     project.scene.light_direction =

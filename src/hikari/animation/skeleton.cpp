@@ -97,6 +97,21 @@ Skeleton Skeleton::from_pmx(const formats::PmxModel& pmx) {
             Mat4::from_translation(Vec3::zero() - Vec3::from_array(source.position)));
     }
 
+    // Outside-parent slots mirror InitBoneSortOrder: slot 0 is the model
+    // root, then every bone MMD treats as a control/IK bone.
+    skeleton.attachment_index.assign(count, -1);
+    skeleton.attachments.clear();
+    skeleton.attachments.push_back(BoneAttachment{true, 0, -1, 0});
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& bone = skeleton.bones[i];
+        const bool movable = (bone.flags & 0x0004) != 0;
+        if (movable || bone.has_ik) {
+            skeleton.attachment_index[i] = static_cast<std::int32_t>(skeleton.attachments.size());
+            skeleton.attachments.push_back(BoneAttachment{false, i, -1, 0});
+        }
+    }
+    skeleton.external_parents.assign(count, ExternalParentFrame{});
+
     skeleton.local_translations.assign(count, Vec3::zero());
     skeleton.local_rotations.assign(count, Quat::identity());
     skeleton.ik_rotations.assign(count, Quat::identity());
@@ -429,18 +444,78 @@ void Skeleton::update_skinning_palette() {
 void Skeleton::compute_world_matrix(std::size_t index, const Vec3& effective_translation,
                                     const Quat& effective_rotation) {
     const auto& bone = bones[index];
-    const Vec3 local_t = bone.offset + effective_translation;
-    if (bone.parent_index) {
-        const Vec3 parent_position = world_positions[*bone.parent_index];
-        const Quat parent_rotation = world_rotations[*bone.parent_index];
-        world_positions[index] = parent_position + parent_rotation.rotate_vec3(local_t);
-        world_rotations[index] = (parent_rotation * effective_rotation).normalize();
-    } else {
+    const ExternalParentFrame* external =
+        index < external_parents.size() && external_parents[index].active
+            ? &external_parents[index]
+            : nullptr;
+
+    // Outside parent: the bone leaves its own parent chain and is placed
+    // relative to the target frame. MMD keeps the authored local rotation and
+    // translation, then applies the target rest-space matrix.
+    if (external != nullptr && !external->ground) {
+        const Mat4 world = Mat4::from_quat(effective_rotation) *
+                           Mat4::from_translation(effective_translation) *
+                           external->target_matrix;
+        world_matrices[index] = world;
+        world_positions[index] = world.translation();
+        world_rotations[index] = world.rotation();
+        return;
+    }
+
+    // "ground" detaches the bone from its parent and keeps it in model space.
+    // It behaves like a root bone, so the rest origin is the absolute position
+    // rather than the parent-relative offset.
+    const bool detached = external != nullptr;
+    if (!bone.parent_index || detached) {
+        if (!detached && root_external_active) {
+            // Model-wide registration: root bones are placed by the target
+            // frame, with their own rest position preserved.
+            const Mat4 world = Mat4::from_quat(effective_rotation) *
+                               Mat4::from_translation(effective_translation) *
+                               Mat4::from_translation(bone.initial_position) *
+                               root_external_matrix;
+            world_matrices[index] = world;
+            world_positions[index] = world.translation();
+            world_rotations[index] = world.rotation();
+            return;
+        }
+        const Vec3 local_t = (detached ? bone.initial_position : bone.offset) +
+                             effective_translation;
         world_positions[index] = local_t;
         world_rotations[index] = effective_rotation.normalize();
+    } else {
+        const Vec3 parent_position = world_positions[*bone.parent_index];
+        const Quat parent_rotation = world_rotations[*bone.parent_index];
+        world_positions[index] =
+            parent_position + parent_rotation.rotate_vec3(bone.offset + effective_translation);
+        world_rotations[index] = (parent_rotation * effective_rotation).normalize();
     }
     world_matrices[index] =
         Mat4::from_translation_rotation(world_positions[index], world_rotations[index]);
+}
+
+void Skeleton::clear_external_parents() {
+    for (auto& frame : external_parents) {
+        frame = ExternalParentFrame{};
+    }
+    root_external_active = false;
+    root_external_matrix = Mat4::identity();
+}
+
+bool Skeleton::has_active_attachments() const {
+    for (const auto& attachment : attachments) {
+        if (attachment.target_model != -1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<std::size_t> Skeleton::find_attachment_for_bone(std::size_t bone) const {
+    if (bone >= attachment_index.size() || attachment_index[bone] < 0) {
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(attachment_index[bone]);
 }
 
 void Skeleton::update_subtree(std::size_t index) {

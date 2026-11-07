@@ -50,6 +50,24 @@ struct BoneNode {
 
 enum class BoneVisualType { IkController, UnderIk, MoveAndRotate, GrantAppend, StandardRotate };
 
+// MMD outside-parent (OP) registration target for one selectable bone.
+// target_model is -1 for "none", -2 for "ground" and a scene model index
+// otherwise. The model root registration lives at index 0 with is_root set.
+struct BoneAttachment {
+    bool is_root = false;
+    std::size_t bone_index = 0;
+    std::int32_t target_model = -1;
+    std::size_t target_bone = 0;
+};
+
+// Per-bone resolved outside-parent frame supplied by the scene evaluator.
+// target_matrix maps the target bone's rest space into this model's space.
+struct ExternalParentFrame {
+    bool active = false;
+    bool ground = false;
+    Mat4 target_matrix = Mat4::identity();
+};
+
 class Skeleton {
 public:
     std::vector<BoneNode> bones;
@@ -69,6 +87,13 @@ public:
     std::vector<Mat4> world_matrices;
     std::vector<Mat4> skinning_palette;
     std::vector<std::size_t> sorted_eval_order;
+    // Outside-parent registrations: root at 0, then every movable/IK bone.
+    std::vector<BoneAttachment> attachments;
+    std::vector<std::int32_t> attachment_index; // per bone -> attachments index
+    // Scene-resolved frames, one per bone, refreshed before evaluation.
+    std::vector<ExternalParentFrame> external_parents;
+    bool root_external_active = false;
+    Mat4 root_external_matrix = Mat4::identity();
 
     static Skeleton from_pmx(const formats::PmxModel& pmx);
 
@@ -82,6 +107,9 @@ public:
     void update_transforms_stage(bool after_physics);
     void update_skinning_palette();
     void update_subtree(std::size_t index);
+    void clear_external_parents();
+    bool has_active_attachments() const;
+    std::optional<std::size_t> find_attachment_for_bone(std::size_t bone) const;
 
     std::vector<physics::BodyTransform> get_bone_world_transforms() const;
     // Restore physics-driven bones to the authored rest pose. Used when physics

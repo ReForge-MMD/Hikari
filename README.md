@@ -74,6 +74,12 @@ application window keeps its size and the image is letterboxed. Physics speed
 (`Physics > Simulation Speed`) scales the simulation rate without changing
 gravity, so hair and cloth react faster without extra sag.
 
+The bone panel's `OP Register` dialog reproduces MMD outside-parent
+registration: a control/IK bone or the whole model can follow a bone of any
+loaded model, with per-model display-key windows and the frame-register bake.
+The camera panel's `Follow bone (Track)` mode rides a chosen model bone and
+stores the parent pair in camera keyframes.
+
 The editor provides model, bone, facial, camera, light, shadow, accessory, view,
 playback and interpolation panels. Each panel is a dock that can be moved, tabbed,
 floated or closed, and the arrangement is restored on the next launch; `View >

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QList>
 #include <QRect>
 #include <QStringList>
 #include <QWidget>
@@ -57,6 +58,20 @@ public:
     void reset_selection_transform();
     void set_selected_bone_ik_enabled(bool enabled);
     QMap<QString, bool> ik_states() const;
+    QMap<QString, OpTarget> op_states() const;
+    QStringList op_subject_names() const;
+    QStringList op_target_bone_names(int model_index) const;
+    QList<int> op_target_bone_indices(int model_index) const;
+    struct OpPreview {
+        bool valid = false;
+        std::array<float, 3> position{0.0f, 0.0f, 0.0f};
+        std::array<float, 3> angles_deg{0.0f, 0.0f, 0.0f};
+    };
+    OpPreview op_preview(const QString& subject, const QString& target_model,
+                         const QString& target_bone) const;
+    void op_register(const QMap<QString, OpTarget>& bindings);
+    void op_frame_register(const QString& subject, const QString& target_model,
+                           const QString& target_bone);
     void reset_camera();
 
     int model_count() const { return static_cast<int>(models_.size()); }
@@ -107,6 +122,14 @@ private:
     HikariMotion build_hikari_motion() const;
     bool apply_parsed_motion(const formats::VmdMotion& motion, const QString& label);
     void apply_ik_states(ModelInstance& model, float timeline_frame, float motion_frame);
+    struct OpWindow {
+        unsigned int start = 0;
+        unsigned int end = 0;
+    };
+    QMap<QString, OpWindow> op_windows(float timeline_frame) const;
+    void apply_op_bindings(ModelInstance& model, const QMap<QString, OpTarget>& bindings);
+    void resolve_op_bindings();
+    ModelInstance* model_by_name(const QString& name);
     void apply_editor_tracks(ModelInstance* model, float frame, bool apply_scene_values);
     void apply_editor_bone_override();
     void apply_bone_morphs(ModelInstance& model, const animation::MorphResult& result);

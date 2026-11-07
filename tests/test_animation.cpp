@@ -108,6 +108,52 @@ TEST_CASE("Skeleton rotation propagates to children", "[animation]") {
     REQUIRE(skeleton.world_positions[1].y == Catch::Approx(0.0f).margin(1.0e-3f));
 }
 
+TEST_CASE("Skeleton outside parent places a control bone on the target frame", "[animation]") {
+    hikari::formats::PmxModel model;
+    hikari::formats::PmxBone root;
+    root.name_local = "root";
+    root.name_universal = "root";
+    root.position = {0.0f, 0.0f, 0.0f};
+    root.parent_index = -1;
+    root.flags = 0x0008;
+    hikari::formats::PmxBone control;
+    control.name_local = "control";
+    control.name_universal = "control";
+    control.position = {0.0f, 5.0f, 0.0f};
+    control.parent_index = 0;
+    control.flags = 0x0008 | 0x0004;
+    model.bones = {root, control};
+    model.vertices.resize(2);
+
+    auto skeleton = hikari::animation::Skeleton::from_pmx(model);
+    REQUIRE(skeleton.attachments.size() == 2);
+    REQUIRE(skeleton.attachment_index[1] == 1);
+
+    auto& frame = skeleton.external_parents[1];
+    frame.active = true;
+    frame.target_matrix = hikari::Mat4::from_translation(hikari::Vec3(10.0f, 0.0f, 0.0f));
+    skeleton.update_transforms();
+    REQUIRE(skeleton.world_positions[1].x == Catch::Approx(10.0f));
+    REQUIRE(skeleton.world_positions[1].y == Catch::Approx(0.0f));
+    REQUIRE(skeleton.skinning_palette[1]
+                .transform_point(hikari::Vec3(0.0f, 5.0f, 0.0f))
+                .x == Catch::Approx(10.0f));
+
+    skeleton.external_parents[1].ground = true;
+    skeleton.set_bone_transform(0, hikari::Vec3(1.0f, 0.0f, 0.0f), hikari::Quat::identity());
+    skeleton.update_transforms();
+    REQUIRE(skeleton.world_positions[1].x == Catch::Approx(0.0f));
+    REQUIRE(skeleton.world_positions[1].y == Catch::Approx(5.0f));
+
+    skeleton.clear_external_parents();
+    skeleton.set_bone_transform(0, hikari::Vec3::zero(), hikari::Quat::identity());
+    skeleton.root_external_active = true;
+    skeleton.root_external_matrix =
+        hikari::Mat4::from_translation(hikari::Vec3(3.0f, 0.0f, 0.0f));
+    skeleton.update_transforms();
+    REQUIRE(skeleton.world_positions[0].x == Catch::Approx(3.0f));
+}
+
 TEST_CASE("Skeleton skips IK solving when the IK bone is disabled", "[animation]") {
     auto skeleton = hikari::animation::Skeleton::from_pmx(ik_model());
     REQUIRE(skeleton.ik_enabled.size() == 4);

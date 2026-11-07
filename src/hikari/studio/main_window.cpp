@@ -23,6 +23,7 @@
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -1119,10 +1120,10 @@ QWidget* MainWindow::build_model_tab() {
     key_scale->setToolTip(QStringLiteral("Register the model scale at the current frame"));
     scale_row->addWidget(key_scale);
     layout->addLayout(scale_row);
-    auto* register_button = new QPushButton(QStringLiteral("Register Disp/IK"));
+    auto* register_button = new QPushButton(QStringLiteral("Register Disp/IK/OP"));
     register_button->setToolTip(
-        QStringLiteral("Register IK on/off state for every IK bone at the current frame. "
-                       "Bone display is not stored in VMD."));
+        QStringLiteral("Register IK on/off state and outside-parent registrations at the "
+                       "current frame. Bone display is not stored in VMD."));
     layout->addWidget(register_button);
     layout->addStretch(1);
 
@@ -1149,8 +1150,9 @@ QWidget* MainWindow::build_model_tab() {
         timeline_->update();
     });
     connect(register_button, &QPushButton::clicked, this, [this] {
-        state_.register_ik_keyframe(viewport_->ik_states(),
-                                    static_cast<unsigned int>(state_.current_frame));
+        state_.register_display_keyframe(state_.model_name, viewport_->ik_states(),
+                                         viewport_->op_states(),
+                                         static_cast<unsigned int>(state_.current_frame));
         timeline_->update();
     });
     return page;
@@ -1202,6 +1204,11 @@ QWidget* MainWindow::build_bone_tab() {
     buttons->addWidget(reset);
     buttons->addWidget(register_button);
     layout->addLayout(buttons);
+    auto* op_button = new QPushButton(QStringLiteral("OP Register (Outside Parent)..."));
+    op_button->setToolTip(
+        QStringLiteral("Attach a control/IK bone or the whole model to a bone of another "
+                       "model. The registration is stored in the Disp/IK/OP track."));
+    layout->addWidget(op_button);
     layout->addStretch(1);
 
     connect(mode, &QComboBox::currentIndexChanged, this, [this](int index) {
@@ -1252,6 +1259,7 @@ QWidget* MainWindow::build_bone_tab() {
                                  static_cast<unsigned int>(state_.current_frame));
         timeline_->update();
     });
+    connect(op_button, &QPushButton::clicked, this, [this] { show_op_dialog(); });
     return page;
 }
 
@@ -1343,6 +1351,22 @@ QWidget* MainWindow::build_camera_tab() {
     add_row(grid, 5, QStringLiteral("Target"), camera_target_);
     layout->addLayout(grid);
 
+    camera_follow_ = make_check(QStringLiteral("Follow bone (Track)"), state_.camera_follow);
+    camera_follow_->setToolTip(
+        QStringLiteral("MMD camera tracking: ride the selected model's bone and inherit its "
+                       "world rotation. The parent pair is stored in camera keyframes."));
+    layout->addWidget(camera_follow_);
+    auto* follow_row = new QHBoxLayout();
+    follow_row->addWidget(new QLabel(QStringLiteral("Model")));
+    camera_parent_model_ = new QComboBox();
+    follow_row->addWidget(camera_parent_model_, 1);
+    layout->addLayout(follow_row);
+    auto* follow_bone_row = new QHBoxLayout();
+    follow_bone_row->addWidget(new QLabel(QStringLiteral("Bone")));
+    camera_parent_bone_ = new QComboBox();
+    follow_bone_row->addWidget(camera_parent_bone_, 1);
+    layout->addLayout(follow_bone_row);
+
     auto* row = new QHBoxLayout();
     auto* reset = new QPushButton(QStringLiteral("Reset Camera"));
     auto* ortho = make_check(QStringLiteral("Ortho"), state_.camera_orthographic);
@@ -1389,6 +1413,20 @@ QWidget* MainWindow::build_camera_tab() {
                                      : index == 2 ? QStringLiteral("Camera target: selected bone")
                                                   : QStringLiteral("Camera target: free"));
     });
+    connect(camera_follow_, &QCheckBox::toggled, this, [this](bool checked) {
+        state_.camera_follow = checked;
+        state_.set_status(checked ? QStringLiteral("Camera follow bone enabled")
+                                  : QStringLiteral("Camera follow bone disabled"));
+    });
+    connect(camera_parent_model_, &QComboBox::currentIndexChanged, this, [this](int) {
+        state_.camera_parent_model = camera_parent_model_->currentData().toInt();
+        state_.camera_parent_bone = 0;
+        refresh_camera_follow_combos();
+    });
+    connect(camera_parent_bone_, &QComboBox::currentIndexChanged, this, [this](int) {
+        state_.camera_parent_bone = camera_parent_bone_->currentData().toInt();
+    });
+    refresh_camera_follow_combos();
     connect(reset, &QPushButton::clicked, this, [this, distance, fov, yaw, pitch, roll] {
         viewport_->reset_camera();
         state_.mode = EditorMode::Camera;
@@ -1773,6 +1811,42 @@ void MainWindow::refresh_model_list() {
         model_scale_->setValue(state_.model_scale);
         model_scale_->blockSignals(false);
     }
+    refresh_camera_follow_combos();
+}
+
+void MainWindow::refresh_camera_follow_combos() {
+    if (camera_parent_model_ == nullptr || camera_parent_bone_ == nullptr ||
+        viewport_ == nullptr) {
+        return;
+    }
+    const QStringList models = viewport_->model_names();
+    camera_parent_model_->blockSignals(true);
+    camera_parent_model_->clear();
+    camera_parent_model_->addItem(QStringLiteral("none"), -1);
+    for (int i = 0; i < models.size(); ++i) {
+        camera_parent_model_->addItem(models[i], i);
+    }
+    const int model_index = state_.camera_parent_model;
+    const int combo_index = model_index < 0 ? 0 : model_index + 1;
+    camera_parent_model_->setCurrentIndex(
+        std::clamp(combo_index, 0, camera_parent_model_->count() - 1));
+    camera_parent_model_->blockSignals(false);
+
+    camera_parent_bone_->blockSignals(true);
+    camera_parent_bone_->clear();
+    if (model_index >= 0 && model_index < models.size()) {
+        const QStringList bones = viewport_->op_target_bone_names(model_index);
+        const QList<int> indices = viewport_->op_target_bone_indices(model_index);
+        for (int i = 0; i < bones.size() && i < indices.size(); ++i) {
+            camera_parent_bone_->addItem(bones[i], indices[i]);
+        }
+        const int bone_combo = camera_parent_bone_->findData(state_.camera_parent_bone);
+        camera_parent_bone_->setCurrentIndex(bone_combo >= 0 ? bone_combo : 0);
+        if (bone_combo < 0 && camera_parent_bone_->count() > 0) {
+            state_.camera_parent_bone = camera_parent_bone_->currentData().toInt();
+        }
+    }
+    camera_parent_bone_->blockSignals(false);
 }
 
 void MainWindow::update_edit_actions() {
@@ -1869,6 +1943,29 @@ void MainWindow::sync_bone_fields() {
         camera_target_->blockSignals(true);
         camera_target_->setCurrentIndex(static_cast<int>(state_.camera_target));
         camera_target_->blockSignals(false);
+    }
+    if (camera_follow_ != nullptr && !camera_follow_->hasFocus()) {
+        camera_follow_->blockSignals(true);
+        camera_follow_->setChecked(state_.camera_follow);
+        camera_follow_->blockSignals(false);
+    }
+    if (camera_parent_model_ != nullptr && !camera_parent_model_->hasFocus()) {
+        const int want = state_.camera_parent_model < 0 ? 0 : state_.camera_parent_model + 1;
+        if (camera_parent_model_->currentIndex() != want) {
+            camera_parent_model_->blockSignals(true);
+            camera_parent_model_->setCurrentIndex(
+                std::clamp(want, 0, camera_parent_model_->count() - 1));
+            camera_parent_model_->blockSignals(false);
+            refresh_camera_follow_combos();
+        }
+    }
+    if (camera_parent_bone_ != nullptr && !camera_parent_bone_->hasFocus()) {
+        const int want = camera_parent_bone_->findData(state_.camera_parent_bone);
+        if (want >= 0 && camera_parent_bone_->currentIndex() != want) {
+            camera_parent_bone_->blockSignals(true);
+            camera_parent_bone_->setCurrentIndex(want);
+            camera_parent_bone_->blockSignals(false);
+        }
     }
     if (model_scale_ != nullptr && !model_scale_->hasFocus()) {
         model_scale_->blockSignals(true);
@@ -2052,6 +2149,168 @@ void MainWindow::show_gravity_dialog() {
             [this](double value) { state_.gravity_noise = static_cast<float>(value); });
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    dialog.exec();
+}
+
+void MainWindow::show_op_dialog() {
+    if (!state_.model_loaded || viewport_ == nullptr) {
+        QMessageBox::information(this, QStringLiteral("Outside Parent (OP) Register"),
+                                 QStringLiteral("Load a PMX model first."));
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("Outside Parent (OP) Register"));
+    auto* layout = new QVBoxLayout(&dialog);
+
+    auto* group = new QGroupBox(QStringLiteral("Outside parent setting"), &dialog);
+    auto* grid = new QGridLayout(group);
+    auto* subject = new QComboBox();
+    auto* previous = new QPushButton(QStringLiteral("<"));
+    auto* next = new QPushButton(QStringLiteral(">"));
+    auto* target_model = new QComboBox();
+    auto* target_bone = new QComboBox();
+    previous->setFixedWidth(26);
+    next->setFixedWidth(26);
+    grid->addWidget(new QLabel(QStringLiteral("Subject bone")), 0, 0);
+    grid->addWidget(subject, 0, 1);
+    grid->addWidget(previous, 0, 2);
+    grid->addWidget(next, 0, 3);
+    grid->addWidget(new QLabel(QStringLiteral("Target model")), 1, 0);
+    grid->addWidget(target_model, 1, 1, 1, 3);
+    grid->addWidget(new QLabel(QStringLiteral("Target bone")), 2, 0);
+    grid->addWidget(target_bone, 2, 1, 1, 3);
+    layout->addWidget(group);
+
+    auto* relative = new QGroupBox(QStringLiteral("Subject bone relative place (auto calculated)"));
+    auto* relative_grid = new QGridLayout(relative);
+    std::array<QLineEdit*, 6> fields{};
+    const char* names = "XYZ";
+    for (int i = 0; i < 3; ++i) {
+        fields[static_cast<std::size_t>(i)] = new QLineEdit();
+        fields[static_cast<std::size_t>(i)]->setReadOnly(true);
+        fields[static_cast<std::size_t>(i + 3)] = new QLineEdit();
+        fields[static_cast<std::size_t>(i + 3)]->setReadOnly(true);
+        relative_grid->addWidget(
+            new QLabel(QStringLiteral("Place %1").arg(QChar(names[i]))), i, 0);
+        relative_grid->addWidget(fields[static_cast<std::size_t>(i)], i, 1);
+        relative_grid->addWidget(
+            new QLabel(QStringLiteral("Rot %1").arg(QChar(names[i]))), i, 2);
+        relative_grid->addWidget(fields[static_cast<std::size_t>(i + 3)], i, 3);
+    }
+    layout->addWidget(relative);
+
+    for (const QString& name : viewport_->op_subject_names()) {
+        subject->addItem(name == op_root_subject() ? QStringLiteral("root") : name, name);
+    }
+
+    const QStringList model_names = viewport_->model_names();
+    target_model->addItem(QStringLiteral("none"), -1);
+    target_model->addItem(QStringLiteral("ground"), -2);
+    for (int i = 0; i < model_names.size(); ++i) {
+        target_model->addItem(model_names[i], i);
+    }
+
+    QMap<QString, OpTarget> working = viewport_->op_states();
+
+    const auto subject_key = [&] { return subject->currentData().toString(); };
+    const auto model_index = [&] { return target_model->currentData().toInt(); };
+    const auto model_name = [&] {
+        const int index = model_index();
+        return index >= 0 && index < model_names.size() ? model_names[index] : QString();
+    };
+    const auto bone_name = [&] { return target_bone->currentData().toString(); };
+
+    const auto refresh_bones = [&](const QString& keep) {
+        target_bone->blockSignals(true);
+        target_bone->clear();
+        if (model_index() >= 0) {
+            for (const QString& bone : viewport_->op_target_bone_names(model_index())) {
+                target_bone->addItem(bone, bone);
+            }
+            const int index = target_bone->findData(keep);
+            if (index >= 0) {
+                target_bone->setCurrentIndex(index);
+            }
+        }
+        target_bone->blockSignals(false);
+    };
+
+    const auto refresh_preview = [&] {
+        const auto preview = viewport_->op_preview(subject_key(), model_name(), bone_name());
+        for (std::size_t i = 0; i < 3; ++i) {
+            fields[i]->setText(preview.valid ? QString::number(preview.position[i], 'f', 3)
+                                             : QStringLiteral("------"));
+            fields[i + 3]->setText(preview.valid
+                                       ? QString::number(preview.angles_deg[i], 'f', 3)
+                                       : QStringLiteral("------"));
+        }
+    };
+
+    const auto load_subject = [&] {
+        const QString key = subject_key();
+        const OpTarget target = working.value(key);
+        target_model->blockSignals(true);
+        if (target.model.isEmpty()) {
+            target_model->setCurrentIndex(0);
+        } else if (target.model == op_ground_target()) {
+            target_model->setCurrentIndex(1);
+        } else {
+            const int index = model_names.indexOf(target.model);
+            target_model->setCurrentIndex(index >= 0 ? index + 2 : 0);
+        }
+        target_model->blockSignals(false);
+        refresh_bones(target.bone);
+        refresh_preview();
+    };
+
+    QObject::connect(subject, &QComboBox::currentIndexChanged, &dialog,
+                     [&](int) { load_subject(); });
+    QObject::connect(previous, &QPushButton::clicked, &dialog, [&] {
+        subject->setCurrentIndex(std::max(subject->currentIndex() - 1, 0));
+    });
+    QObject::connect(next, &QPushButton::clicked, &dialog, [&] {
+        subject->setCurrentIndex(
+            std::min(subject->currentIndex() + 1, subject->count() - 1));
+    });
+    QObject::connect(target_model, &QComboBox::currentIndexChanged, &dialog, [&](int) {
+        OpTarget& target = working[subject_key()];
+        target.model = model_index() == -2 ? op_ground_target() : model_name();
+        target.bone.clear();
+        refresh_bones(QString());
+        if (model_index() >= 0 && target_bone->count() > 0) {
+            target.bone = bone_name();
+        }
+        refresh_preview();
+    });
+    QObject::connect(target_bone, &QComboBox::currentIndexChanged, &dialog, [&](int) {
+        working[subject_key()].bone = bone_name();
+        refresh_preview();
+    });
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+    auto* op_register = new QPushButton(QStringLiteral("OP register"));
+    auto* frame_register = new QPushButton(QStringLiteral("Frame register"));
+    buttons->addButton(op_register, QDialogButtonBox::ActionRole);
+    buttons->addButton(frame_register, QDialogButtonBox::ActionRole);
+    layout->addWidget(buttons);
+
+    QObject::connect(op_register, &QPushButton::clicked, &dialog, [&] {
+        viewport_->op_register(working);
+        refresh_preview();
+    });
+    QObject::connect(frame_register, &QPushButton::clicked, &dialog, [&] {
+        if (model_index() == -1) {
+            return;
+        }
+        const QString target =
+            model_index() == -2 ? op_ground_target() : model_name();
+        viewport_->op_frame_register(subject_key(), target, bone_name());
+        refresh_preview();
+    });
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    load_subject();
     dialog.exec();
 }
 

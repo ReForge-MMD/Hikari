@@ -24,6 +24,17 @@ enum class PhysicsMode { Always, Anytime, Trace, Disabled };
 enum class ShadowMode { Off, Mode1, Mode2 };
 enum class FpsLimit { Fps30, Fps60, Unlimited };
 
+// One MMD outside-parent (OP) registration carried by the Disp/IK/OP track.
+// model is empty for "none", kOpGroundTarget for ground, otherwise the target
+// model name; bone is the target bone name.
+struct OpTarget {
+    QString model;
+    QString bone;
+};
+
+inline QString op_root_subject() { return QStringLiteral("<root>"); }
+inline QString op_ground_target() { return QStringLiteral("<ground>"); }
+
 // Snapshot of an animated value captured when a keyframe is registered.
 // Per-track interpretation:
 //   bone: position + rotation (local transform)
@@ -46,6 +57,15 @@ struct TrackKeyframe {
     std::array<std::uint8_t, 4> interpolation{20, 20, 20, 20};
     // IK on/off state per IK controller bone for the Disp/IK/OP track.
     QMap<QString, bool> ik_enabled;
+    // Outside-parent registrations per subject bone for the same track.
+    QMap<QString, OpTarget> op_bindings;
+    // Per-model display state. MMD keeps a display-key track on every model;
+    // this map namespaces the shared Hikari row the same way.
+    QMap<QString, QMap<QString, bool>> model_ik;
+    QMap<QString, QMap<QString, OpTarget>> model_op;
+    // Camera follow-bone target carried by camera keys (MMD CameraKey pair).
+    int parent_model = -1;
+    int parent_bone = 0;
 };
 
 using TrackKeyframeMap = std::map<QString, std::map<unsigned int, TrackKeyframe>>;
@@ -135,6 +155,10 @@ struct StudioAppState {
     float camera_fov_deg = 30.0f;
     bool camera_orthographic = false;
     CameraTarget camera_target = CameraTarget::Free;
+    // MMD "Track" (follow bone): camera rides the selected model's bone.
+    bool camera_follow = false;
+    int camera_parent_model = -1;
+    int camera_parent_bone = 0;
 
     PhysicsMode physics_mode = PhysicsMode::Anytime;
     bool playtime_only = false;
@@ -186,6 +210,10 @@ struct StudioAppState {
 
     void register_keyframe(const QString& track, unsigned int frame, bool record_undo = true);
     void register_ik_keyframe(const QMap<QString, bool>& states, unsigned int frame);
+    void register_display_keyframe(const QString& track_model_name,
+                                   const QMap<QString, bool>& ik_states,
+                                   const QMap<QString, OpTarget>& op_bindings,
+                                   unsigned int frame);
     void delete_keyframe(const QString& track, unsigned int frame, bool record_undo = true);
     void delete_keyframes(const std::set<std::pair<QString, unsigned int>>& keys);
     void delete_frame_line(unsigned int frame);

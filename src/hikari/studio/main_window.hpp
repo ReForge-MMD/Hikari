@@ -64,6 +64,7 @@ private:
     QWidget* build_playback_tab();
     QWidget* build_interpolation_tab();
     void show_gravity_dialog();
+    void show_op_dialog();
     void show_physics_dialog();
     void show_shortcuts_dialog();
     void show_about_dialog();
@@ -79,6 +80,7 @@ private:
     void paste_keyframes();
     void refresh_targets();
     void refresh_model_list();
+    void refresh_camera_follow_combos();
     void refresh_morph_combos();
     void sync_bone_fields();
     void sync_morph_fields();
@@ -103,6 +105,9 @@ private:
     QActionGroup* physics_speed_group_ = nullptr;
     QComboBox* model_combo_ = nullptr;
     QComboBox* camera_target_ = nullptr;
+    QCheckBox* camera_follow_ = nullptr;
+    QComboBox* camera_parent_model_ = nullptr;
+    QComboBox* camera_parent_bone_ = nullptr;
     QCheckBox* model_visible_ = nullptr;
     QDoubleSpinBox* model_scale_ = nullptr;
     QCheckBox* bone_ik_ = nullptr;
