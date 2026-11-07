@@ -28,6 +28,8 @@ signals:
     void localModeChanged(bool local);
 
 protected:
+    void showEvent(QShowEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;

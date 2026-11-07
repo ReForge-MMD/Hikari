@@ -80,6 +80,9 @@ signals:
     void screenSizeChanged(int width, int height);
 
 protected:
+    QPaintEngine* paintEngine() const override { return nullptr; }
+    void paintEvent(QPaintEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
     void showEvent(QShowEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;

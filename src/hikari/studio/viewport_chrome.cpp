@@ -1,5 +1,15 @@
 #include "hikari/studio/viewport_chrome.hpp"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <QDoubleSpinBox>
 #include <QCursor>
 #include <QHBoxLayout>
@@ -136,6 +146,31 @@ int ViewGizmo::cell_at(const QPoint& point) const {
         }
     }
     return -1;
+}
+
+void ViewGizmo::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+#ifdef _WIN32
+    if (testAttribute(Qt::WA_NativeWindow)) {
+        const HWND hwnd = reinterpret_cast<HWND>(winId());
+        SetWindowLongPtr(hwnd, GWL_STYLE, GetWindowLongPtr(hwnd, GWL_STYLE) | WS_CLIPSIBLINGS);
+        const HRGN rgn = CreateRoundRectRgn(0, 0, width() + 1, height() + 1, 16, 16);
+        SetWindowRgn(hwnd, rgn, TRUE);
+    }
+#endif
+}
+
+bool ViewGizmo::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
+#ifdef _WIN32
+    if (eventType == "windows_generic_MSG") {
+        MSG* msg = static_cast<MSG*>(message);
+        if (msg->message == WM_ERASEBKGND) {
+            *result = 1;
+            return true;
+        }
+    }
+#endif
+    return QWidget::nativeEvent(eventType, message, result);
 }
 
 void ViewGizmo::paintEvent(QPaintEvent*) {

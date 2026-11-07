@@ -135,6 +135,7 @@ D3DViewport::D3DViewport(StudioAppState& state, QWidget* parent)
     setAttribute(Qt::WA_NativeWindow);
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAttribute(Qt::WA_PaintOnScreen);
+    setAttribute(Qt::WA_NoSystemBackground);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
     setMinimumSize(320, 240);
@@ -147,6 +148,8 @@ D3DViewport::D3DViewport(StudioAppState& state, QWidget* parent)
 
     gizmo_ = new ViewGizmo(this);
     gizmo_->setAttribute(Qt::WA_NativeWindow);
+    gizmo_->setAttribute(Qt::WA_OpaquePaintEvent);
+    gizmo_->setAttribute(Qt::WA_NoSystemBackground);
     gizmo_->set_local_mode(state_.is_local_coord);
     connect(gizmo_, &ViewGizmo::rotateRequested, this, &D3DViewport::rotate_selection);
     connect(gizmo_, &ViewGizmo::translateRequested, this, &D3DViewport::translate_selection);
@@ -163,6 +166,10 @@ bool D3DViewport::initialize() {
     }
     try {
         const HWND hwnd = reinterpret_cast<HWND>(winId());
+#ifdef _WIN32
+        SetWindowLongPtr(hwnd, GWL_STYLE,
+                         GetWindowLongPtr(hwnd, GWL_STYLE) | WS_CLIPCHILDREN | WS_CLIPSIBLINGS);
+#endif
         context_ = std::make_unique<core::D3D11Context>(hwnd, static_cast<std::uint32_t>(width()),
                                                          static_cast<std::uint32_t>(height()));
         renderer_ = std::make_unique<render::SceneRenderer>(*context_);
@@ -177,6 +184,25 @@ bool D3DViewport::initialize() {
                                .arg(QString::fromUtf8(error.what())));
         return false;
     }
+}
+
+void D3DViewport::paintEvent(QPaintEvent* /*event*/) {
+    if (initialized_) {
+        tick();
+    }
+}
+
+bool D3DViewport::nativeEvent(const QByteArray& eventType, void* message, qintptr* result) {
+#ifdef _WIN32
+    if (eventType == "windows_generic_MSG") {
+        MSG* msg = static_cast<MSG*>(message);
+        if (msg->message == WM_ERASEBKGND) {
+            *result = 1;
+            return true;
+        }
+    }
+#endif
+    return QWidget::nativeEvent(eventType, message, result);
 }
 
 void D3DViewport::showEvent(QShowEvent* event) {
@@ -199,6 +225,9 @@ void D3DViewport::resizeEvent(QResizeEvent* event) {
         }
     }
     place_gizmo();
+    if (initialized_) {
+        tick();
+    }
 }
 
 bool D3DViewport::load_model(const QString& path) {
@@ -1035,7 +1064,9 @@ void D3DViewport::place_gizmo() {
                              std::max(0, width() - gizmo_->width()));
     const int y = std::clamp(scene.bottom() - gizmo_->height() - margin, 0,
                              std::max(0, height() - gizmo_->height()));
-    gizmo_->move(x, y);
+    if (gizmo_->pos() != QPoint(x, y)) {
+        gizmo_->move(x, y);
+    }
     gizmo_->raise();
 }
 
