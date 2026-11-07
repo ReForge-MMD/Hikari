@@ -71,11 +71,14 @@ play/pause, `V` VSync, `P` physics, `J` jiggle, `R` reset physics.
 
 Screen Size sets the offscreen viewport render resolution and aspect ratio; the
 application window keeps its size and the image is letterboxed. Physics speed
-(`Physical Operation > Simulation Speed`) scales the simulation rate without changing
+(`Physics > Simulation Speed`) scales the simulation rate without changing
 gravity, so hair and cloth react faster without extra sag.
 
 The editor provides model, bone, facial, camera, light, shadow, accessory, view,
-playback and interpolation panels. Skeleton bones and Jolt rigid bodies/joints are
+playback and interpolation panels. Each panel is a dock that can be moved, tabbed,
+floated or closed, and the arrangement is restored on the next launch; `View >
+Panels` toggles panels and resets the layout. Skeleton bones and Jolt rigid
+bodies/joints are
 drawn as a D3D11 line overlay, so the viewport does not depend on Qt painting over the
 swap chain.
 

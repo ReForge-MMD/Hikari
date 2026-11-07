@@ -86,7 +86,6 @@ private:
 
     StudioAppState& state_;
     QPushButton* mode_ = nullptr;
-    QLabel* target_ = nullptr;
     QDoubleSpinBox* position_[3] = {};
     QDoubleSpinBox* angle_[3] = {};
     QDoubleSpinBox* distance_ = nullptr;

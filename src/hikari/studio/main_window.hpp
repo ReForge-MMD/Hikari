@@ -8,15 +8,19 @@
 #include "hikari/studio/app_state.hpp"
 
 class QAction;
+class QActionGroup;
 class QCheckBox;
+class QCloseEvent;
 class QComboBox;
+class QDockWidget;
 class QDoubleSpinBox;
+class QEvent;
 class QKeyEvent;
 class QLabel;
+class QMenu;
 class QPushButton;
 class QSlider;
 class QSpinBox;
-class QActionGroup;
 
 namespace hikari::studio {
 
@@ -32,14 +36,20 @@ public:
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
+    void closeEvent(QCloseEvent* event) override;
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
     void build_menus();
     void build_docks();
+    QDockWidget* add_panel_dock(const QString& title, const QString& object_name, QWidget* body,
+                                Qt::DockWidgetArea area);
+    void reset_panel_layout();
+    void restore_panel_layout();
+    void save_panel_layout();
+    void refresh_tab_title_bars();
     QWidget* build_viewport_area();
     QWidget* build_timeline_panel();
-    QWidget* build_panel_strip();
-    QWidget* make_panel(const QString& title, QWidget* body, int width);
     QWidget* build_model_tab();
     QWidget* build_bone_tab();
     QWidget* build_facial_tab();
@@ -78,7 +88,9 @@ private:
     ViewportHeader* header_ = nullptr;
     ViewportFooter* footer_ = nullptr;
     TimelineWidget* timeline_ = nullptr;
-    QWidget* panel_strip_ = nullptr;
+    QDockWidget* timeline_dock_ = nullptr;
+    std::vector<QDockWidget*> panel_docks_;
+    QMenu* panels_menu_ = nullptr;
     std::array<QDoubleSpinBox*, 3> bone_pos_{};
     std::array<QDoubleSpinBox*, 3> bone_rot_{};
     std::array<QComboBox*, 4> morph_combo_{};
@@ -98,6 +110,7 @@ private:
     QSpinBox* jump_frame_ = nullptr;
     QLabel* stats_label_ = nullptr;
     QLabel* info_label_ = nullptr;
+    QString persistent_status_;
     std::vector<ClipboardKey> clipboard_;
     unsigned int clipboard_anchor_ = 0;
     QString model_path_;

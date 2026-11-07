@@ -4,12 +4,14 @@
 #include <QActionGroup>
 #include <QApplication>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -17,19 +19,27 @@
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPixmap>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStatusBar>
+#include <QTabBar>
+#include <QTabWidget>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -52,6 +62,7 @@ QDoubleSpinBox* make_spin(double minimum, double maximum, double step, int decim
     spin->setDecimals(decimals);
     spin->setValue(value);
     spin->setKeyboardTracking(false);
+    spin->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     return spin;
 }
 
@@ -71,7 +82,7 @@ QLabel* make_hint(const QString& text) {
 void add_row(QGridLayout* layout, int row, const QString& label, QWidget* widget) {
     auto* caption = new QLabel(label);
     caption->setObjectName(QStringLiteral("FieldLabel"));
-    caption->setMinimumWidth(52);
+    caption->setMinimumWidth(64);
     layout->addWidget(caption, row, 0);
     layout->addWidget(widget, row, 1);
 }
@@ -80,6 +91,71 @@ QCheckBox* make_check(const QString& text, bool checked) {
     auto* box = new QCheckBox(text);
     box->setChecked(checked);
     return box;
+}
+
+QWidget* make_divider() {
+    auto* divider = new QWidget();
+    divider->setObjectName(QStringLiteral("ToolbarDivider"));
+    divider->setFixedSize(1, 20);
+    return divider;
+}
+
+enum class Glyph { First, Previous, Next, Last, Add, Remove };
+
+QIcon make_glyph_icon(Glyph glyph) {
+    constexpr int logical_size = 16;
+    constexpr qreal scale = 2.0;
+    QPixmap pixmap(static_cast<int>(logical_size * scale),
+                   static_cast<int>(logical_size * scale));
+    pixmap.setDevicePixelRatio(scale);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QColor ink(colors::on_surface_variant);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(ink);
+    const auto triangle = [&painter](const QPointF& a, const QPointF& b, const QPointF& c) {
+        QPolygonF shape;
+        shape << a << b << c;
+        painter.drawPolygon(shape);
+    };
+    switch (glyph) {
+    case Glyph::First:
+        painter.drawRect(QRectF(4.0, 3.5, 1.6, 9.0));
+        triangle({12.6, 3.5}, {5.8, 8.0}, {12.6, 12.5});
+        break;
+    case Glyph::Previous:
+        triangle({11.6, 3.5}, {4.4, 8.0}, {11.6, 12.5});
+        break;
+    case Glyph::Next:
+        triangle({4.4, 3.5}, {11.6, 8.0}, {4.4, 12.5});
+        break;
+    case Glyph::Last:
+        triangle({3.4, 3.5}, {10.2, 8.0}, {3.4, 12.5});
+        painter.drawRect(QRectF(10.4, 3.5, 1.6, 9.0));
+        break;
+    case Glyph::Add:
+        painter.setPen(QPen(ink, 1.6, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(QPointF(8.0, 4.2), QPointF(8.0, 11.8));
+        painter.drawLine(QPointF(4.2, 8.0), QPointF(11.8, 8.0));
+        break;
+    case Glyph::Remove:
+        painter.setPen(QPen(ink, 1.6, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(QPointF(4.2, 8.0), QPointF(11.8, 8.0));
+        break;
+    }
+    return QIcon(pixmap);
+}
+
+QToolButton* make_transport_button(Glyph glyph, const QString& tooltip, QWidget* parent) {
+    auto* button = new QToolButton(parent);
+    button->setObjectName(QStringLiteral("TransportButton"));
+    button->setIcon(make_glyph_icon(glyph));
+    button->setIconSize(QSize(16, 16));
+    button->setFixedSize(32, 32);
+    button->setAutoRaise(true);
+    button->setToolTip(tooltip);
+    return button;
 }
 
 } // namespace
@@ -91,31 +167,34 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
     setStyleSheet(NordicTheme::style_sheet());
 
     setCentralWidget(build_viewport_area());
-    build_menus();
     build_docks();
+    build_menus();
+    restore_panel_layout();
+    QTimer::singleShot(250, this, [this] { refresh_tab_title_bars(); });
 
     statusBar()->setSizeGripEnabled(true);
-    info_label_ = new QLabel(QStringLiteral("Hikari Studio ready"));
-    stats_label_ = new QLabel(QStringLiteral("60.0 FPS (16.67 ms)"));
+    persistent_status_ = QStringLiteral("Hikari Studio ready");
+    info_label_ = new QLabel(persistent_status_);
+    info_label_->setObjectName(QStringLiteral("StatusLabel"));
+    stats_label_ = new QLabel(QStringLiteral("60.0 fps  ·  16.7 ms"));
+    stats_label_->setObjectName(QStringLiteral("StatsLabel"));
     statusBar()->addWidget(info_label_, 1);
     statusBar()->addPermanentWidget(stats_label_);
 
     connect(viewport_, &D3DViewport::statsChanged, this,
             [this](float fps, float frame_ms) {
-                stats_label_->setText(QStringLiteral("%1 FPS (%2 ms)")
+                stats_label_->setText(QStringLiteral("%1 fps  ·  %2 ms")
                                           .arg(fps, 0, 'f', 1)
-                                          .arg(frame_ms, 0, 'f', 2));
+                                          .arg(frame_ms, 0, 'f', 1));
             });
-    connect(viewport_, &D3DViewport::statusMessage, this, [this](const QString& message) {
-        statusBar()->showMessage(message, 5000);
-        info_label_->setText(message);
-    });
+    connect(viewport_, &D3DViewport::statusMessage, this,
+            [this](const QString& message) { state_.set_status(message); });
     connect(viewport_, &D3DViewport::modelLoaded, this,
             [this](const QString& name, int vertices, int bones) {
                 refresh_targets();
                 refresh_morph_combos();
-                info_label_->setText(
-                    QStringLiteral("%1 | %2 vertices | %3 bones").arg(name).arg(vertices).arg(bones));
+                persistent_status_ =
+                    QStringLiteral("%1  ·  %2 vertices  ·  %3 bones").arg(name).arg(vertices).arg(bones);
             });
     connect(viewport_, &D3DViewport::screenSizeChanged, this, [this](int width, int height) {
         state_.screen_size_width = width;
@@ -199,6 +278,7 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
             stats_label_->setVisible(state_.info_display);
         }
         if (info_label_ != nullptr) {
+            info_label_->setText(state_.current_status().value_or(persistent_status_));
             info_label_->setVisible(state_.info_display);
         }
     });
@@ -402,6 +482,17 @@ void MainWindow::build_menus() {
     connect(ground_shadow_action, &QAction::toggled, this,
             [this](bool checked) { state_.ground_shadow = checked; });
     view_menu->addSeparator();
+    auto* white_action = view_menu->addAction(QStringLiteral("MMD White Canvas"));
+    white_action->setCheckable(true);
+    white_action->setChecked(state_.viewport_white_bg);
+    connect(white_action, &QAction::toggled, this,
+            [this](bool checked) { state_.viewport_white_bg = checked; });
+    auto* wireframe_action = view_menu->addAction(QStringLiteral("Wireframe (R)"));
+    wireframe_action->setCheckable(true);
+    wireframe_action->setChecked(state_.wireframe);
+    connect(wireframe_action, &QAction::toggled, this,
+            [this](bool checked) { state_.wireframe = checked; });
+    view_menu->addSeparator();
     view_menu->addAction(QStringLiteral("Reset View"), this, [this] {
         viewport_->reset_camera();
         footer_->sync();
@@ -415,21 +506,19 @@ void MainWindow::build_menus() {
             showFullScreen();
         }
     });
+    view_menu->addSeparator();
 
-    auto* background_menu = menuBar()->addMenu(QStringLiteral("&Background"));
-    auto* white_action = background_menu->addAction(QStringLiteral("MMD White Canvas"));
-    white_action->setCheckable(true);
-    white_action->setChecked(state_.viewport_white_bg);
-    connect(white_action, &QAction::toggled, this,
-            [this](bool checked) { state_.viewport_white_bg = checked; });
-    auto* wireframe_action = background_menu->addAction(QStringLiteral("Wireframe (R)"));
-    wireframe_action->setCheckable(true);
-    wireframe_action->setChecked(state_.wireframe);
-    connect(wireframe_action, &QAction::toggled, this,
-            [this](bool checked) { state_.wireframe = checked; });
-    background_menu->addSeparator();
-    background_menu->addAction(QStringLiteral("Screen Size..."), this,
-                               [this] { show_screen_size_dialog(); });
+    panels_menu_ = view_menu->addMenu(QStringLiteral("Panels"));
+    if (timeline_dock_ != nullptr) {
+        panels_menu_->addAction(timeline_dock_->toggleViewAction());
+        panels_menu_->addSeparator();
+    }
+    for (auto* dock : panel_docks_) {
+        panels_menu_->addAction(dock->toggleViewAction());
+    }
+    panels_menu_->addSeparator();
+    panels_menu_->addAction(QStringLiteral("Reset Panel Layout"), this,
+                            [this] { reset_panel_layout(); });
 
     auto* facial_menu = menuBar()->addMenu(QStringLiteral("&Facial"));
     facial_menu->addAction(QStringLiteral("Reset All Facial Values"), this, [this] {
@@ -449,7 +538,7 @@ void MainWindow::build_menus() {
         timeline_->update();
     });
 
-    auto* physics_menu = menuBar()->addMenu(QStringLiteral("&Physical Operation"));
+    auto* physics_menu = menuBar()->addMenu(QStringLiteral("&Physics"));
     auto* physics_group = new QActionGroup(this);
     physics_group->setExclusive(true);
     for (const auto& [label, mode] :
@@ -524,61 +613,385 @@ void MainWindow::build_menus() {
 }
 
 void MainWindow::build_docks() {
+    setDockNestingEnabled(true);
+    setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks |
+                   QMainWindow::AllowTabbedDocks | QMainWindow::GroupedDragging);
+    setTabPosition(Qt::AllDockWidgetAreas, QTabWidget::North);
+    setCorner(Qt::TopLeftCorner, Qt::LeftDockWidgetArea);
     setCorner(Qt::BottomLeftCorner, Qt::BottomDockWidgetArea);
+    setCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);
     setCorner(Qt::BottomRightCorner, Qt::BottomDockWidgetArea);
 
-    auto* timeline_dock = new QDockWidget(QStringLiteral("Timeline"), this);
-    timeline_dock->setObjectName(QStringLiteral("TimelineDock"));
-    timeline_dock->setWidget(build_timeline_panel());
-    addDockWidget(Qt::LeftDockWidgetArea, timeline_dock);
+    timeline_dock_ = new QDockWidget(QStringLiteral("Timeline"), this);
+    timeline_dock_->setObjectName(QStringLiteral("TimelineDock"));
+    timeline_dock_->setAllowedAreas(Qt::AllDockWidgetAreas);
+    timeline_dock_->setWidget(build_timeline_panel());
+    addDockWidget(Qt::BottomDockWidgetArea, timeline_dock_);
 
-    auto* panels_dock = new QDockWidget(QStringLiteral("Manipulation"), this);
-    panels_dock->setObjectName(QStringLiteral("EditorDock"));
-    panel_strip_ = build_panel_strip();
-    panels_dock->setWidget(panel_strip_);
-    addDockWidget(Qt::BottomDockWidgetArea, panels_dock);
-    resizeDocks({timeline_dock}, {300}, Qt::Horizontal);
-    resizeDocks({panels_dock}, {306}, Qt::Vertical);
+    add_panel_dock(QStringLiteral("Model"), QStringLiteral("ModelDock"), build_model_tab(),
+                   Qt::LeftDockWidgetArea);
+    add_panel_dock(QStringLiteral("Bone"), QStringLiteral("BoneDock"), build_bone_tab(),
+                   Qt::LeftDockWidgetArea);
+
+    auto* camera = add_panel_dock(QStringLiteral("Camera"), QStringLiteral("CameraDock"),
+                                  build_camera_tab(), Qt::RightDockWidgetArea);
+    auto* light = add_panel_dock(QStringLiteral("Light"), QStringLiteral("LightDock"),
+                                 build_light_tab(), Qt::RightDockWidgetArea);
+    auto* shadow = add_panel_dock(QStringLiteral("Shadow"), QStringLiteral("ShadowDock"),
+                                  build_shadow_tab(), Qt::RightDockWidgetArea);
+    auto* accessory = add_panel_dock(QStringLiteral("Accessory"),
+                                     QStringLiteral("AccessoryDock"), build_accessory_tab(),
+                                     Qt::RightDockWidgetArea);
+    auto* facial = add_panel_dock(QStringLiteral("Facial"), QStringLiteral("FacialDock"),
+                                  build_facial_tab(), Qt::RightDockWidgetArea);
+    auto* view = add_panel_dock(QStringLiteral("View"), QStringLiteral("ViewDock"),
+                                build_view_tab(), Qt::RightDockWidgetArea);
+    auto* playback = add_panel_dock(QStringLiteral("Playback"), QStringLiteral("PlaybackDock"),
+                                    build_playback_tab(), Qt::RightDockWidgetArea);
+    auto* interpolation =
+        add_panel_dock(QStringLiteral("Interpolation"), QStringLiteral("InterpolationDock"),
+                       build_interpolation_tab(), Qt::RightDockWidgetArea);
+
+    tabifyDockWidget(camera, light);
+    tabifyDockWidget(light, shadow);
+    tabifyDockWidget(shadow, accessory);
+    tabifyDockWidget(facial, view);
+    tabifyDockWidget(view, playback);
+    tabifyDockWidget(playback, interpolation);
+
+    resizeDocks({timeline_dock_}, {320}, Qt::Vertical);
+    if (auto* model = findChild<QDockWidget*>(QStringLiteral("ModelDock"))) {
+        resizeDocks({model}, {288}, Qt::Horizontal);
+        if (auto* bone = findChild<QDockWidget*>(QStringLiteral("BoneDock"))) {
+            resizeDocks({model, bone}, {255, 265}, Qt::Vertical);
+        }
+    }
+    resizeDocks({camera}, {340}, Qt::Horizontal);
+    resizeDocks({camera, facial}, {305, 215}, Qt::Vertical);
+    camera->raise();
+    facial->raise();
+    refresh_tab_title_bars();
+}
+
+void MainWindow::refresh_tab_title_bars() {
+    std::vector<QDockWidget*> docks = panel_docks_;
+    if (timeline_dock_ != nullptr) {
+        docks.push_back(timeline_dock_);
+    }
+    // Dock tab bars elide long names by default, which cuts panel titles down
+    // to a few letters in a narrow dock area. Keep the full labels and let the
+    // scroller arrows take over when the tabs no longer fit.
+    for (auto* bar : findChildren<QTabBar*>()) {
+        bar->installEventFilter(this);
+        if (bar->elideMode() != Qt::ElideNone) {
+            bar->setElideMode(Qt::ElideNone);
+        }
+        if (!bar->usesScrollButtons()) {
+            bar->setUsesScrollButtons(true);
+        }
+        if (bar->expanding()) {
+            bar->setExpanding(false);
+        }
+        if (bar->drawBase()) {
+            bar->setDrawBase(false);
+        }
+        // Qt draws no close button on dock tabs, so place one inside each tab.
+        // It is a plain child of the bar rather than a tab button: QTabBar
+        // reserves a wide, non-styleable gap for tab buttons, which would keep
+        // the cross far from its label.
+        const int last = bar->count() - 1;
+        const bool overflowing =
+            last >= 0 && bar->tabRect(last).right() > bar->width();
+        const int visible_right = overflowing ? bar->width() - 36 : bar->width();
+        QStringList titles;
+        for (int i = 0; i < bar->count(); ++i) {
+            titles.append(bar->tabText(i));
+        }
+        const auto buttons =
+            bar->findChildren<QToolButton*>(QStringLiteral("TabCloseButton"));
+        for (auto* button : buttons) {
+            if (!titles.contains(button->property("dockTitle").toString())) {
+                button->hide();
+                button->deleteLater();
+            }
+        }
+        for (int i = 0; i < bar->count(); ++i) {
+            const QString title = bar->tabText(i);
+            QDockWidget* target = nullptr;
+            for (auto* dock : docks) {
+                if (dock->windowTitle() == title) {
+                    target = dock;
+                    break;
+                }
+            }
+            if (target == nullptr) {
+                continue;
+            }
+            QToolButton* close = nullptr;
+            for (auto* button : buttons) {
+                if (button->property("dockTitle").toString() == title) {
+                    close = button;
+                    break;
+                }
+            }
+            if (close == nullptr) {
+                close = new QToolButton(bar);
+                close->setObjectName(QStringLiteral("TabCloseButton"));
+                close->setProperty("dockTitle", title);
+                close->setIcon(QIcon(QStringLiteral(":/icons/close.svg")));
+                close->setIconSize(QSize(16, 16));
+                close->setFixedSize(16, 16);
+                close->setAutoRaise(true);
+                close->setCursor(Qt::PointingHandCursor);
+                close->setToolTip(QStringLiteral("Close %1").arg(title));
+                connect(close, &QToolButton::clicked, this, [target, close] {
+                    close->hide();
+                    target->close();
+                });
+            } else {
+                close->setIconSize(QSize(16, 16));
+                close->setFixedSize(16, 16);
+            }
+            const QRect tab = bar->tabRect(i);
+            const int button_w = close->width();
+            const int button_h = close->height();
+            const int x = tab.right() - button_w - 4;
+            const int y = tab.top() + (tab.height() - 2 - button_h) / 2;
+            close->move(x, y);
+            const bool tab_visible = tab.left() >= 0 && tab.right() <= visible_right;
+            close->setVisible(tab_visible);
+            close->raise();
+        }
+    }
+    // Qt keeps the active dock's title bar below the tab bar in a vertical
+    // dock area, which shows every panel name twice. Hide the title bar while
+    // the dock shares a tab group, and restore it as soon as it is pulled out.
+    for (auto* dock : docks) {
+        bool tabbed = false;
+        for (auto* sibling : tabifiedDockWidgets(dock)) {
+            if (!sibling->isHidden()) {
+                tabbed = true;
+                break;
+            }
+        }
+        if (tabbed) {
+            if (dock->titleBarWidget() == nullptr) {
+                auto* spacer = new QWidget(dock);
+                spacer->setObjectName(QStringLiteral("TabbedDockSpacer"));
+                spacer->setFixedHeight(0);
+                dock->setTitleBarWidget(spacer);
+            }
+        } else if (dock->titleBarWidget() != nullptr) {
+            dock->setTitleBarWidget(nullptr);
+        }
+    }
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    if ((event->type() == QEvent::LayoutRequest || event->type() == QEvent::Resize) &&
+        qobject_cast<QTabBar*>(watched) != nullptr) {
+        QTimer::singleShot(0, this, [this] { refresh_tab_title_bars(); });
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
+QDockWidget* MainWindow::add_panel_dock(const QString& title, const QString& object_name,
+                                        QWidget* body, Qt::DockWidgetArea area) {
+    auto* dock = new QDockWidget(title, this);
+    dock->setObjectName(object_name);
+    dock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable |
+                      QDockWidget::DockWidgetClosable);
+    dock->setAllowedAreas(Qt::AllDockWidgetAreas);
+
+    auto* scroll = new QScrollArea();
+    scroll->setObjectName(QStringLiteral("PanelScroll"));
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setBackgroundRole(QPalette::Window);
+    scroll->viewport()->setBackgroundRole(QPalette::Window);
+    scroll->setMinimumSize(1, 1);
+    body->setObjectName(QStringLiteral("PanelBody"));
+    scroll->setWidget(body);
+    dock->setWidget(scroll);
+    dock->setMinimumWidth(240);
+    addDockWidget(area, dock);
+    connect(dock, &QDockWidget::topLevelChanged, this,
+            [this](bool) { refresh_tab_title_bars(); });
+    connect(dock, &QDockWidget::dockLocationChanged, this,
+            [this](Qt::DockWidgetArea) { refresh_tab_title_bars(); });
+    connect(dock, &QDockWidget::visibilityChanged, this, [this](bool) {
+        QTimer::singleShot(0, this, [this] { refresh_tab_title_bars(); });
+    });
+    panel_docks_.push_back(dock);
+    return dock;
+}
+
+void MainWindow::reset_panel_layout() {
+    if (timeline_dock_ == nullptr) {
+        return;
+    }
+    timeline_dock_->setFloating(false);
+    timeline_dock_->show();
+    addDockWidget(Qt::BottomDockWidgetArea, timeline_dock_);
+
+    const auto dock = [this](const QString& name) {
+        return findChild<QDockWidget*>(name);
+    };
+    auto* model = dock(QStringLiteral("ModelDock"));
+    auto* bone = dock(QStringLiteral("BoneDock"));
+    auto* camera = dock(QStringLiteral("CameraDock"));
+    auto* light = dock(QStringLiteral("LightDock"));
+    auto* shadow = dock(QStringLiteral("ShadowDock"));
+    auto* accessory = dock(QStringLiteral("AccessoryDock"));
+    auto* facial = dock(QStringLiteral("FacialDock"));
+    auto* view = dock(QStringLiteral("ViewDock"));
+    auto* playback = dock(QStringLiteral("PlaybackDock"));
+    auto* interpolation = dock(QStringLiteral("InterpolationDock"));
+    if (model == nullptr || bone == nullptr || camera == nullptr || light == nullptr ||
+        shadow == nullptr || accessory == nullptr || facial == nullptr || view == nullptr ||
+        playback == nullptr || interpolation == nullptr) {
+        return;
+    }
+
+    for (auto* panel : panel_docks_) {
+        panel->setFloating(false);
+        panel->show();
+    }
+    addDockWidget(Qt::LeftDockWidgetArea, model);
+    addDockWidget(Qt::LeftDockWidgetArea, bone);
+    addDockWidget(Qt::RightDockWidgetArea, camera);
+    addDockWidget(Qt::RightDockWidgetArea, light);
+    addDockWidget(Qt::RightDockWidgetArea, shadow);
+    addDockWidget(Qt::RightDockWidgetArea, accessory);
+    addDockWidget(Qt::RightDockWidgetArea, facial);
+    addDockWidget(Qt::RightDockWidgetArea, view);
+    addDockWidget(Qt::RightDockWidgetArea, playback);
+    addDockWidget(Qt::RightDockWidgetArea, interpolation);
+    tabifyDockWidget(camera, light);
+    tabifyDockWidget(light, shadow);
+    tabifyDockWidget(shadow, accessory);
+    tabifyDockWidget(facial, view);
+    tabifyDockWidget(view, playback);
+    tabifyDockWidget(playback, interpolation);
+
+    resizeDocks({timeline_dock_}, {320}, Qt::Vertical);
+    resizeDocks({model}, {288}, Qt::Horizontal);
+    resizeDocks({model, bone}, {255, 265}, Qt::Vertical);
+    resizeDocks({camera}, {340}, Qt::Horizontal);
+    resizeDocks({camera, facial}, {305, 215}, Qt::Vertical);
+    camera->raise();
+    facial->raise();
+    refresh_tab_title_bars();
+}
+
+void MainWindow::restore_panel_layout() {
+    QSettings settings;
+    const QByteArray geometry =
+        settings.value(QStringLiteral("studio/window_geometry_v2")).toByteArray();
+    if (!geometry.isEmpty()) {
+        restoreGeometry(geometry);
+    }
+    const QByteArray layout =
+        settings.value(QStringLiteral("studio/panel_layout_v2")).toByteArray();
+    if (layout.isEmpty() || !restoreState(layout, 2)) {
+        reset_panel_layout();
+    }
+    refresh_tab_title_bars();
+}
+
+void MainWindow::save_panel_layout() {
+    QSettings settings;
+    settings.setValue(QStringLiteral("studio/window_geometry_v2"), saveGeometry());
+    settings.setValue(QStringLiteral("studio/panel_layout_v2"), saveState(2));
+}
+
+void MainWindow::closeEvent(QCloseEvent* event) {
+    save_panel_layout();
+    QMainWindow::closeEvent(event);
 }
 
 QWidget* MainWindow::build_timeline_panel() {
     auto* panel = new QWidget();
     auto* layout = new QVBoxLayout(panel);
-    layout->setContentsMargins(4, 4, 4, 4);
-    layout->setSpacing(4);
+    layout->setContentsMargins(12, 10, 12, 10);
+    layout->setSpacing(8);
 
-    layout->addWidget(make_section(QStringLiteral("Bone / Frame manipulation")));
-    auto* select_row = new QHBoxLayout();
-    auto* select_all = new QPushButton(QStringLiteral("Select All"));
-    auto* delete_line = new QPushButton(QStringLiteral("Delete Line"));
-    select_row->addWidget(select_all);
-    select_row->addWidget(delete_line);
-    layout->addLayout(select_row);
-
-    layout->addWidget(make_section(QStringLiteral("Frame manipulation")));
-    auto* frame_row = new QHBoxLayout();
-    auto* first_button = new QPushButton(QStringLiteral("|<"));
-    auto* prev_button = new QPushButton(QStringLiteral("<"));
+    auto* transport = new QHBoxLayout();
+    transport->setSpacing(4);
+    auto* first_button = make_transport_button(Glyph::First, QStringLiteral("First frame"), panel);
+    auto* prev_button = make_transport_button(Glyph::Previous, QStringLiteral("Previous frame"),
+                                              panel);
+    auto* next_button = make_transport_button(Glyph::Next, QStringLiteral("Next frame"), panel);
+    auto* last_button = make_transport_button(Glyph::Last, QStringLiteral("Last frame"), panel);
     jump_frame_ = new QSpinBox();
     jump_frame_->setRange(0, 100000);
     jump_frame_->setAlignment(Qt::AlignCenter);
-    auto* next_button = new QPushButton(QStringLiteral(">"));
-    auto* last_button = new QPushButton(QStringLiteral(">|"));
-    auto* add_button = new QPushButton(QStringLiteral("+"));
-    auto* remove_button = new QPushButton(QStringLiteral("-"));
-    frame_row->addWidget(first_button);
-    frame_row->addWidget(prev_button);
-    frame_row->addWidget(jump_frame_, 1);
-    frame_row->addWidget(next_button);
-    frame_row->addWidget(last_button);
-    frame_row->addWidget(add_button);
-    frame_row->addWidget(remove_button);
-    layout->addLayout(frame_row);
+    jump_frame_->setFixedWidth(88);
+    jump_frame_->setToolTip(QStringLiteral("Current frame"));
+    auto* add_button = make_transport_button(Glyph::Add, QStringLiteral("Register keyframe"),
+                                             panel);
+    auto* remove_button = make_transport_button(Glyph::Remove, QStringLiteral("Delete keyframe"),
+                                                panel);
+
+    transport->addWidget(first_button);
+    transport->addWidget(prev_button);
+    transport->addWidget(next_button);
+    transport->addWidget(last_button);
+    transport->addSpacing(8);
+    transport->addWidget(jump_frame_);
+    transport->addSpacing(4);
+    transport->addWidget(add_button);
+    transport->addWidget(remove_button);
+    transport->addWidget(make_divider());
+    transport->addStretch(1);
+
+    auto* zoom_label = new QLabel(QStringLiteral("Zoom"));
+    zoom_label->setObjectName(QStringLiteral("FieldLabel"));
+    auto* zoom = new QSlider(Qt::Horizontal);
+    zoom->setRange(50, 300);
+    zoom->setValue(100);
+    zoom->setFixedWidth(140);
+    auto* zoom_value = new QLabel(QStringLiteral("100%"));
+    zoom_value->setObjectName(QStringLiteral("FieldLabel"));
+    zoom_value->setFixedWidth(44);
+    zoom_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    transport->addWidget(zoom_label);
+    transport->addWidget(zoom);
+    transport->addWidget(zoom_value);
+    layout->addLayout(transport);
+
+    auto* actions_row = new QHBoxLayout();
+    actions_row->setSpacing(4);
+    auto* select_all = new QPushButton(QStringLiteral("Select all"));
+    select_all->setToolTip(QStringLiteral("Select every bone keyframe at the current frame"));
+    auto* vsel_button = new QPushButton(QStringLiteral("Track keys"));
+    vsel_button->setToolTip(QStringLiteral("Select every keyframe on the active track"));
+    auto* delete_line = new QPushButton(QStringLiteral("Delete frame"));
+    delete_line->setToolTip(QStringLiteral("Delete every keyframe at the current frame"));
+    copy_button_ = new QPushButton(QStringLiteral("Copy"));
+    paste_button_ = new QPushButton(QStringLiteral("Paste"));
+    auto* delete_button = new QPushButton(QStringLiteral("Delete keys"));
+    delete_button->setObjectName(QStringLiteral("DangerButton"));
+    delete_button->setToolTip(QStringLiteral("Delete the selected keyframes"));
+    actions_row->addWidget(select_all);
+    actions_row->addWidget(vsel_button);
+    actions_row->addWidget(delete_line);
+    actions_row->addWidget(make_divider());
+    actions_row->addWidget(copy_button_);
+    actions_row->addWidget(paste_button_);
+    actions_row->addWidget(delete_button);
+    actions_row->addStretch(1);
+    layout->addLayout(actions_row);
 
     timeline_ = new TimelineWidget(state_);
     auto* scroll = new QScrollArea();
+    scroll->setObjectName(QStringLiteral("TimelineScrollArea"));
     scroll->setWidgetResizable(true);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setBackgroundRole(QPalette::Window);
+    scroll->viewport()->setBackgroundRole(QPalette::Window);
     scroll->setWidget(timeline_);
     layout->addWidget(scroll, 1);
 
@@ -600,55 +1013,34 @@ QWidget* MainWindow::build_timeline_panel() {
     connect(timeline_, &TimelineWidget::pasteRequested, this,
             [this] { paste_keyframes(); });
 
-    auto* actions_row = new QHBoxLayout();
-    copy_button_ = new QPushButton(QStringLiteral("Copy"));
-    paste_button_ = new QPushButton(QStringLiteral("Paste"));
-    auto* vsel_button = new QPushButton(QStringLiteral("V-Sel"));
-    auto* delete_button = new QPushButton(QStringLiteral("Delete"));
-    actions_row->addWidget(copy_button_);
-    actions_row->addWidget(paste_button_);
-    actions_row->addWidget(vsel_button);
-    actions_row->addWidget(delete_button);
-    layout->addLayout(actions_row);
-
-    auto* zoom_row = new QHBoxLayout();
-    auto* register_button = new QPushButton(QStringLiteral("Register"));
-    zoom_row->addWidget(register_button);
-    zoom_row->addWidget(new QLabel(QStringLiteral("Zoom")));
-    auto* zoom = new QSlider(Qt::Horizontal);
-    zoom->setRange(50, 300);
-    zoom->setValue(100);
-    zoom_row->addWidget(zoom, 1);
-    layout->addLayout(zoom_row);
-
-    connect(first_button, &QPushButton::clicked, this, [this] {
+    connect(first_button, &QToolButton::clicked, this, [this] {
         state_.current_frame = 0.0f;
         jump_frame_->setValue(0);
         footer_->sync();
     });
-    connect(prev_button, &QPushButton::clicked, this, [this] {
+    connect(prev_button, &QToolButton::clicked, this, [this] {
         state_.step_frame(-1);
         jump_frame_->setValue(static_cast<int>(state_.current_frame));
         footer_->sync();
     });
-    connect(next_button, &QPushButton::clicked, this, [this] {
+    connect(next_button, &QToolButton::clicked, this, [this] {
         state_.step_frame(1);
         jump_frame_->setValue(static_cast<int>(state_.current_frame));
         footer_->sync();
     });
-    connect(last_button, &QPushButton::clicked, this, [this] {
+    connect(last_button, &QToolButton::clicked, this, [this] {
         state_.current_frame = static_cast<float>(state_.play_range.second);
         jump_frame_->setValue(state_.play_range.second);
         footer_->sync();
     });
     connect(jump_frame_, &QSpinBox::valueChanged, this,
             [this](int value) { state_.current_frame = static_cast<float>(value); });
-    connect(add_button, &QPushButton::clicked, this, [this] {
+    connect(add_button, &QToolButton::clicked, this, [this] {
         state_.register_keyframe(state_.selected_track_name(),
                                  static_cast<unsigned int>(state_.current_frame));
         timeline_->update();
     });
-    connect(remove_button, &QPushButton::clicked, this, [this] {
+    connect(remove_button, &QToolButton::clicked, this, [this] {
         state_.delete_keyframe(state_.selected_track_name(),
                                static_cast<unsigned int>(state_.current_frame));
         timeline_->update();
@@ -678,13 +1070,9 @@ QWidget* MainWindow::build_timeline_panel() {
     });
     connect(delete_button, &QPushButton::clicked, this,
             [this] { delete_selected_keyframes(); });
-    connect(register_button, &QPushButton::clicked, this, [this] {
-        state_.register_keyframe(state_.selected_track_name(),
-                                 static_cast<unsigned int>(state_.current_frame));
-        timeline_->update();
-    });
-    connect(zoom, &QSlider::valueChanged, this, [this](int value) {
+    connect(zoom, &QSlider::valueChanged, this, [this, zoom_value](int value) {
         state_.timeline_zoom = static_cast<float>(value) / 100.0f;
+        zoom_value->setText(QStringLiteral("%1%").arg(value));
         timeline_->refresh_layout();
         timeline_->update();
     });
@@ -695,56 +1083,11 @@ QWidget* MainWindow::build_timeline_panel() {
     return panel;
 }
 
-QWidget* MainWindow::build_panel_strip() {
-    auto* scroll = new QScrollArea();
-    scroll->setObjectName(QStringLiteral("PanelStrip"));
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-    auto* content = new QWidget();
-    auto* row = new QHBoxLayout(content);
-    row->setContentsMargins(4, 4, 4, 4);
-    row->setSpacing(4);
-    row->setSizeConstraint(QLayout::SetMinAndMaxSize);
-    row->addWidget(make_panel(QStringLiteral("Interpolation curve"),
-                              build_interpolation_tab(), 176));
-    row->addWidget(make_panel(QStringLiteral("Model manipulation"), build_model_tab(), 168));
-    row->addWidget(make_panel(QStringLiteral("Bone manipulation"), build_bone_tab(), 232));
-    row->addWidget(make_panel(QStringLiteral("Facial manipulation"), build_facial_tab(), 214));
-    row->addWidget(make_panel(QStringLiteral("Camera"), build_camera_tab(), 196));
-    row->addWidget(make_panel(QStringLiteral("Light manipulation"), build_light_tab(), 200));
-    row->addWidget(make_panel(QStringLiteral("Self-shadow manipulation"),
-                              build_shadow_tab(), 186));
-    row->addWidget(make_panel(QStringLiteral("Accessory manipulation"),
-                              build_accessory_tab(), 196));
-    row->addWidget(make_panel(QStringLiteral("View"), build_view_tab(), 210));
-    row->addWidget(make_panel(QStringLiteral("Playback"), build_playback_tab(), 196));
-    row->addStretch(1);
-    scroll->setWidget(content);
-    return scroll;
-}
-
-QWidget* MainWindow::make_panel(const QString& title, QWidget* body, int width) {
-    auto* panel = new QWidget();
-    panel->setObjectName(QStringLiteral("MmdPanel"));
-    panel->setFixedWidth(width);
-    auto* layout = new QVBoxLayout(panel);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(0);
-    auto* caption = new QLabel(title);
-    caption->setObjectName(QStringLiteral("PanelTitle"));
-    caption->setFixedHeight(20);
-    layout->addWidget(caption);
-    body->setParent(panel);
-    layout->addWidget(body, 1);
-    return panel;
-}
-
 QWidget* MainWindow::build_model_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(4);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     model_combo_ = new QComboBox();
     model_combo_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     model_combo_->setMinimumContentsLength(8);
@@ -810,8 +1153,8 @@ QWidget* MainWindow::build_model_tab() {
 QWidget* MainWindow::build_bone_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(4);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
 
     auto* mode_row = new QHBoxLayout();
     mode_row->addWidget(new QLabel(QStringLiteral("Mode")));
@@ -909,8 +1252,8 @@ QWidget* MainWindow::build_bone_tab() {
 QWidget* MainWindow::build_facial_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(2);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     const QStringList titles = {QStringLiteral("Eyes"), QStringLiteral("Mouth"),
                                 QStringLiteral("Brow"), QStringLiteral("Other")};
     for (int i = 0; i < 4; ++i) {
@@ -966,8 +1309,8 @@ QWidget* MainWindow::build_facial_tab() {
 QWidget* MainWindow::build_camera_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(4);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     auto* distance = make_spin(1.0, 500.0, 0.2, 2, state_.camera_distance);
     auto* fov = make_spin(10.0, 120.0, 0.5, 1, state_.camera_fov_deg);
     auto* yaw = make_spin(-180.0, 180.0, 1.0, 1,
@@ -1036,11 +1379,9 @@ QWidget* MainWindow::build_camera_tab() {
     });
     connect(camera_target_, &QComboBox::currentIndexChanged, this, [this](int index) {
         state_.camera_target = static_cast<CameraTarget>(std::clamp(index, 0, 2));
-        statusBar()->showMessage(
-            index == 1 ? QStringLiteral("Camera target: model")
-                       : index == 2 ? QStringLiteral("Camera target: selected bone")
-                                    : QStringLiteral("Camera target: free"),
-            5000);
+        state_.set_status(index == 1 ? QStringLiteral("Camera target: model")
+                                     : index == 2 ? QStringLiteral("Camera target: selected bone")
+                                                  : QStringLiteral("Camera target: free"));
     });
     connect(reset, &QPushButton::clicked, this, [this, distance, fov, yaw, pitch, roll] {
         viewport_->reset_camera();
@@ -1066,8 +1407,8 @@ QWidget* MainWindow::build_camera_tab() {
 QWidget* MainWindow::build_light_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(3);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     auto* grid = new QGridLayout();
     grid->setHorizontalSpacing(4);
     grid->setVerticalSpacing(2);
@@ -1135,8 +1476,8 @@ QWidget* MainWindow::build_light_tab() {
 QWidget* MainWindow::build_shadow_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(4);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     auto* mode = new QComboBox();
     mode->addItems({QStringLiteral("Off"), QStringLiteral("Mode 1"), QStringLiteral("Mode 2")});
     mode->setCurrentIndex(static_cast<int>(state_.shadow_mode));
@@ -1177,8 +1518,8 @@ QWidget* MainWindow::build_shadow_tab() {
 QWidget* MainWindow::build_accessory_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(4);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     auto* load = new QPushButton(QStringLiteral("Load .x..."));
     auto* clear = new QPushButton(QStringLiteral("Remove"));
     auto* row = new QHBoxLayout();
@@ -1234,8 +1575,8 @@ QWidget* MainWindow::build_accessory_tab() {
 QWidget* MainWindow::build_view_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(3);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     auto* grid = new QGridLayout();
     grid->setHorizontalSpacing(6);
     grid->setVerticalSpacing(2);
@@ -1283,8 +1624,8 @@ QWidget* MainWindow::build_view_tab() {
 QWidget* MainWindow::build_playback_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(3);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     auto* play = new QPushButton(QStringLiteral("Play / Pause"));
     layout->addWidget(play);
     auto* speed_row = new QHBoxLayout();
@@ -1349,8 +1690,8 @@ QWidget* MainWindow::build_playback_tab() {
 QWidget* MainWindow::build_interpolation_tab() {
     auto* page = new QWidget();
     auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(6, 6, 6, 6);
-    layout->setSpacing(4);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(8);
     auto* automatic = make_check(QStringLiteral("Automatic curve"), state_.curve_auto);
     auto* row = new QHBoxLayout();
     auto* linear = new QPushButton(QStringLiteral("Linear"));
@@ -1486,9 +1827,9 @@ void MainWindow::update_viewport_title() {
         return;
     }
     if (state_.mode == EditorMode::Camera) {
-        header_->set_title(QStringLiteral("camera light accessory"));
+        header_->set_title(QStringLiteral("Camera  ·  Light  ·  Accessory"));
     } else {
-        header_->set_title(state_.model_name.isEmpty() ? QStringLiteral("model")
+        header_->set_title(state_.model_name.isEmpty() ? QStringLiteral("Model")
                                                        : state_.model_name);
     }
 }

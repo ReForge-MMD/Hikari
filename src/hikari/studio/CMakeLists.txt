@@ -1,4 +1,5 @@
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 add_executable(hikari_studio WIN32
   app_state.cpp
@@ -11,6 +12,7 @@ add_executable(hikari_studio WIN32
   model_instance.hpp
   project_io.cpp
   project_io.hpp
+  resources.qrc
   theme.hpp
   timeline_widget.cpp
   timeline_widget.hpp
@@ -34,7 +36,7 @@ target_link_libraries(hikari_studio
 target_include_directories(hikari_studio PRIVATE ${Stb_INCLUDE_DIR})
 
 if(WIN32)
-  target_link_libraries(hikari_studio PRIVATE d3d11 dxgi dxguid d3dcompiler)
+  target_link_libraries(hikari_studio PRIVATE d3d11 dxgi dxguid d3dcompiler dwmapi)
 
   get_target_property(_hikari_qmake Qt6::qmake IMPORTED_LOCATION)
   if(_hikari_qmake)

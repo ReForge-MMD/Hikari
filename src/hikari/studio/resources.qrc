@@ -1,0 +1,11 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/icons">
+    <file alias="check.svg">icons/check.svg</file>
+    <file alias="chevron-up.svg">icons/chevron-up.svg</file>
+    <file alias="chevron-down.svg">icons/chevron-down.svg</file>
+    <file alias="close.svg">icons/close.svg</file>
+    <file alias="float.svg">icons/float.svg</file>
+    <file alias="dot.svg">icons/dot.svg</file>
+  </qresource>
+</RCC>

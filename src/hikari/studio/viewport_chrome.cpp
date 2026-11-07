@@ -15,14 +15,15 @@
 #include <cmath>
 
 #include "hikari/studio/app_state.hpp"
+#include "hikari/studio/theme.hpp"
 
 namespace hikari::studio {
 namespace {
 
 constexpr int kCell = 32;
-constexpr int kGap = 2;
-constexpr int kMargin = 6;
-constexpr int kHeader = 18;
+constexpr int kGap = 4;
+constexpr int kMargin = 8;
+constexpr int kHeader = 20;
 constexpr int kColumns = 3;
 constexpr int kRows = 2;
 
@@ -31,8 +32,8 @@ constexpr int kRows = 2;
 constexpr float kRotateDegreesPerPixel = 0.5729578f;
 constexpr float kTranslateUnitsPerPixel = 0.05f;
 
-const QColor kAxisColor[3] = {QColor(0xd0, 0x5a, 0x5a), QColor(0x62, 0xb4, 0x5c),
-                              QColor(0x5b, 0x86, 0xc8)};
+const QColor kAxisColor[3] = {QColor(0xe0, 0xa3, 0x9e), QColor(0xa6, 0xc9, 0xa0),
+                              QColor(0x93, 0xb8, 0xdb)};
 
 QRect cell_rect(int cell) {
     const int column = cell % kColumns;
@@ -84,7 +85,8 @@ QDoubleSpinBox* make_field(double minimum, double maximum, double step, int deci
     field->setDecimals(decimals);
     field->setKeyboardTracking(false);
     field->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    field->setFixedWidth(66);
+    field->setMinimumWidth(64);
+    field->setMaximumWidth(92);
     return field;
 }
 
@@ -92,6 +94,13 @@ QLabel* make_caption(const QString& text) {
     auto* label = new QLabel(text);
     label->setObjectName(QStringLiteral("ViewportCaption"));
     return label;
+}
+
+QWidget* make_divider() {
+    auto* divider = new QWidget();
+    divider->setObjectName(QStringLiteral("ToolbarDivider"));
+    divider->setFixedSize(1, 20);
+    return divider;
 }
 
 } // namespace
@@ -132,27 +141,26 @@ int ViewGizmo::cell_at(const QPoint& point) const {
 void ViewGizmo::paintEvent(QPaintEvent*) {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
-    painter.setPen(QPen(QColor(0x4a, 0x4f, 0x59), 1.0));
-    painter.setBrush(QColor(0x1b, 0x1e, 0x24, 238));
-    painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 4.0, 4.0);
+    painter.setPen(QPen(QColor(colors::outline), 1.0));
+    painter.setBrush(QColor(colors::surface_high));
+    painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 12.0, 12.0);
 
-    painter.setPen(local_ ? QColor(0x8f, 0xb8, 0xd8) : QColor(0xa8, 0xb0, 0xba));
+    painter.setPen(local_ ? QColor(colors::primary) : QColor(colors::on_surface_variant));
     QFont header_font = font();
     header_font.setPointSizeF(8.0);
+    header_font.setWeight(QFont::DemiBold);
     painter.setFont(header_font);
-    painter.drawText(QRect(kMargin, 1, width() - kMargin * 2, kHeader - 2),
+    painter.drawText(QRect(kMargin, 0, width() - kMargin * 2, kHeader),
                      Qt::AlignLeft | Qt::AlignVCenter,
-                     local_ ? QStringLiteral("local") : QStringLiteral("global"));
-    painter.setPen(QColor(0x6b, 0x74, 0x80));
-    painter.drawText(QRect(kMargin, 1, width() - kMargin * 2, kHeader - 2),
-                     Qt::AlignRight | Qt::AlignVCenter, QStringLiteral("L/G"));
+                     local_ ? QStringLiteral("Local") : QStringLiteral("Global"));
 
     for (int cell = 0; cell < kColumns * kRows; ++cell) {
         const QRect box = cell_rect(cell);
         const bool active = cell == pressed_ || (pressed_ < 0 && cell == hovered_);
         painter.setPen(Qt::NoPen);
-        painter.setBrush(active ? QColor(0x33, 0x39, 0x44) : QColor(0x24, 0x28, 0x30));
-        painter.drawRoundedRect(QRectF(box).adjusted(0.5, 0.5, -0.5, -0.5), 3.0, 3.0);
+        painter.setBrush(active ? QColor(colors::primary_container)
+                                : QColor(colors::surface_highest));
+        painter.drawRoundedRect(QRectF(box), 8.0, 8.0);
         const QColor color = kAxisColor[cell % kColumns];
         const QPointF center(box.center().x() + 0.5, box.center().y() + 0.5);
         if (cell < kColumns) {
@@ -264,67 +272,67 @@ void ViewGizmo::drag_by(int delta_y, Qt::KeyboardModifiers modifiers) {
 
 ViewportHeader::ViewportHeader(StudioAppState& state, QWidget* parent)
     : QWidget(parent), state_(state) {
-    setObjectName(QStringLiteral("ViewportStrip"));
-    setFixedHeight(26);
+    setObjectName(QStringLiteral("ViewportHeader"));
+    setFixedHeight(44);
     auto* layout = new QHBoxLayout(this);
-    layout->setContentsMargins(8, 2, 6, 2);
+    layout->setContentsMargins(12, 7, 12, 7);
     layout->setSpacing(6);
 
-    title_ = new QLabel(QStringLiteral("camera light accessory"));
+    title_ = new QLabel(QStringLiteral("Camera  ·  Light  ·  Accessory"));
     title_->setObjectName(QStringLiteral("ViewportTitle"));
-    layout->addWidget(title_, 1);
+    title_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    layout->addWidget(title_);
 
-    auto* set_button = new QPushButton(QStringLiteral("set"));
+    auto* set_button = new QPushButton(QStringLiteral("Key"));
     set_button->setObjectName(QStringLiteral("ViewportChip"));
-    set_button->setToolTip(QStringLiteral("Register the current target at the frame"));
+    set_button->setToolTip(QStringLiteral("Register the current target at this frame"));
     layout->addWidget(set_button);
 
     frame_ = new QSpinBox();
     frame_->setObjectName(QStringLiteral("ViewportField"));
     frame_->setRange(0, 100000);
     frame_->setAlignment(Qt::AlignCenter);
-    frame_->setFixedWidth(64);
+    frame_->setFixedWidth(76);
+    frame_->setToolTip(QStringLiteral("Current frame"));
     layout->addWidget(frame_);
+    layout->addWidget(make_divider());
 
-    auto* go_button = new QPushButton(QStringLiteral("Go"));
-    go_button->setObjectName(QStringLiteral("ViewportChip"));
-    layout->addWidget(go_button);
-
-    auto* shadow = new QPushButton(QStringLiteral("GShdow"));
+    auto* shadow = new QPushButton(QStringLiteral("Ground shadow"));
     shadow->setObjectName(QStringLiteral("ViewportChip"));
     shadow->setCheckable(true);
     shadow->setChecked(state_.ground_shadow);
-    shadow->setToolTip(QStringLiteral("Ground shadow"));
+    shadow->setToolTip(QStringLiteral("Toggle the ground shadow"));
     layout->addWidget(shadow);
 
-    auto* info = new QPushButton(QStringLiteral("info"));
+    auto* info = new QPushButton(QStringLiteral("Info"));
     info->setObjectName(QStringLiteral("ViewportChip"));
     info->setCheckable(true);
     info->setChecked(state_.info_display);
+    info->setToolTip(QStringLiteral("Show frame statistics in the status bar"));
     layout->addWidget(info);
 
-    auto* low_power = new QPushButton(QStringLiteral("low pow"));
+    auto* low_power = new QPushButton(QStringLiteral("Low power"));
     low_power->setObjectName(QStringLiteral("ViewportChip"));
     low_power->setCheckable(true);
     low_power->setChecked(state_.save_cpu_power);
+    low_power->setToolTip(QStringLiteral("Reduce CPU work while editing"));
     layout->addWidget(low_power);
 
-    auto* axis = new QPushButton(QStringLiteral("grid"));
+    auto* axis = new QPushButton(QStringLiteral("Grid"));
     axis->setObjectName(QStringLiteral("ViewportChip"));
     axis->setCheckable(true);
     axis->setChecked(state_.show_grid);
     axis->setToolTip(QStringLiteral("Coordinate grid"));
     layout->addWidget(axis);
+    layout->addWidget(make_divider());
 
-    auto* home = new QPushButton(QStringLiteral("Reset View"));
+    auto* home = new QPushButton(QStringLiteral("Reset view"));
     home->setObjectName(QStringLiteral("ViewportChip"));
     home->setToolTip(QStringLiteral("Frame the model with the default camera"));
     layout->addWidget(home);
 
     connect(frame_, &QSpinBox::valueChanged, this,
             [this](int value) { emit frameRequested(value); });
-    connect(go_button, &QPushButton::clicked, this,
-            [this] { emit frameRequested(frame_->value()); });
     connect(set_button, &QPushButton::clicked, this, [this] {
         state_.register_keyframe(state_.selected_track_name(),
                                  static_cast<unsigned int>(state_.current_frame));
@@ -353,41 +361,42 @@ void ViewportHeader::set_frame(int frame) {
 
 ViewportFooter::ViewportFooter(StudioAppState& state, QWidget* parent)
     : QWidget(parent), state_(state) {
-    setObjectName(QStringLiteral("ViewportStrip"));
-    setFixedHeight(28);
+    setObjectName(QStringLiteral("ViewportFooter"));
+    setFixedHeight(44);
     auto* layout = new QHBoxLayout(this);
-    layout->setContentsMargins(8, 2, 6, 2);
+    layout->setContentsMargins(12, 7, 12, 7);
     layout->setSpacing(4);
 
     mode_ = new QPushButton(QStringLiteral("To Model"));
     mode_->setObjectName(QStringLiteral("ViewportMode"));
-    mode_->setFixedWidth(82);
+    mode_->setFixedWidth(100);
     layout->addWidget(mode_);
-
-    target_ = new QLabel(QStringLiteral("camera"));
-    target_->setObjectName(QStringLiteral("ViewportTitle"));
-    target_->setFixedWidth(92);
-    layout->addWidget(target_);
+    layout->addWidget(make_divider());
 
     const QStringList position_labels = {QStringLiteral("X"), QStringLiteral("Y"),
                                          QStringLiteral("Z")};
     for (int axis = 0; axis < 3; ++axis) {
         layout->addWidget(make_caption(position_labels[axis]));
         position_[axis] = make_field(-100000.0, 100000.0, 0.1, 2);
+        position_[axis]->setToolTip(
+            QStringLiteral("Position %1").arg(position_labels[axis]));
         layout->addWidget(position_[axis]);
     }
-    layout->addSpacing(8);
-    const QStringList angle_labels = {QStringLiteral("angle X"), QStringLiteral("Y"),
-                                      QStringLiteral("Z")};
+    layout->addWidget(make_divider());
+    const QStringList angle_labels = {QStringLiteral("RX"), QStringLiteral("RY"),
+                                      QStringLiteral("RZ")};
     for (int axis = 0; axis < 3; ++axis) {
         layout->addWidget(make_caption(angle_labels[axis]));
         angle_[axis] = make_field(-3600.0, 3600.0, 0.5, 1);
+        angle_[axis]->setToolTip(
+            QStringLiteral("Rotation %1").arg(QChar(static_cast<char>('X' + axis))));
         layout->addWidget(angle_[axis]);
     }
-    layout->addSpacing(8);
-    layout->addWidget(make_caption(QStringLiteral("dist")));
+    layout->addWidget(make_divider());
+    layout->addWidget(make_caption(QStringLiteral("Dist")));
     distance_ = make_field(0.0, 5000.0, 0.5, 2);
     distance_->setSpecialValueText(QStringLiteral("-"));
+    distance_->setToolTip(QStringLiteral("Camera distance"));
     layout->addWidget(distance_);
     layout->addStretch(1);
 
@@ -421,9 +430,6 @@ void ViewportFooter::sync() {
                           ? QString()
                           : QStringLiteral("To model mode: load a model first"));
     mode_->setText(camera ? QStringLiteral("To Model") : QStringLiteral("To Camera"));
-    target_->setText(camera ? QStringLiteral("camera")
-                            : (state_.model_name.isEmpty() ? QStringLiteral("model")
-                                                           : state_.model_name));
     if (camera) {
         for (int axis = 0; axis < 3; ++axis) {
             if (!position_[axis]->hasFocus()) {

@@ -1,5 +1,6 @@
 #include "hikari/studio/timeline_widget.hpp"
 
+#include <QFontMetrics>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QMouseEvent>
@@ -11,24 +12,28 @@
 #include <cmath>
 
 #include "hikari/studio/app_state.hpp"
+#include "hikari/studio/theme.hpp"
 
 namespace hikari::studio {
 namespace {
-constexpr int kRowHeight = 20;
-constexpr int kHeaderWidth = 96;
-constexpr int kRulerHeight = 22;
-constexpr int kRightMargin = 20;
-constexpr int kGridPadding = 6;
+constexpr int kRowHeight = 22;
+constexpr int kHeaderWidth = 148;
+constexpr int kRulerHeight = 26;
+constexpr int kRightMargin = 24;
+constexpr int kGridPadding = 8;
 constexpr int kMinVisibleFrames = 40;
 constexpr int kPlayheadMargin = 18;
 constexpr float kFrameSpacing = 14.0f;
-const QColor kBase(24, 27, 34);
-const QColor kPanel(32, 37, 46);
-const QColor kLine(56, 63, 76);
-const QColor kSnow(220, 224, 230);
-const QColor kCyan(126, 200, 227);
-const QColor kYellow(214, 190, 104);
-const QColor kRed(196, 92, 92);
+const QColor kBase(colors::surface_lowest);
+const QColor kPanel(colors::surface_container);
+const QColor kLine(colors::outline_variant);
+const QColor kSnow(colors::on_surface);
+const QColor kMuted(colors::on_surface_muted);
+const QColor kCyan(colors::primary);
+const QColor kKey(0x7e, 0x9d, 0xb4);
+const QColor kKeySelected(colors::tertiary);
+const QColor kSelection(colors::primary_container);
+const QColor kPlayhead(colors::on_surface);
 
 bool reserved_channel(const QString& name) {
     return name == QStringLiteral("view cnt") || name == QStringLiteral("Disp/IK/OP") ||
@@ -202,6 +207,12 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     const int content_height = kRulerHeight + static_cast<int>(row_list.size()) * kRowHeight;
     const QRect grid_rect(kHeaderWidth, 0, std::max(0, width() - kHeaderWidth), height());
 
+    QFont row_font = font();
+    row_font.setPixelSize(12);
+    QFont ruler_font = font();
+    ruler_font.setFamilies({QStringLiteral("Cascadia Mono"), QStringLiteral("Consolas")});
+    ruler_font.setPixelSize(11);
+
     painter.fillRect(QRect(0, 0, width(), kRulerHeight), kPanel);
     painter.setPen(QPen(kLine, 1));
     painter.drawLine(0, kRulerHeight, width(), kRulerHeight);
@@ -217,16 +228,21 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             selected = *state_.selected_bone_idx == descriptor.index;
         }
         painter.fillRect(QRect(0, y, width(), kRowHeight),
-                         selected ? QColor(45, 62, 72) : (row % 2 ? QColor(29, 33, 41) : kBase));
-        painter.fillRect(QRect(0, y, kHeaderWidth, kRowHeight), selected ? kLine : kPanel);
-        painter.setPen(kLine);
+                         selected ? kSelection
+                                  : (row % 2 ? QColor(colors::surface_low) : kBase));
+        painter.fillRect(QRect(0, y, kHeaderWidth, kRowHeight), selected ? kSelection : kPanel);
+        painter.setPen(QColor(kLine.red(), kLine.green(), kLine.blue(), 110));
         painter.drawLine(0, y + kRowHeight - 1, width(), y + kRowHeight - 1);
+        painter.setFont(row_font);
         painter.setPen(selected ? kCyan : kSnow);
-        painter.drawText(QRect(6, y, kHeaderWidth - 8, kRowHeight), Qt::AlignVCenter | Qt::AlignLeft,
-                         descriptor.name);
+        const QString label = QFontMetrics(row_font).elidedText(
+            descriptor.name, Qt::ElideRight, kHeaderWidth - 24);
+        painter.drawText(QRect(12, y, kHeaderWidth - 20, kRowHeight),
+                         Qt::AlignVCenter | Qt::AlignLeft, label);
     }
 
     painter.setClipRect(grid_rect);
+    painter.setFont(ruler_font);
     for (int frame = 0; frame <= visible_frames; frame += 5) {
         const int x =
             kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
@@ -236,10 +252,11 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         if (x < kHeaderWidth - 20) {
             continue;
         }
-        painter.setPen(QPen(QColor(kLine.red(), kLine.green(), kLine.blue(), 120), 1));
-        painter.drawLine(x, 0, x, height());
-        painter.setPen(kSnow);
-        painter.drawText(QRect(x - 20, 2, 40, 18), Qt::AlignCenter, QString::number(frame));
+        painter.setPen(QPen(QColor(kLine.red(), kLine.green(), kLine.blue(), 90), 1));
+        painter.drawLine(x, kRulerHeight, x, height());
+        painter.fillRect(QRect(x, kRulerHeight - 5, 1, 4), kLine);
+        painter.setPen(kMuted);
+        painter.drawText(QRect(x - 24, 3, 48, 16), Qt::AlignCenter, QString::number(frame));
     }
 
     for (int row = 0; row < static_cast<int>(row_list.size()); ++row) {
@@ -263,25 +280,29 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             const bool key_selected =
                 state_.selected_keyframes.count({descriptor.name, frame}) != 0;
             QPolygonF diamond;
-            diamond << QPointF(center.x(), center.y() - 4.5)
-                    << QPointF(center.x() + 4.5, center.y())
-                    << QPointF(center.x(), center.y() + 4.5)
-                    << QPointF(center.x() - 4.5, center.y());
-            painter.setPen(QPen(kBase, 1));
-            painter.setBrush(key_selected ? kCyan : kYellow);
+            diamond << QPointF(center.x(), center.y() - 5.0)
+                    << QPointF(center.x() + 5.0, center.y())
+                    << QPointF(center.x(), center.y() + 5.0)
+                    << QPointF(center.x() - 5.0, center.y());
+            painter.setPen(QPen(key_selected ? kSnow : kBase, 1));
+            painter.setBrush(key_selected ? kKeySelected : kKey);
             painter.drawPolygon(diamond);
         }
     }
+    painter.setClipping(false);
 
     const int playhead_x = kHeaderWidth + kGridPadding +
                            static_cast<int>(state_.current_frame * spacing) - offset;
     if (playhead_x >= kHeaderWidth && playhead_x <= width()) {
-        painter.setPen(QPen(kRed, 1.8));
+        painter.setPen(QPen(kPlayhead, 1.6));
         painter.drawLine(playhead_x, 0, playhead_x, std::min(height(), content_height));
-        painter.setBrush(kRed);
-        painter.drawEllipse(QPointF(playhead_x, 3.0), 4.0, 4.0);
+        QPolygonF head;
+        head << QPointF(playhead_x - 4.0, 0.0) << QPointF(playhead_x + 4.0, 0.0)
+             << QPointF(playhead_x, 7.0);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(kPlayhead);
+        painter.drawPolygon(head);
     }
-    painter.setClipping(false);
 
     painter.setPen(QPen(kLine, 1));
     painter.drawLine(kHeaderWidth, 0, kHeaderWidth, height());
