@@ -8,4 +8,8 @@
     <file alias="float.svg">icons/float.svg</file>
     <file alias="dot.svg">icons/dot.svg</file>
   </qresource>
+  <qresource prefix="/brand">
+    <file alias="hikari-mark.svg">icons/hikari-mark.svg</file>
+    <file alias="hikari-app-icon.svg">icons/hikari-app-icon.svg</file>
+  </qresource>
 </RCC>

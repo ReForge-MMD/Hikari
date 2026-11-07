@@ -161,7 +161,7 @@ QToolButton* make_transport_button(Glyph glyph, const QString& tooltip, QWidget*
 } // namespace
 
 MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
-    : QMainWindow(parent), model_path_(std::move(model_path)) {
+    : QMainWindow(parent), model_path_(std::move(model_path)), motion_path_(std::move(motion_path)) {
     setWindowTitle(QStringLiteral("Hikari Studio"));
     resize(1440, 900);
     setStyleSheet(NordicTheme::style_sheet());
@@ -290,12 +290,18 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
             viewport_->load_model(model_path_);
             refresh_targets();
             refresh_morph_combos();
+            if (motion_path_.isEmpty()) {
+                emit startupFinished();
+            }
         });
+    } else if (motion_path_.isEmpty()) {
+        QTimer::singleShot(0, this, [this] { emit startupFinished(); });
     }
-    if (!motion_path.isEmpty()) {
-        QTimer::singleShot(400, this, [this, motion_path] {
-            viewport_->load_motion(motion_path);
+    if (!motion_path_.isEmpty()) {
+        QTimer::singleShot(400, this, [this] {
+            viewport_->load_motion(motion_path_);
             refresh_targets();
+            emit startupFinished();
         });
     }
 }

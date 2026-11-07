@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96" role="img" aria-label="Hikari Studio">
+  <title>Hikari Studio app icon</title>
+  <desc>Monochrome app icon: the H and keyframe mark in one ink on a graphite tile.</desc>
+  <defs>
+    <linearGradient id="hikari-badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f2731"/>
+      <stop offset="1" stop-color="#0e1217"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="22" fill="url(#hikari-badge)"/>
+  <g fill="#e3e9ef" stroke="#e3e9ef">
+    <path d="M48 34 66 48 48 62 30 48Z" stroke="none"/>
+    <path d="M30 26V70M66 26V70" fill="none" stroke-width="9" stroke-linecap="round"/>
+  </g>
+</svg>

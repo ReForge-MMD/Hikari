@@ -6,6 +6,7 @@ add_executable(hikari_studio WIN32
   app_state.hpp
   d3d_viewport.cpp
   d3d_viewport.hpp
+  hikari.rc
   main.cpp
   main_window.cpp
   main_window.hpp
@@ -13,6 +14,8 @@ add_executable(hikari_studio WIN32
   project_io.cpp
   project_io.hpp
   resources.qrc
+  splash_screen.cpp
+  splash_screen.hpp
   theme.hpp
   timeline_widget.cpp
   timeline_widget.hpp
@@ -31,6 +34,7 @@ target_link_libraries(hikari_studio
     Qt6::Widgets
     Qt6::Gui
     Qt6::Core
+    Qt6::Svg
 )
 
 target_include_directories(hikari_studio PRIVATE ${Stb_INCLUDE_DIR})

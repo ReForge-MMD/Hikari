@@ -34,6 +34,9 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QString model_path, QString motion_path, QWidget* parent = nullptr);
 
+signals:
+    void startupFinished();
+
 protected:
     void keyPressEvent(QKeyEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
@@ -114,6 +117,7 @@ private:
     std::vector<ClipboardKey> clipboard_;
     unsigned int clipboard_anchor_ = 0;
     QString model_path_;
+    QString motion_path_;
 };
 
 } // namespace hikari::studio

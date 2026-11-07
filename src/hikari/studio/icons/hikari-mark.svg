@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="16 16 64 64" width="64" height="64" role="img" aria-label="Hikari Studio">
+  <title>Hikari Studio mark</title>
+  <desc>Monochrome mark for dark surfaces: a monoline H whose crossbar is an outlined animation keyframe.</desc>
+  <g fill="#e3e9ef" stroke="#e3e9ef">
+    <path d="M48 34 66 48 48 62 30 48Z" fill="none" stroke-width="5" stroke-linejoin="round"/>
+    <path d="M30 26V70M66 26V70" fill="none" stroke-width="9" stroke-linecap="round"/>
+  </g>
+</svg>

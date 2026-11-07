@@ -1,5 +1,7 @@
 #include <QApplication>
+#include <QIcon>
 #include <QSurfaceFormat>
+#include <QTimer>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -13,6 +15,7 @@
 #endif
 
 #include "hikari/studio/main_window.hpp"
+#include "hikari/studio/splash_screen.hpp"
 #include "hikari/studio/theme.hpp"
 
 int main(int argc, char** argv) {
@@ -22,6 +25,7 @@ int main(int argc, char** argv) {
     application.setApplicationName(QStringLiteral("Hikari Studio"));
     application.setOrganizationName(QStringLiteral("Hikari"));
     application.setApplicationVersion(QStringLiteral("1.0.0"));
+    application.setWindowIcon(QIcon(QStringLiteral(":/brand/hikari-app-icon.svg")));
 
     QString model_path;
     QString motion_path;
@@ -33,8 +37,17 @@ int main(int argc, char** argv) {
         motion_path = arguments[2];
     }
 
+    hikari::studio::SplashScreen splash;
+    splash.set_status(model_path.isEmpty() ? QStringLiteral("Preparing the workspace")
+                                           : QStringLiteral("Loading the startup scene"));
+    splash.show();
+    application.processEvents();
+
     hikari::studio::MainWindow window(model_path, motion_path);
+    QObject::connect(&window, &hikari::studio::MainWindow::startupFinished, &splash,
+                     [&splash, &window] { splash.finish(&window); });
     window.show();
+    QTimer::singleShot(15000, &splash, [&splash, &window] { splash.finish(&window); });
 #ifdef _WIN32
     // DWM attribute ids used by Windows 10 20H1 and Windows 11; the SDK
     // constants are not present in every toolchain.

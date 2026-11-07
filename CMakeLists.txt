@@ -10,7 +10,7 @@ include(HikariOptions)
 
 option(HIKARI_BUILD_STUDIO "Build the Qt 6 studio application" ON)
 if(HIKARI_BUILD_STUDIO)
-  find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets)
+  find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Svg)
 endif()
 find_package(Jolt CONFIG REQUIRED)
 find_package(Stb REQUIRED)
