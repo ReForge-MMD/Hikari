@@ -440,7 +440,8 @@ void D3DViewport::sync_active_model_state() {
         if (!slot) {
             continue;
         }
-        const std::string& name = morph.name_local.empty() ? morph.name_universal : morph.name_local;
+        const std::string& name =
+            morph.name_universal.empty() ? morph.name_local : morph.name_universal;
         state_.category_morph_names[static_cast<std::size_t>(*slot)].push_back(to_qstring(name));
     }
     for (int i = 0; i < 4; ++i) {
