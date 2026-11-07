@@ -57,6 +57,10 @@ public:
     std::vector<Mat4> inv_bind_matrices;
     std::vector<Vec3> local_translations;
     std::vector<Quat> local_rotations;
+    // IK layer composed on top of the authored pose: world = parent * (ik * local).
+    // Kept out of local_rotations so IK never overwrites the pose the user or the
+    // motion authored, and re-evaluating the skeleton is idempotent.
+    std::vector<Quat> ik_rotations;
     // Runtime IK on/off state per bone. Only IK controller bones are toggled;
     // every entry defaults to enabled.
     std::vector<bool> ik_enabled;
@@ -88,11 +92,13 @@ public:
 
 private:
     void build_name_index();
+    Quat composed_rotation(std::size_t index) const;
     void compute_world_matrix(std::size_t index, const Vec3& effective_translation,
                               const Quat& effective_rotation);
     void solve_ik(bool after_physics);
     void fill_bone_world_transforms(std::vector<physics::BodyTransform>& out) const;
     std::vector<physics::BodyTransform> bone_transform_scratch_;
+    std::vector<Quat> ik_saved_;
     std::unordered_map<std::string, std::size_t> name_index_;
 };
 

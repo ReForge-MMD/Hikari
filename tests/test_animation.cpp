@@ -114,13 +114,14 @@ TEST_CASE("Skeleton skips IK solving when the IK bone is disabled", "[animation]
 
     skeleton.set_bone_transform(3, hikari::Vec3(2.0f, 0.0f, 0.0f), hikari::Quat::identity());
     skeleton.update_transforms();
-    REQUIRE(std::abs(skeleton.local_rotations[1].to_euler_xyz().z) > 0.05f);
+    REQUIRE(std::abs((skeleton.ik_rotations[1] * skeleton.local_rotations[1]).to_euler_xyz().z) >
+            0.05f);
 
     skeleton.reset_pose();
     skeleton.ik_enabled[3] = false;
     skeleton.set_bone_transform(3, hikari::Vec3(2.0f, 0.0f, 0.0f), hikari::Quat::identity());
     skeleton.update_transforms();
-    REQUIRE(skeleton.local_rotations[1].to_euler_xyz().z ==
+    REQUIRE((skeleton.ik_rotations[1] * skeleton.local_rotations[1]).to_euler_xyz().z ==
             Catch::Approx(0.0f).margin(1.0e-4f));
 }
 

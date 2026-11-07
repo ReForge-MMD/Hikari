@@ -1112,7 +1112,10 @@ void D3DViewport::rotate_selection(int axis, float degrees) {
         const Quat parent = bone.parent_index
                                 ? model->skeleton.world_rotations[*bone.parent_index]
                                 : Quat::identity();
-        model->skeleton.local_rotations[index] = (parent.inverse() * world).normalize();
+        // The authored layer rotates under the IK layer, so peel both frames off.
+        const Quat authoring_frame =
+            (parent * model->skeleton.ik_rotations[index]).normalize();
+        model->skeleton.local_rotations[index] = (authoring_frame.inverse() * world).normalize();
     }
     model->skeleton.update_transforms();
     state_.bone_transform_dirty = false;
@@ -1153,7 +1156,9 @@ void D3DViewport::translate_selection(int axis, float amount) {
                      axis == 1 ? amount_in_model : 0.0f,
                      axis == 2 ? amount_in_model : 0.0f);
     if (state_.is_local_coord) {
-        local_delta = model->skeleton.local_rotations[index].rotate_vec3(local_delta);
+        local_delta = (model->skeleton.ik_rotations[index] *
+                       model->skeleton.local_rotations[index])
+                          .rotate_vec3(local_delta);
     } else if (bone.parent_index) {
         local_delta =
             model->skeleton.world_rotations[*bone.parent_index].inverse().rotate_vec3(local_delta);

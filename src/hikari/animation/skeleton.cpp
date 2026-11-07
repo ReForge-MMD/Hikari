@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <queue>
 
 namespace hikari::animation {
@@ -98,6 +99,7 @@ Skeleton Skeleton::from_pmx(const formats::PmxModel& pmx) {
 
     skeleton.local_translations.assign(count, Vec3::zero());
     skeleton.local_rotations.assign(count, Quat::identity());
+    skeleton.ik_rotations.assign(count, Quat::identity());
     skeleton.ik_enabled.assign(count, true);
     skeleton.world_positions.assign(count, Vec3::zero());
     skeleton.world_rotations.assign(count, Quat::identity());
@@ -383,9 +385,16 @@ void Skeleton::reset_pose() {
 }
 
 void Skeleton::update_transforms() {
+    // IK is re-derived on every evaluation from the authored pose, so it never
+    // accumulates on top of a previous solve (MMD resets rotQuat2 the same way).
+    std::fill(ik_rotations.begin(), ik_rotations.end(), Quat::identity());
     update_transforms_stage(false);
     update_transforms_stage(true);
     update_skinning_palette();
+}
+
+Quat Skeleton::composed_rotation(std::size_t index) const {
+    return (ik_rotations[index] * local_rotations[index]).normalize();
 }
 
 void Skeleton::update_transforms_stage(bool after_physics) {
@@ -398,14 +407,14 @@ void Skeleton::update_transforms_stage(bool after_physics) {
         if (bones[idx].has_append_parent) {
             const auto parent = bones[idx].append_parent;
             if ((bones[idx].flags & 0x0100) != 0) {
-                grant_rotation = Quat::identity().slerp(local_rotations[parent], bones[idx].append_ratio);
+                grant_rotation = Quat::identity().slerp(composed_rotation(parent), bones[idx].append_ratio);
             }
             if ((bones[idx].flags & 0x0200) != 0) {
                 grant_translation = local_translations[parent] * bones[idx].append_ratio;
             }
         }
         const Vec3 effective_translation = local_translations[idx] + grant_translation;
-        const Quat effective_rotation = (grant_rotation * local_rotations[idx]).normalize();
+        const Quat effective_rotation = (grant_rotation * composed_rotation(idx)).normalize();
         compute_world_matrix(idx, effective_translation, effective_rotation);
     }
     solve_ik(after_physics);
@@ -440,14 +449,14 @@ void Skeleton::update_subtree(std::size_t index) {
     if (bones[index].has_append_parent) {
         const auto parent = bones[index].append_parent;
         if ((bones[index].flags & 0x0100) != 0) {
-            grant_rotation = Quat::identity().slerp(local_rotations[parent], bones[index].append_ratio);
+            grant_rotation = Quat::identity().slerp(composed_rotation(parent), bones[index].append_ratio);
         }
         if ((bones[index].flags & 0x0200) != 0) {
             grant_translation = local_translations[parent] * bones[index].append_ratio;
         }
     }
     const Vec3 effective_translation = local_translations[index] + grant_translation;
-    const Quat effective_rotation = (grant_rotation * local_rotations[index]).normalize();
+    const Quat effective_rotation = (grant_rotation * composed_rotation(index)).normalize();
     compute_world_matrix(index, effective_translation, effective_rotation);
     for (std::size_t child : children[index]) {
         update_subtree(child);
@@ -468,9 +477,14 @@ void Skeleton::solve_ik(bool after_physics) {
             continue;
         }
         const int max_loops = std::clamp(bone.ik_loop_count, 1, 100);
-        const float angle_limit = std::max(bone.ik_angle_limit, 0.001f);
+        // MMD reads the PMX "unit angle" as an unrestricted step when it is zero.
+        const float angle_limit = bone.ik_angle_limit > 0.0f ? bone.ik_angle_limit : kPi;
+        const std::size_t root = bone.ik_links.empty() ? target_bone : bone.ik_links.back();
+        float best_distance = std::numeric_limits<float>::max();
+        ik_saved_.clear();
 
         for (int loop = 0; loop < max_loops; ++loop) {
+            bool moved = false;
             for (std::size_t l = 0; l < bone.ik_links.size(); ++l) {
                 const std::size_t link_index = bone.ik_links[l];
                 if (link_index >= bones.size()) {
@@ -506,37 +520,59 @@ void Skeleton::solve_ik(bool after_physics) {
                 }
                 axis = axis * (1.0f / std::sqrt(axis_len_sq));
 
+                const Quat authored = local_rotations[link_index];
+                const Quat composed = (ik_rotations[link_index] * authored).normalize();
+                Quat result;
                 if (bone.ik_link_has_limits[l]) {
                     const Vec3 limit_min = bone.ik_link_min[l];
                     const Vec3 limit_max = bone.ik_link_max[l];
                     const bool is_x_hinge = std::abs(limit_max.y - limit_min.y) < 1.0e-4f &&
                                             std::abs(limit_max.z - limit_min.z) < 1.0e-4f;
+                    const Vec3 hinge_axis(axis.x >= 0.0f ? 1.0f : -1.0f, 0.0f, 0.0f);
+                    const Vec3 step_axis = is_x_hinge ? hinge_axis : axis;
+                    const Quat trial = (composed * Quat::from_axis_angle(step_axis, angle)).normalize();
+                    Vec3 euler = trial.to_euler_xyz();
+                    euler.x = std::clamp(euler.x, limit_min.x, limit_max.x);
                     if (is_x_hinge) {
-                        const Vec3 hinge_axis(axis.x >= 0.0f ? 1.0f : -1.0f, 0.0f, 0.0f);
-                        const Quat delta = Quat::from_axis_angle(hinge_axis, angle);
-                        const Quat trial = (local_rotations[link_index] * delta).normalize();
-                        Vec3 euler = trial.to_euler_xyz();
-                        euler.x = std::clamp(euler.x, limit_min.x, limit_max.x);
                         euler.y = 0.0f;
                         euler.z = 0.0f;
-                        local_rotations[link_index] = Quat::from_euler_xyz(euler);
                     } else {
-                        const Quat delta = Quat::from_axis_angle(axis, angle);
-                        const Quat trial = (local_rotations[link_index] * delta).normalize();
-                        Vec3 euler = trial.to_euler_xyz();
-                        euler.x = std::clamp(euler.x, limit_min.x, limit_max.x);
                         euler.y = std::clamp(euler.y, limit_min.y, limit_max.y);
                         euler.z = std::clamp(euler.z, limit_min.z, limit_max.z);
-                        local_rotations[link_index] = Quat::from_euler_xyz(euler);
                     }
+                    result = Quat::from_euler_xyz(euler);
                 } else {
-                    const Quat delta = Quat::from_axis_angle(axis, angle);
-                    local_rotations[link_index] = (local_rotations[link_index] * delta).normalize();
+                    result = (composed * Quat::from_axis_angle(axis, angle)).normalize();
                 }
-
+                ik_rotations[link_index] = (result * authored.inverse()).normalize();
+                moved = true;
                 update_subtree(link_index);
             }
+
+            const float distance =
+                (world_positions[target_bone] - world_positions[ik_bone]).length_squared();
+            if (distance < best_distance) {
+                best_distance = distance;
+                ik_saved_.clear();
+                ik_saved_.reserve(bone.ik_links.size());
+                for (std::size_t link : bone.ik_links) {
+                    ik_saved_.push_back(ik_rotations[link]);
+                }
+            } else {
+                for (std::size_t i = 0; i < bone.ik_links.size() && i < ik_saved_.size(); ++i) {
+                    ik_rotations[bone.ik_links[i]] = ik_saved_[i];
+                }
+                break;
+            }
+            if (distance < 1.0e-8f || !moved) {
+                break;
+            }
         }
+        // Keep the best iteration instead of the last one, like the Rust solver.
+        for (std::size_t i = 0; i < bone.ik_links.size() && i < ik_saved_.size(); ++i) {
+            ik_rotations[bone.ik_links[i]] = ik_saved_[i];
+        }
+        update_subtree(root);
     }
 }
 
@@ -598,6 +634,8 @@ void Skeleton::apply_physics(physics::PhysicsRig& rig, float dt) {
             const Quat mmd_rot = Quat(-jolt_rot.x, -jolt_rot.y, jolt_rot.z, jolt_rot.w).normalize();
             const Quat inv_parent = parent_rotation.inverse();
             local_rotations[idx] = (inv_parent * mmd_rot).normalize();
+            // A physics override is the final local transform; drop any IK layer.
+            ik_rotations[idx] = Quat::identity();
             local_translations[idx] =
                 inv_parent.rotate_vec3(mmd_pos - parent_position) - bones[idx].offset;
             world_positions[idx] = mmd_pos;
@@ -608,6 +646,7 @@ void Skeleton::apply_physics(physics::PhysicsRig& rig, float dt) {
             const Quat mmd_rot = Quat(-jolt_rot.x, -jolt_rot.y, jolt_rot.z, jolt_rot.w).normalize();
             const Quat inv_parent = parent_rotation.inverse();
             local_rotations[idx] = (inv_parent * mmd_rot).normalize();
+            ik_rotations[idx] = Quat::identity();
             const Vec3 world_pos =
                 parent_position +
                 parent_rotation.rotate_vec3(bones[idx].offset + local_translations[idx]);
