@@ -4,7 +4,16 @@
   "description": "Direct3D 11 MMD/MME runtime and Qt6 animation studio",
   "dependencies": [
     "joltphysics",
-    "stb"
+    "stb",
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "swresample"
+      ]
+    }
   ],
   "features": {
     "tests": {

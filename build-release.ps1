@@ -31,6 +31,12 @@ if (-not $env:QTDIR) {
     $env:QTDIR = Get-CacheValue "CMAKE_PREFIX_PATH"
 }
 if (-not $env:QTDIR) {
+    $qt6 = Get-CacheValue "Qt6_DIR"
+    if ($qt6 -match '^(.*)[/\\]lib[/\\]cmake[/\\]Qt6$') {
+        $env:QTDIR = $Matches[1]
+    }
+}
+if (-not $env:QTDIR) {
     throw "QTDIR is not set. Point it at a Qt 6 MSVC 2022 x64 kit."
 }
 

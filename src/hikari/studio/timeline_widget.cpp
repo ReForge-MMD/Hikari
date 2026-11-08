@@ -19,6 +19,7 @@ namespace {
 constexpr int kRowHeight = 22;
 constexpr int kHeaderWidth = 148;
 constexpr int kRulerHeight = 26;
+constexpr int kAudioStripHeight = 34;
 constexpr int kRightMargin = 24;
 constexpr int kGridPadding = 8;
 constexpr int kMinVisibleFrames = 40;
@@ -31,9 +32,15 @@ const QColor kSnow(colors::on_surface);
 const QColor kMuted(colors::on_surface_muted);
 const QColor kCyan(colors::primary);
 const QColor kKey(0x7e, 0x9d, 0xb4);
+const QColor kMotionKey(0x55, 0x6b, 0x7d);
 const QColor kKeySelected(colors::tertiary);
 const QColor kSelection(colors::primary_container);
 const QColor kPlayhead(colors::on_surface);
+const QColor kAudioWave(0x6f, 0x9f, 0xc9, 210);
+
+int rows_top(const StudioAppState& state) {
+    return kRulerHeight + (state.audio_peaks.empty() ? 0 : kAudioStripHeight);
+}
 
 bool reserved_channel(const QString& name) {
     return name == QStringLiteral("view cnt") || name == QStringLiteral("Disp/IK/OP") ||
@@ -73,7 +80,7 @@ void TimelineWidget::refresh_layout() {
     layout_frames_ = frames;
     layout_rows_ = row_count;
     layout_spacing_ = spacing;
-    setMinimumHeight(kRulerHeight + row_count * kRowHeight + 4);
+    setMinimumHeight(rows_top(state_) + row_count * kRowHeight + 4);
     if (changed) {
         updateGeometry();
     }
@@ -171,7 +178,11 @@ void TimelineWidget::rebuild_rows() const {
     QSet<QString> morph_names;
     const auto has_keys = [this](const QString& name) {
         const auto track = state_.track_keyframes.find(name);
-        return track != state_.track_keyframes.end() && !track->second.empty();
+        if (track != state_.track_keyframes.end() && !track->second.empty()) {
+            return true;
+        }
+        const auto motion = state_.motion_keyframes.find(name);
+        return motion != state_.motion_keyframes.end() && !motion.value().isEmpty();
     };
     for (const auto& category : state_.category_morph_names) {
         for (const QString& name : category) {
@@ -181,18 +192,28 @@ void TimelineWidget::rebuild_rows() const {
             }
         }
     }
-    for (const auto& [track, keys] : state_.track_keyframes) {
-        if (keys.empty() || track.isEmpty() || reserved_channel(track) ||
-            bone_names.contains(track) || morph_names.contains(track)) {
-            continue;
+    const auto append_extra_row = [&](const QString& track) {
+        if (track.isEmpty() || reserved_channel(track) || bone_names.contains(track) ||
+            morph_names.contains(track)) {
+            return;
         }
         if (track == QStringLiteral("camera") || track == QStringLiteral("light") ||
             track == QStringLiteral("shadow") || track == QStringLiteral("gravity") ||
             track == QStringLiteral("accessory")) {
-            continue;
+            return;
         }
         morph_names.insert(track);
         rows_cache_.push_back({track, TimelineRowKind::Morph, 0});
+    };
+    for (const auto& [track, keys] : state_.track_keyframes) {
+        if (!keys.empty()) {
+            append_extra_row(track);
+        }
+    }
+    for (auto it = state_.motion_keyframes.begin(); it != state_.motion_keyframes.end(); ++it) {
+        if (!it.value().isEmpty()) {
+            append_extra_row(it.key());
+        }
     }
 }
 
@@ -204,7 +225,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
     const int visible_frames = std::max(state_.max_timeline_frame, kMinVisibleFrames);
     const int offset = static_cast<int>(state_.timeline_scroll);
-    const int content_height = kRulerHeight + static_cast<int>(row_list.size()) * kRowHeight;
+    const int content_height = rows_top(state_) + static_cast<int>(row_list.size()) * kRowHeight;
     const QRect grid_rect(kHeaderWidth, 0, std::max(0, width() - kHeaderWidth), height());
 
     QFont row_font = font();
@@ -217,8 +238,56 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     painter.setPen(QPen(kLine, 1));
     painter.drawLine(0, kRulerHeight, width(), kRulerHeight);
 
+    const int strip_top = kRulerHeight;
+    const int strip_height = rows_top(state_) - kRulerHeight;
+    if (strip_height > 0) {
+        const int strip_bottom = strip_top + strip_height;
+        painter.fillRect(QRect(0, strip_top, width(), strip_height), kPanel);
+        painter.setPen(QPen(kLine, 1));
+        painter.drawLine(0, strip_bottom, width(), strip_bottom);
+
+        painter.setFont(row_font);
+        painter.setPen(kMuted);
+        const QString name =
+            state_.audio_name.isEmpty()
+                ? QStringLiteral("Audio")
+                : QFontMetrics(row_font).elidedText(state_.audio_name, Qt::ElideRight,
+                                                    kHeaderWidth - 24);
+        painter.drawText(QRect(12, strip_top, kHeaderWidth - 20, strip_height),
+                         Qt::AlignVCenter | Qt::AlignLeft, name);
+
+        if (!state_.audio_peaks.empty() && state_.audio_peaks_per_second > 0.0) {
+            const int center = strip_top + strip_height / 2;
+            const int half = std::max(1, strip_height / 2 - 4);
+            const QRect strip_grid(kHeaderWidth, strip_top,
+                                   std::max(0, width() - kHeaderWidth), strip_height);
+            painter.setClipRect(strip_grid);
+            painter.setPen(QPen(kAudioWave, 1));
+            for (int x = kHeaderWidth; x < width(); ++x) {
+                const float frame =
+                    (static_cast<float>(x - kHeaderWidth - kGridPadding) +
+                     state_.timeline_scroll) /
+                    spacing;
+                const double seconds =
+                    (static_cast<double>(frame) - state_.audio_offset_frames) / 30.0;
+                if (seconds < 0.0 || seconds >= state_.audio_duration) {
+                    continue;
+                }
+                const auto index =
+                    static_cast<std::size_t>(seconds * state_.audio_peaks_per_second);
+                if (index >= state_.audio_peaks.size()) {
+                    continue;
+                }
+                const int amplitude =
+                    static_cast<int>(std::lround(state_.audio_peaks[index] * half));
+                painter.drawLine(x, center - amplitude, x, center + amplitude);
+            }
+            painter.setClipping(false);
+        }
+    }
+
     for (int row = 0; row < static_cast<int>(row_list.size()); ++row) {
-        const int y = kRulerHeight + row * kRowHeight;
+        const int y = rows_top(state_) + row * kRowHeight;
         if (y > height()) {
             break;
         }
@@ -260,11 +329,32 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     }
 
     for (int row = 0; row < static_cast<int>(row_list.size()); ++row) {
-        const int y = kRulerHeight + row * kRowHeight;
+        const int y = rows_top(state_) + row * kRowHeight;
         if (y > height()) {
             break;
         }
         const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
+        const auto motion_keys = state_.motion_keyframes.find(descriptor.name);
+        if (motion_keys != state_.motion_keyframes.end()) {
+            // Loaded VMD keys are a read-only reference; authored keyframes are
+            // drawn on top with the regular diamond.
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(kMotionKey);
+            for (const unsigned int frame : motion_keys.value()) {
+                const int x =
+                    kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
+                if (x < kHeaderWidth || x > width()) {
+                    continue;
+                }
+                const QPointF center(x, y + kRowHeight / 2.0);
+                QPolygonF marker;
+                marker << QPointF(center.x(), center.y() - 3.0)
+                       << QPointF(center.x() + 3.0, center.y())
+                       << QPointF(center.x(), center.y() + 3.0)
+                       << QPointF(center.x() - 3.0, center.y());
+                painter.drawPolygon(marker);
+            }
+        }
         const auto track = state_.track_keyframes.find(descriptor.name);
         if (track == state_.track_keyframes.end()) {
             continue;
@@ -309,15 +399,16 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
 }
 
 std::optional<TimelineKeyframeHit> TimelineWidget::keyframe_at(const QPoint& position) const {
-    if (position.x() < kHeaderWidth || position.y() < kRulerHeight) {
+    const int top = rows_top(state_);
+    if (position.x() < kHeaderWidth || position.y() < top) {
         return std::nullopt;
     }
-    const int row = (position.y() - kRulerHeight) / kRowHeight;
+    const int row = (position.y() - top) / kRowHeight;
     const auto& row_list = rows();
     if (row < 0 || row >= static_cast<int>(row_list.size())) {
         return std::nullopt;
     }
-    const int row_y = kRulerHeight + row * kRowHeight + kRowHeight / 2;
+    const int row_y = top + row * kRowHeight + kRowHeight / 2;
     if (std::abs(position.y() - row_y) > 6) {
         return std::nullopt;
     }
@@ -348,8 +439,8 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
     setFocus();
     const QPoint position = event->pos();
     if (position.x() < kHeaderWidth) {
-        if (position.y() >= kRulerHeight) {
-            const int row = (position.y() - kRulerHeight) / kRowHeight;
+        if (position.y() >= rows_top(state_)) {
+            const int row = (position.y() - rows_top(state_)) / kRowHeight;
             const auto& row_list = rows();
             if (row >= 0 && row < static_cast<int>(row_list.size())) {
                 const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];

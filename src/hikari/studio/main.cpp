@@ -29,12 +29,16 @@ int main(int argc, char** argv) {
 
     QString model_path;
     QString motion_path;
+    QString audio_path;
     const QStringList arguments = application.arguments();
     if (arguments.size() > 1) {
         model_path = arguments[1];
     }
     if (arguments.size() > 2) {
         motion_path = arguments[2];
+    }
+    if (arguments.size() > 3) {
+        audio_path = arguments[3];
     }
 
     hikari::studio::SplashScreen splash;
@@ -43,7 +47,7 @@ int main(int argc, char** argv) {
     splash.show();
     application.processEvents();
 
-    hikari::studio::MainWindow window(model_path, motion_path);
+    hikari::studio::MainWindow window(model_path, motion_path, audio_path);
     QObject::connect(&window, &hikari::studio::MainWindow::startupFinished, &splash,
                      [&splash, &window] { splash.finish(&window); });
     window.show();

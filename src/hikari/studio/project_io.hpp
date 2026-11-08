@@ -54,6 +54,9 @@ struct ProjectScene {
     std::array<float, 3> camera_follow_offset{0.0f, 0.0f, 0.0f};
     float camera_near_clip = 0.1f;
     float camera_far_clip = 1000.0f;
+    QString audio_path;
+    float audio_offset_frames = 0.0f;
+    float audio_volume = 1.0f;
     std::array<float, 3> light_color{0.6f, 0.6f, 0.6f};
     std::array<float, 3> light_direction{-0.5f, -1.0f, -0.5f};
     ShadowMode shadow_mode = ShadowMode::Mode1;

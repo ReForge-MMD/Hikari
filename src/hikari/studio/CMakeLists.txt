@@ -31,6 +31,7 @@ target_link_libraries(hikari_studio
     hikari_animation
     hikari_physics
     hikari_render
+    hikari_audio
     Qt6::Widgets
     Qt6::Gui
     Qt6::Core

@@ -20,6 +20,10 @@
 
 class QTimer;
 
+namespace hikari::audio {
+class AudioPlayer;
+}
+
 namespace hikari::studio {
 
 class ViewGizmo;
@@ -38,6 +42,8 @@ public:
     bool save_motion(const QString& path);
     bool load_motion_hkm(const QString& path);
     bool save_motion_hkm(const QString& path);
+    bool load_audio(const QString& path);
+    void unload_audio();
     bool load_project(const QString& path);
     bool save_project(const QString& path);
     void clear_model();
@@ -120,6 +126,8 @@ private:
     void update_camera();
     bool camera_follow_state(Vec3& bone_position, Quat& rotation, float& scale) const;
     Quat camera_orientation() const;
+    void rebuild_motion_keyframes();
+    void sync_audio_playback();
     void evaluate_frame(float frame);
     formats::VmdMotion build_authored_vmd() const;
     HikariMotion build_hikari_motion() const;
@@ -152,6 +160,8 @@ private:
     std::optional<animation::MotionPlayer> motion_player_;
     std::optional<formats::VmdMotion> motion_data_;
     std::vector<Mat4> render_palette_;
+    std::unique_ptr<audio::AudioPlayer> audio_player_;
+    bool audio_playing_ = false;
 
     QTimer* timer_ = nullptr;
     QElapsedTimer frame_timer_;

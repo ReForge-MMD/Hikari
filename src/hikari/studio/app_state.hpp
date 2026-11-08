@@ -122,6 +122,9 @@ struct StudioAppState {
     float timeline_zoom = 1.0f;
     float timeline_scroll = 0.0f;
     TrackKeyframeMap track_keyframes;
+    // Frames of the loaded VMD, shown on the timeline as a read-only reference.
+    // The motion player still owns the animation; these entries never drive it.
+    QMap<QString, QSet<unsigned int>> motion_keyframes;
     std::set<std::pair<QString, unsigned int>> selected_keyframes;
     bool track_keys_dirty = true;
     std::uint64_t keyframe_revision = 0;
@@ -194,6 +197,16 @@ struct StudioAppState {
 
     bool jiggle_enabled = true;
     bool vsync = false;
+
+    // Preview audio. The decoded samples live in the player; the state keeps
+    // the display metadata and the waveform peaks for the timeline.
+    QString audio_path;
+    QString audio_name;
+    double audio_duration = 0.0;
+    double audio_peaks_per_second = 0.0;
+    float audio_offset_frames = 0.0f;
+    float audio_volume = 1.0f;
+    std::vector<float> audio_peaks;
 
     int screen_size_width = 1280;
     int screen_size_height = 720;

@@ -32,7 +32,8 @@ class ViewportHeader;
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
-    explicit MainWindow(QString model_path, QString motion_path, QWidget* parent = nullptr);
+    explicit MainWindow(QString model_path, QString motion_path, QString audio_path = {},
+                        QWidget* parent = nullptr);
 
 signals:
     void startupFinished();
@@ -51,6 +52,7 @@ private:
     void restore_panel_layout();
     void save_panel_layout();
     void refresh_tab_title_bars();
+    void refresh_camera_presets();
     QWidget* build_viewport_area();
     QWidget* build_timeline_panel();
     QWidget* build_model_tab();
@@ -108,10 +110,19 @@ private:
     QDoubleSpinBox* camera_distance_ = nullptr;
     QDoubleSpinBox* camera_near_clip_ = nullptr;
     QDoubleSpinBox* camera_far_clip_ = nullptr;
+    QDoubleSpinBox* camera_fov_ = nullptr;
+    QDoubleSpinBox* camera_yaw_ = nullptr;
+    QDoubleSpinBox* camera_pitch_ = nullptr;
+    QDoubleSpinBox* camera_roll_ = nullptr;
+    QComboBox* camera_preset_combo_ = nullptr;
+    QCheckBox* camera_ortho_ = nullptr;
     QCheckBox* camera_follow_ = nullptr;
     QComboBox* camera_parent_model_ = nullptr;
     QComboBox* camera_parent_bone_ = nullptr;
     std::array<QDoubleSpinBox*, 3> camera_follow_offset_{};
+    QLabel* audio_label_ = nullptr;
+    QDoubleSpinBox* audio_offset_ = nullptr;
+    QSlider* audio_volume_ = nullptr;
     QCheckBox* model_visible_ = nullptr;
     QDoubleSpinBox* model_scale_ = nullptr;
     QCheckBox* bone_ik_ = nullptr;
@@ -127,6 +138,7 @@ private:
     unsigned int clipboard_anchor_ = 0;
     QString model_path_;
     QString motion_path_;
+    QString audio_path_;
 };
 
 } // namespace hikari::studio

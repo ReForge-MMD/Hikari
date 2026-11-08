@@ -20,6 +20,10 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
@@ -34,6 +38,7 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -86,6 +91,91 @@ void add_row(QGridLayout* layout, int row, const QString& label, QWidget* widget
     caption->setMinimumWidth(64);
     layout->addWidget(caption, row, 0);
     layout->addWidget(widget, row, 1);
+}
+
+// Panel editors should follow the dock width. Without an Ignored horizontal
+// policy the spin box and combo minimumSizeHint keep the panel from shrinking
+// and the right side of the row is clipped inside the scroll area.
+void make_shrinkable(QWidget* widget) {
+    widget->setSizePolicy(QSizePolicy::Ignored, widget->sizePolicy().verticalPolicy());
+    widget->setMinimumWidth(0);
+}
+
+void make_compact_combo(QComboBox* combo) {
+    combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    combo->setMinimumContentsLength(6);
+    make_shrinkable(combo);
+}
+
+QJsonArray vec3_to_json(const std::array<float, 3>& value) {
+    return QJsonArray{value[0], value[1], value[2]};
+}
+
+std::array<float, 3> vec3_from_json(const QJsonValue& value) {
+    const QJsonArray array = value.toArray();
+    return {static_cast<float>(array.at(0).toDouble()),
+            static_cast<float>(array.at(1).toDouble()),
+            static_cast<float>(array.at(2).toDouble())};
+}
+
+QJsonObject camera_preset_to_json(const StudioAppState& state) {
+    QJsonObject object;
+    object[QStringLiteral("pan")] = vec3_to_json(state.camera_pan);
+    object[QStringLiteral("yaw")] = state.camera_yaw;
+    object[QStringLiteral("pitch")] = state.camera_pitch;
+    object[QStringLiteral("roll")] = state.camera_roll;
+    object[QStringLiteral("distance")] = state.camera_distance;
+    object[QStringLiteral("fov")] = state.camera_fov_deg;
+    object[QStringLiteral("orthographic")] = state.camera_orthographic;
+    object[QStringLiteral("near_clip")] = state.camera_near_clip;
+    object[QStringLiteral("far_clip")] = state.camera_far_clip;
+    object[QStringLiteral("target")] = static_cast<int>(state.camera_target);
+    object[QStringLiteral("follow")] = state.camera_follow;
+    object[QStringLiteral("parent_model")] = state.camera_parent_model;
+    object[QStringLiteral("parent_bone")] = state.camera_parent_bone;
+    object[QStringLiteral("follow_offset")] = vec3_to_json(state.camera_follow_offset);
+    return object;
+}
+
+void camera_preset_from_json(const QJsonObject& object, StudioAppState& state) {
+    state.camera_pan = vec3_from_json(object.value(QStringLiteral("pan")));
+    state.camera_yaw = static_cast<float>(object.value(QStringLiteral("yaw")).toDouble());
+    state.camera_pitch = static_cast<float>(object.value(QStringLiteral("pitch")).toDouble());
+    state.camera_roll = static_cast<float>(object.value(QStringLiteral("roll")).toDouble());
+    state.camera_distance =
+        static_cast<float>(object.value(QStringLiteral("distance")).toDouble(45.0));
+    state.camera_fov_deg =
+        static_cast<float>(object.value(QStringLiteral("fov")).toDouble(30.0));
+    state.camera_orthographic =
+        object.value(QStringLiteral("orthographic")).toBool(false);
+    state.camera_near_clip =
+        static_cast<float>(object.value(QStringLiteral("near_clip")).toDouble(0.1));
+    state.camera_far_clip =
+        static_cast<float>(object.value(QStringLiteral("far_clip")).toDouble(1000.0));
+    state.camera_target = static_cast<CameraTarget>(
+        std::clamp(object.value(QStringLiteral("target")).toInt(0), 0, 2));
+    state.camera_follow = object.value(QStringLiteral("follow")).toBool(false);
+    state.camera_parent_model =
+        object.value(QStringLiteral("parent_model")).toInt(-1);
+    state.camera_parent_bone =
+        object.value(QStringLiteral("parent_bone")).toInt(0);
+    state.camera_follow_offset =
+        vec3_from_json(object.value(QStringLiteral("follow_offset")));
+}
+
+QJsonObject load_camera_presets() {
+    QSettings settings;
+    const QByteArray bytes = settings.value(QStringLiteral("cameraPresets")).toByteArray();
+    if (bytes.isEmpty()) {
+        return {};
+    }
+    return QJsonDocument::fromJson(bytes).object();
+}
+
+void store_camera_presets(const QJsonObject& presets) {
+    QSettings settings;
+    settings.setValue(QStringLiteral("cameraPresets"),
+                      QJsonDocument(presets).toJson(QJsonDocument::Compact));
 }
 
 QCheckBox* make_check(const QString& text, bool checked) {
@@ -161,8 +251,12 @@ QToolButton* make_transport_button(Glyph glyph, const QString& tooltip, QWidget*
 
 } // namespace
 
-MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
-    : QMainWindow(parent), model_path_(std::move(model_path)), motion_path_(std::move(motion_path)) {
+MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_path,
+                       QWidget* parent)
+    : QMainWindow(parent),
+      model_path_(std::move(model_path)),
+      motion_path_(std::move(motion_path)),
+      audio_path_(std::move(audio_path)) {
     setWindowTitle(QStringLiteral("Hikari Studio"));
     resize(1440, 900);
     setStyleSheet(NordicTheme::style_sheet());
@@ -285,10 +379,15 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QWidget* parent)
     });
     sync_timer->start();
 
-    if (!model_path_.isEmpty()) {
+    if (!model_path_.isEmpty() || !audio_path_.isEmpty()) {
         QTimer::singleShot(120, this, [this] {
             viewport_->initialize();
-            viewport_->load_model(model_path_);
+            if (!model_path_.isEmpty()) {
+                viewport_->load_model(model_path_);
+            }
+            if (!audio_path_.isEmpty()) {
+                viewport_->load_audio(audio_path_);
+            }
             refresh_targets();
             refresh_morph_combos();
             if (motion_path_.isEmpty()) {
@@ -328,6 +427,7 @@ void MainWindow::build_menus() {
     auto* file_menu = menuBar()->addMenu(QStringLiteral("&File"));
     file_menu->addAction(QStringLiteral("New Project"), this, [this] {
         viewport_->clear_model();
+        viewport_->unload_audio();
         state_.set_status(QStringLiteral("Created new project"));
         refresh_targets();
     });
@@ -364,6 +464,25 @@ void MainWindow::build_menus() {
                          [this] { choose_model(); });
     file_menu->addAction(QStringLiteral("Load Motion (.VMD)..."), this,
                          [this] { choose_motion(); });
+    file_menu->addAction(QStringLiteral("Load Audio..."), this, [this] {
+        const QString path = QFileDialog::getOpenFileName(
+            this, QStringLiteral("Load audio"), state_.default_directory,
+            QStringLiteral("Audio files (*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.opus *.wma "
+                           "*.aiff *.aif *.wv *.ape);;All files (*)"));
+        if (path.isEmpty()) {
+            return;
+        }
+        viewport_->load_audio(path);
+        sync_bone_fields();
+        timeline_->refresh_layout();
+        timeline_->update();
+    });
+    file_menu->addAction(QStringLiteral("Unload Audio"), this, [this] {
+        viewport_->unload_audio();
+        sync_bone_fields();
+        timeline_->refresh_layout();
+        timeline_->update();
+    });
     auto* load_hkm = file_menu->addAction(QStringLiteral("Load Hikari Motion (.hkm)..."), this, [this] {
         const QString path = QFileDialog::getOpenFileName(
             this, QStringLiteral("Load Hikari motion"), state_.default_directory,
@@ -685,13 +804,13 @@ void MainWindow::refresh_tab_title_bars() {
     if (timeline_dock_ != nullptr) {
         docks.push_back(timeline_dock_);
     }
-    // Dock tab bars elide long names by default, which cuts panel titles down
-    // to a few letters in a narrow dock area. Keep the full labels and let the
-    // scroller arrows take over when the tabs no longer fit.
+    // Dock tab bars need to stay usable in a narrow dock area. Elide the labels
+    // so the common four-tab groups still fit, and keep the scroller arrows for
+    // groups that cannot shrink any further.
     for (auto* bar : findChildren<QTabBar*>()) {
         bar->installEventFilter(this);
-        if (bar->elideMode() != Qt::ElideNone) {
-            bar->setElideMode(Qt::ElideNone);
+        if (bar->elideMode() != Qt::ElideRight) {
+            bar->setElideMode(Qt::ElideRight);
         }
         if (!bar->usesScrollButtons()) {
             bar->setUsesScrollButtons(true);
@@ -1345,9 +1464,17 @@ QWidget* MainWindow::build_camera_tab() {
                             state_.camera_pitch * 180.0 / 3.14159265358979323846);
     auto* roll = make_spin(-180.0, 180.0, 1.0, 1,
                            state_.camera_roll * 180.0 / 3.14159265358979323846);
+    camera_fov_ = fov;
+    camera_yaw_ = yaw;
+    camera_pitch_ = pitch;
+    camera_roll_ = roll;
+    for (QDoubleSpinBox* spin : {distance, near_clip, far_clip, fov, yaw, pitch, roll}) {
+        make_shrinkable(spin);
+    }
     auto* grid = new QGridLayout();
     grid->setHorizontalSpacing(4);
     grid->setVerticalSpacing(2);
+    grid->setColumnStretch(1, 1);
     add_row(grid, 0, QStringLiteral("Distance"), distance);
     add_row(grid, 1, QStringLiteral("FOV"), fov);
     add_row(grid, 2, QStringLiteral("Yaw"), yaw);
@@ -1360,6 +1487,7 @@ QWidget* MainWindow::build_camera_tab() {
     camera_target_->setToolTip(
         QStringLiteral("Camera rotation pivot in model mode: free point, model center, "
                        "or the selected bone."));
+    make_compact_combo(camera_target_);
     add_row(grid, 5, QStringLiteral("Target"), camera_target_);
     add_row(grid, 6, QStringLiteral("Near clip"), near_clip);
     add_row(grid, 7, QStringLiteral("Far clip"), far_clip);
@@ -1373,11 +1501,13 @@ QWidget* MainWindow::build_camera_tab() {
     auto* follow_row = new QHBoxLayout();
     follow_row->addWidget(new QLabel(QStringLiteral("Model")));
     camera_parent_model_ = new QComboBox();
+    make_compact_combo(camera_parent_model_);
     follow_row->addWidget(camera_parent_model_, 1);
     layout->addLayout(follow_row);
     auto* follow_bone_row = new QHBoxLayout();
     follow_bone_row->addWidget(new QLabel(QStringLiteral("Bone")));
     camera_parent_bone_ = new QComboBox();
+    make_compact_combo(camera_parent_bone_);
     follow_bone_row->addWidget(camera_parent_bone_, 1);
     layout->addLayout(follow_bone_row);
     auto* offset_row = new QHBoxLayout();
@@ -1387,6 +1517,7 @@ QWidget* MainWindow::build_camera_tab() {
         camera_follow_offset_[static_cast<std::size_t>(i)] =
             make_spin(-1000.0, 1000.0, 0.1, 2,
                       state_.camera_follow_offset[static_cast<std::size_t>(i)]);
+        make_shrinkable(camera_follow_offset_[static_cast<std::size_t>(i)]);
         camera_follow_offset_[static_cast<std::size_t>(i)]->setToolTip(
             QStringLiteral("Camera offset in the followed bone's local frame."));
         camera_follow_offset_[static_cast<std::size_t>(i)]->setPrefix(
@@ -1398,9 +1529,26 @@ QWidget* MainWindow::build_camera_tab() {
     auto* row = new QHBoxLayout();
     auto* reset = new QPushButton(QStringLiteral("Reset Camera"));
     auto* ortho = make_check(QStringLiteral("Ortho"), state_.camera_orthographic);
+    camera_ortho_ = ortho;
     row->addWidget(reset);
     row->addWidget(ortho);
     layout->addLayout(row);
+
+    auto* preset_row = new QHBoxLayout();
+    preset_row->addWidget(new QLabel(QStringLiteral("Preset")));
+    camera_preset_combo_ = new QComboBox();
+    make_compact_combo(camera_preset_combo_);
+    preset_row->addWidget(camera_preset_combo_, 1);
+    auto* preset_save = new QPushButton(QStringLiteral("Save"));
+    preset_row->addWidget(preset_save);
+    layout->addLayout(preset_row);
+    auto* preset_actions = new QHBoxLayout();
+    auto* preset_load = new QPushButton(QStringLiteral("Load"));
+    auto* preset_delete = new QPushButton(QStringLiteral("Delete"));
+    preset_actions->addWidget(preset_load);
+    preset_actions->addWidget(preset_delete);
+    layout->addLayout(preset_actions);
+
     auto* register_button = new QPushButton(QStringLiteral("Register Camera Keyframe"));
     layout->addWidget(register_button);
     layout->addStretch(1);
@@ -1481,6 +1629,53 @@ QWidget* MainWindow::build_camera_tab() {
         update_viewport_title();
         footer_->sync();
     });
+
+    const auto apply_current_preset = [this] {
+        const QString name = camera_preset_combo_->currentText();
+        if (name.isEmpty()) {
+            return;
+        }
+        const QJsonObject presets = load_camera_presets();
+        if (!presets.contains(name)) {
+            return;
+        }
+        camera_preset_from_json(presets.value(name).toObject(), state_);
+        sync_bone_fields();
+        update_viewport_title();
+        footer_->sync();
+        timeline_->update();
+        state_.set_status(QStringLiteral("Loaded camera preset: %1").arg(name));
+    };
+    connect(preset_save, &QPushButton::clicked, this, [this] {
+        bool ok = false;
+        const QString name = QInputDialog::getText(
+                                 this, QStringLiteral("Save camera preset"),
+                                 QStringLiteral("Preset name:"), QLineEdit::Normal, QString(),
+                                 &ok)
+                                 .trimmed();
+        if (!ok || name.isEmpty()) {
+            return;
+        }
+        QJsonObject presets = load_camera_presets();
+        presets[name] = camera_preset_to_json(state_);
+        store_camera_presets(presets);
+        refresh_camera_presets();
+        camera_preset_combo_->setCurrentText(name);
+    });
+    connect(preset_load, &QPushButton::clicked, this, apply_current_preset);
+    connect(preset_delete, &QPushButton::clicked, this, [this] {
+        const QString name = camera_preset_combo_->currentText();
+        if (name.isEmpty()) {
+            return;
+        }
+        QJsonObject presets = load_camera_presets();
+        presets.remove(name);
+        store_camera_presets(presets);
+        refresh_camera_presets();
+    });
+    connect(camera_preset_combo_, &QComboBox::activated, this,
+            [apply_current_preset](int) { apply_current_preset(); });
+    refresh_camera_presets();
     connect(ortho, &QCheckBox::toggled, this,
             [this](bool checked) { state_.camera_orthographic = checked; });
     connect(register_button, &QPushButton::clicked, this, [this] {
@@ -1489,6 +1684,22 @@ QWidget* MainWindow::build_camera_tab() {
         timeline_->update();
     });
     return page;
+}
+
+void MainWindow::refresh_camera_presets() {
+    if (camera_preset_combo_ == nullptr) {
+        return;
+    }
+    const QString current = camera_preset_combo_->currentText();
+    const QJsonObject presets = load_camera_presets();
+    camera_preset_combo_->blockSignals(true);
+    camera_preset_combo_->clear();
+    camera_preset_combo_->addItems(presets.keys());
+    const int index = camera_preset_combo_->findText(current);
+    if (index >= 0) {
+        camera_preset_combo_->setCurrentIndex(index);
+    }
+    camera_preset_combo_->blockSignals(false);
 }
 
 QWidget* MainWindow::build_light_tab() {
@@ -1732,6 +1943,31 @@ QWidget* MainWindow::build_playback_tab() {
     speed_row->addWidget(speed, 1);
     physics_speed_ = speed;
     layout->addLayout(speed_row);
+
+    auto* audio_row = new QHBoxLayout();
+    audio_row->addWidget(new QLabel(QStringLiteral("Audio")));
+    audio_label_ = new QLabel(state_.audio_name.isEmpty() ? QStringLiteral("None")
+                                                          : state_.audio_name);
+    audio_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    audio_label_->setToolTip(state_.audio_path);
+    audio_row->addWidget(audio_label_, 1);
+    layout->addLayout(audio_row);
+    auto* audio_offset_row = new QHBoxLayout();
+    audio_offset_row->addWidget(new QLabel(QStringLiteral("Offset")));
+    audio_offset_ = make_spin(-3000.0, 3000.0, 1.0, 0, state_.audio_offset_frames);
+    audio_offset_->setToolTip(
+        QStringLiteral("Audio offset in timeline frames. Positive values delay the sound."));
+    audio_offset_row->addWidget(audio_offset_, 1);
+    layout->addLayout(audio_offset_row);
+    auto* audio_volume_row = new QHBoxLayout();
+    audio_volume_row->addWidget(new QLabel(QStringLiteral("Volume")));
+    audio_volume_ = new QSlider(Qt::Horizontal);
+    audio_volume_->setRange(0, 100);
+    audio_volume_->setValue(static_cast<int>(std::lround(state_.audio_volume * 100.0f)));
+    audio_volume_->setToolTip(QStringLiteral("Preview audio volume"));
+    audio_volume_row->addWidget(audio_volume_, 1);
+    layout->addLayout(audio_volume_row);
+
     auto* loop = make_check(QStringLiteral("Loop"), state_.loop_playback);
     auto* jiggle = make_check(QStringLiteral("Jiggle dynamics"), state_.jiggle_enabled);
     auto* vsync = make_check(QStringLiteral("VSync"), state_.vsync);
@@ -1759,6 +1995,12 @@ QWidget* MainWindow::build_playback_tab() {
                 actions[index]->setChecked(true);
             }
         }
+    });
+    connect(audio_offset_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        state_.audio_offset_frames = static_cast<float>(value);
+    });
+    connect(audio_volume_, &QSlider::valueChanged, this, [this](int value) {
+        state_.audio_volume = static_cast<float>(value) / 100.0f;
     });
     connect(loop, &QCheckBox::toggled, this,
             [this](bool checked) { state_.loop_playback = checked; });
@@ -2003,6 +2245,16 @@ void MainWindow::sync_bone_fields() {
     sync_camera_spin(camera_distance_, state_.camera_distance);
     sync_camera_spin(camera_near_clip_, state_.camera_near_clip);
     sync_camera_spin(camera_far_clip_, state_.camera_far_clip);
+    sync_camera_spin(camera_fov_, state_.camera_fov_deg);
+    constexpr float kRadToDeg = 57.29577951308232f;
+    sync_camera_spin(camera_yaw_, state_.camera_yaw * kRadToDeg);
+    sync_camera_spin(camera_pitch_, state_.camera_pitch * kRadToDeg);
+    sync_camera_spin(camera_roll_, state_.camera_roll * kRadToDeg);
+    if (camera_ortho_ != nullptr && !camera_ortho_->hasFocus()) {
+        camera_ortho_->blockSignals(true);
+        camera_ortho_->setChecked(state_.camera_orthographic);
+        camera_ortho_->blockSignals(false);
+    }
     if (camera_parent_model_ != nullptr && !camera_parent_model_->hasFocus()) {
         const int want = state_.camera_parent_model < 0 ? 0 : state_.camera_parent_model + 1;
         if (camera_parent_model_->currentIndex() != want) {
@@ -2028,6 +2280,17 @@ void MainWindow::sync_bone_fields() {
             spin->setValue(state_.camera_follow_offset[static_cast<std::size_t>(i)]);
             spin->blockSignals(false);
         }
+    }
+    if (audio_label_ != nullptr) {
+        audio_label_->setText(state_.audio_name.isEmpty() ? QStringLiteral("None")
+                                                          : state_.audio_name);
+        audio_label_->setToolTip(state_.audio_path);
+    }
+    sync_camera_spin(audio_offset_, state_.audio_offset_frames);
+    if (audio_volume_ != nullptr && !audio_volume_->hasFocus()) {
+        audio_volume_->blockSignals(true);
+        audio_volume_->setValue(static_cast<int>(std::lround(state_.audio_volume * 100.0f)));
+        audio_volume_->blockSignals(false);
     }
     if (model_scale_ != nullptr && !model_scale_->hasFocus()) {
         model_scale_->blockSignals(true);

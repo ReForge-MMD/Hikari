@@ -15,8 +15,11 @@
 #include <cmath>
 #include <iterator>
 #include <limits>
+#include <utility>
 
 #include "hikari/animation/bezier.hpp"
+#include "hikari/audio/audio_player.hpp"
+#include "hikari/audio/audio_track.hpp"
 #include "hikari/core/log.hpp"
 #include "hikari/studio/viewport_chrome.hpp"
 
@@ -343,6 +346,7 @@ bool D3DViewport::load_model(const QString& path) {
         active_model_ = static_cast<int>(models_.size()) - 1;
         motion_player_.reset();
         motion_data_.reset();
+        rebuild_motion_keyframes();
         last_editor_frame_ = -1.0f;
         sync_active_model_state();
         state_.mode = EditorMode::Model;
@@ -473,6 +477,7 @@ void D3DViewport::set_active_model(int index) {
     last_editor_frame_ = -1.0f;
     state_.mode = EditorMode::Model;
     sync_active_model_state();
+    rebuild_motion_keyframes();
     update_stats();
     emit activeModelChanged();
     emit statusMessage(QStringLiteral("Active model: %1").arg(state_.model_name));
@@ -548,6 +553,7 @@ void D3DViewport::remove_active_model() {
     }
     motion_player_.reset();
     motion_data_.reset();
+    rebuild_motion_keyframes();
     last_editor_frame_ = -1.0f;
     sync_active_model_state();
     update_stats();
@@ -639,6 +645,53 @@ bool D3DViewport::save_vpd(const QString& path) {
     return true;
 }
 
+bool D3DViewport::load_audio(const QString& path) {
+    if (path.isEmpty()) {
+        return false;
+    }
+    audio::DecodeResult decoded = audio::decode_audio_file(path.toStdString());
+    if (!decoded.ok()) {
+        emit statusMessage(QStringLiteral("Failed to load audio: %1")
+                               .arg(QString::fromStdString(decoded.error)));
+        return false;
+    }
+    if (!audio_player_) {
+        audio_player_ = std::make_unique<audio::AudioPlayer>();
+    }
+    const double duration = decoded.track.duration_seconds;
+    std::vector<float> peaks = decoded.track.peaks;
+    std::string error;
+    audio_player_->load(std::move(decoded.track), &error);
+    if (!error.empty()) {
+        emit statusMessage(QStringLiteral("Failed to start audio playback: %1")
+                               .arg(QString::fromStdString(error)));
+        return false;
+    }
+    state_.audio_path = path;
+    state_.audio_name = QFileInfo(path).completeBaseName();
+    state_.audio_duration = duration;
+    state_.audio_peaks_per_second =
+        static_cast<double>(audio::kOutputSampleRate) / audio::kPeakBlockFrames;
+    state_.audio_peaks = std::move(peaks);
+    state_.audio_volume = std::clamp(state_.audio_volume, 0.0f, 1.0f);
+    audio_player_->set_volume(state_.audio_volume);
+    audio_playing_ = false;
+    emit statusMessage(QStringLiteral("Loaded audio: %1").arg(state_.audio_name));
+    return true;
+}
+
+void D3DViewport::unload_audio() {
+    if (audio_player_) {
+        audio_player_->unload();
+    }
+    audio_playing_ = false;
+    state_.audio_path.clear();
+    state_.audio_name.clear();
+    state_.audio_duration = 0.0;
+    state_.audio_peaks_per_second = 0.0;
+    state_.audio_peaks.clear();
+}
+
 formats::VmdMotion D3DViewport::build_authored_vmd() const {
     const ModelInstance* model = active_model();
     formats::VmdMotion motion;
@@ -691,7 +744,14 @@ formats::VmdMotion D3DViewport::build_authored_vmd() const {
                 camera.distance = -key.distance;
                 camera.position = key.position;
                 camera.rotation = {key.angles[1], key.angles[0], key.angles[2]};
-                camera.interpolation.fill(20);
+                // VMD stores six interpolation channels for a camera key. The
+                // editor keeps one curve for the key, so mirror it across all
+                // six instead of forcing linear bytes.
+                for (std::size_t channel = 0; channel < 6; ++channel) {
+                    std::copy(key.interpolation.begin(), key.interpolation.end(),
+                              camera.interpolation.begin() +
+                                  static_cast<std::ptrdiff_t>(channel * 4));
+                }
                 camera.fov = static_cast<std::uint32_t>(std::lround(std::max(0.0f, key.fov)));
                 camera.perspective = !state_.camera_orthographic;
                 motion.camera_frames.push_back(camera);
@@ -796,6 +856,7 @@ bool D3DViewport::apply_parsed_motion(const formats::VmdMotion& motion, const QS
     ++state_.keyframe_revision;
     motion_player_.emplace(motion);
     motion_data_ = motion;
+    rebuild_motion_keyframes();
     state_.max_timeline_frame = static_cast<int>(motion_player_->max_frame);
     state_.play_range = {0, state_.max_timeline_frame};
     last_editor_frame_ = -1.0f;
@@ -806,6 +867,56 @@ bool D3DViewport::apply_parsed_motion(const formats::VmdMotion& motion, const QS
     }
     emit statusMessage(QStringLiteral("Loaded motion: %1").arg(label));
     return true;
+}
+
+void D3DViewport::rebuild_motion_keyframes() {
+    state_.motion_keyframes.clear();
+    if (!motion_data_) {
+        return;
+    }
+    const formats::VmdMotion& motion = *motion_data_;
+    for (const auto& frame : motion.camera_frames) {
+        state_.motion_keyframes[QStringLiteral("camera")].insert(frame.frame);
+    }
+    for (const auto& frame : motion.light_frames) {
+        state_.motion_keyframes[QStringLiteral("light")].insert(frame.frame);
+    }
+    for (const auto& frame : motion.shadow_frames) {
+        state_.motion_keyframes[QStringLiteral("shadow")].insert(frame.frame);
+    }
+    for (const auto& frame : motion.ik_frames) {
+        state_.motion_keyframes[QStringLiteral("Disp/IK/OP")].insert(frame.frame);
+    }
+
+    const ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return;
+    }
+    // VMD frames are keyed by the names stored in the file. Map them onto the
+    // timeline row names (English bone names, universal morph names) used by
+    // sync_active_model_state().
+    for (const auto& frame : motion.bone_frames) {
+        const auto index = model->skeleton.find_bone_index(frame.name);
+        if (!index) {
+            continue;
+        }
+        const int bone_index = static_cast<int>(*index);
+        if (bone_index < 0 || bone_index >= state_.model_bone_names.size()) {
+            continue;
+        }
+        state_.motion_keyframes[state_.model_bone_names[bone_index]].insert(frame.frame);
+    }
+    for (const auto& frame : motion.morph_frames) {
+        for (const auto& morph : model->pmx.morphs) {
+            if (morph.name_local != frame.name && morph.name_universal != frame.name) {
+                continue;
+            }
+            const std::string& display =
+                morph.name_universal.empty() ? morph.name_local : morph.name_universal;
+            state_.motion_keyframes[to_qstring(display)].insert(frame.frame);
+            break;
+        }
+    }
 }
 
 HikariMotion D3DViewport::build_hikari_motion() const {
@@ -910,6 +1021,9 @@ bool D3DViewport::save_project(const QString& path) {
     project.scene.camera_follow_offset = state_.camera_follow_offset;
     project.scene.camera_near_clip = state_.camera_near_clip;
     project.scene.camera_far_clip = state_.camera_far_clip;
+    project.scene.audio_path = state_.audio_path;
+    project.scene.audio_offset_frames = state_.audio_offset_frames;
+    project.scene.audio_volume = state_.audio_volume;
     project.scene.light_color = state_.light_color;
     project.scene.light_direction = state_.light_direction;
     project.scene.shadow_mode = state_.shadow_mode;
@@ -992,6 +1106,7 @@ bool D3DViewport::load_project(const QString& path) {
     } else {
         motion_player_.reset();
         motion_data_.reset();
+        rebuild_motion_keyframes();
     }
 
     state_.track_keyframes.clear();
@@ -1018,6 +1133,12 @@ bool D3DViewport::load_project(const QString& path) {
     state_.camera_follow_offset = project->scene.camera_follow_offset;
     state_.camera_near_clip = std::max(project->scene.camera_near_clip, 0.01f);
     state_.camera_far_clip = std::max(project->scene.camera_far_clip, 1.0f);
+    state_.audio_offset_frames = project->scene.audio_offset_frames;
+    state_.audio_volume = std::clamp(project->scene.audio_volume, 0.0f, 1.0f);
+    unload_audio();
+    if (!project->scene.audio_path.isEmpty()) {
+        load_audio(project->scene.audio_path);
+    }
     state_.light_color = project->scene.light_color;
     state_.light_direction = project->scene.light_direction;
     state_.shadow_mode = project->scene.shadow_mode;
@@ -1043,6 +1164,7 @@ void D3DViewport::clear_model() {
     state_.camera_parent_bone = 0;
     motion_player_.reset();
     motion_data_.reset();
+    rebuild_motion_keyframes();
     last_editor_frame_ = -1.0f;
     sync_active_model_state();
     update_stats();
@@ -1732,6 +1854,8 @@ void D3DViewport::tick_impl() {
         state_.jump_frame_input = QString::number(static_cast<int>(state_.current_frame));
     }
 
+    sync_audio_playback();
+
     if (state_.model_delete_requested) {
         state_.model_delete_requested = false;
         remove_active_model();
@@ -1915,6 +2039,31 @@ Quat D3DViewport::camera_orientation() const {
     // The reference attaches the camera to the bone by composing the bone
     // rotation outside the camera rotation.
     return (bone_rotation * orientation).normalize();
+}
+
+void D3DViewport::sync_audio_playback() {
+    if (!audio_player_ || !audio_player_->has_track()) {
+        audio_playing_ = false;
+        return;
+    }
+    state_.audio_volume = std::clamp(state_.audio_volume, 0.0f, 1.0f);
+    audio_player_->set_volume(state_.audio_volume);
+    const double expected =
+        (static_cast<double>(state_.current_frame) - state_.audio_offset_frames) / 30.0;
+    const bool in_range =
+        expected >= 0.0 && expected < audio_player_->duration_seconds();
+    if (state_.is_playing && in_range) {
+        // The motion clock is authoritative. Restart the audio voice only when
+        // playback starts, wraps, or drifts far enough to be audible.
+        if (!audio_playing_ ||
+            std::abs(audio_player_->position_seconds() - expected) > 0.2) {
+            audio_player_->play(expected);
+            audio_playing_ = true;
+        }
+    } else if (audio_playing_) {
+        audio_player_->stop();
+        audio_playing_ = false;
+    }
 }
 
 bool D3DViewport::physics_active() const {
@@ -2595,8 +2744,10 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
 
     // Camera placement marker. The eye sits at the centre of its own view, so
     // the marker is placed just past the near plane and drawn as a pixel-sized
-    // diamond with crosshair ticks.
-    if (state_.mode == EditorMode::Camera || state_.camera_follow) {
+    // diamond with crosshair ticks. At zero or negative distance the eye is at
+    // or past the pivot, where the marker would sit on top of the model.
+    if ((state_.mode == EditorMode::Camera || state_.camera_follow) &&
+        state_.camera_distance > 0.0f) {
         const Vec3 forward = (camera_.target - camera_.position).normalize();
         const Vec3 center =
             camera_.position + forward * std::max(camera_.near_z * 1.5f, 0.05f);

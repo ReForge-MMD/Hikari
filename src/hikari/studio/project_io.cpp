@@ -438,6 +438,9 @@ QByteArray hkp_to_json(const ProjectData& project) {
         to_json(project.scene.camera_follow_offset);
     scene[QStringLiteral("camera_near_clip")] = project.scene.camera_near_clip;
     scene[QStringLiteral("camera_far_clip")] = project.scene.camera_far_clip;
+    scene[QStringLiteral("audio_path")] = project.scene.audio_path;
+    scene[QStringLiteral("audio_offset_frames")] = project.scene.audio_offset_frames;
+    scene[QStringLiteral("audio_volume")] = project.scene.audio_volume;
     scene[QStringLiteral("light_color")] = to_json(project.scene.light_color);
     scene[QStringLiteral("light_direction")] = to_json(project.scene.light_direction);
     scene[QStringLiteral("shadow_mode")] = static_cast<int>(project.scene.shadow_mode);
@@ -533,6 +536,12 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
         static_cast<float>(scene.value(QStringLiteral("camera_near_clip")).toDouble(0.1));
     project.scene.camera_far_clip =
         static_cast<float>(scene.value(QStringLiteral("camera_far_clip")).toDouble(1000.0));
+    project.scene.audio_path =
+        scene.value(QStringLiteral("audio_path")).toString();
+    project.scene.audio_offset_frames =
+        static_cast<float>(scene.value(QStringLiteral("audio_offset_frames")).toDouble(0.0));
+    project.scene.audio_volume =
+        static_cast<float>(scene.value(QStringLiteral("audio_volume")).toDouble(1.0));
     project.scene.light_color =
         read_vec3(scene.value(QStringLiteral("light_color")), {0.6f, 0.6f, 0.6f});
     project.scene.light_direction =
