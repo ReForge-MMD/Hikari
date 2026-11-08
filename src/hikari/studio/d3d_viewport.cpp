@@ -2152,12 +2152,21 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
         }
     }
     last_editor_frame_ = -1.0f;
-    for (int frame = start; frame <= end; ++frame) {
-        prepare_export_frame(frame, fps);
+    constexpr double kTimelineFps = 30.0;
+    const double start_seconds = static_cast<double>(start) / kTimelineFps;
+    const double end_seconds = static_cast<double>(end + 1) / kTimelineFps;
+    const int total = std::max(
+        1, static_cast<int>(std::llround((end_seconds - start_seconds) *
+                                         static_cast<double>(std::max(fps, 1)))));
+    for (int index = 0; index < total; ++index) {
+        const double frame = static_cast<double>(start) +
+                             static_cast<double>(index) * kTimelineFps /
+                                 static_cast<double>(std::max(fps, 1));
+        prepare_export_frame(static_cast<float>(frame), fps);
         try {
             const auto capture = context_->capture_scene();
             const QString file = QDir(directory).filePath(
-                QStringLiteral("frame_%1.bmp").arg(frame, 5, 10, QLatin1Char('0')));
+                QStringLiteral("frame_%1.bmp").arg(index, 5, 10, QLatin1Char('0')));
             core::save_bmp(to_wstring(file), capture.width, capture.height, capture.rgba);
         } catch (...) {
         }
