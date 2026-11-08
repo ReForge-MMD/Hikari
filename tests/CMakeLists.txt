@@ -21,14 +21,19 @@ target_link_libraries(hikari_tests
 
 if(HIKARI_BUILD_STUDIO)
   target_sources(hikari_tests PRIVATE
+    ../src/hikari/studio/app_state.cpp
+    ../src/hikari/studio/localization.cpp
     ../src/hikari/studio/project_io.cpp
+    test_frustum.cpp
     test_project.cpp
+    test_state.cpp
   )
-  target_link_libraries(hikari_tests PRIVATE Qt6::Core)
+  target_link_libraries(hikari_tests PRIVATE Qt6::Widgets Qt6::Gui Qt6::Core)
   add_custom_command(TARGET hikari_tests POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "$<TARGET_FILE:Qt6::Core>" "$<TARGET_FILE_DIR:hikari_tests>"
-    COMMENT "Copying the Qt Core runtime next to hikari_tests.exe"
+      "$<TARGET_FILE:Qt6::Core>" "$<TARGET_FILE:Qt6::Gui>"
+      "$<TARGET_FILE:Qt6::Widgets>" "$<TARGET_FILE_DIR:hikari_tests>"
+    COMMENT "Copying the Qt runtime next to hikari_tests.exe"
   )
 endif()
 

@@ -15,12 +15,14 @@
 #include <cmath>
 #include <iterator>
 #include <limits>
+#include <set>
 #include <utility>
 
 #include "hikari/animation/bezier.hpp"
 #include "hikari/audio/audio_player.hpp"
 #include "hikari/audio/audio_track.hpp"
 #include "hikari/core/log.hpp"
+#include "hikari/render/frustum.hpp"
 #include "hikari/studio/viewport_chrome.hpp"
 
 namespace hikari::studio {
@@ -104,6 +106,42 @@ Vec3 subset_world_center(const std::vector<std::uint32_t>& indices,
     return samples == 0 ? Vec3::zero() : sum / static_cast<float>(samples);
 }
 
+// Sampled skinned bounds of one subset. A 25 percent radius margin keeps a
+// subset that straddles the screen edge from being culled by sampling noise.
+render::BoundingSphere subset_world_bounds(const std::vector<std::uint32_t>& indices,
+                                           const std::vector<render::ModelVertex>& vertices,
+                                           const render::MeshSubset& subset,
+                                           const std::vector<Mat4>& palette) {
+    render::BoundingSphere sphere;
+    if (subset.index_count == 0 || indices.empty()) {
+        return sphere;
+    }
+    const std::size_t step = std::max<std::size_t>(1, subset.index_count / 256);
+    Vec3 minimum(1.0e30f, 1.0e30f, 1.0e30f);
+    Vec3 maximum(-1.0e30f, -1.0e30f, -1.0e30f);
+    bool found = false;
+    for (std::size_t i = 0; i < subset.index_count; i += step) {
+        const std::uint32_t vertex_index = indices[subset.index_start + i];
+        if (vertex_index >= vertices.size()) {
+            continue;
+        }
+        const Vec3 point = skinned_position(vertices[vertex_index], palette);
+        minimum.x = std::min(minimum.x, point.x);
+        minimum.y = std::min(minimum.y, point.y);
+        minimum.z = std::min(minimum.z, point.z);
+        maximum.x = std::max(maximum.x, point.x);
+        maximum.y = std::max(maximum.y, point.y);
+        maximum.z = std::max(maximum.z, point.z);
+        found = true;
+    }
+    if (!found) {
+        return sphere;
+    }
+    sphere.center = (minimum + maximum) * 0.5f;
+    sphere.radius = (maximum - minimum).length() * 0.5f * 1.25f;
+    return sphere;
+}
+
 Vec3 bone_tail_world(const animation::Skeleton& skeleton, std::size_t index) {
     const animation::BoneNode& bone = skeleton.bones[index];
     if (bone.has_tail_bone && bone.tail_bone < skeleton.bones.size()) {
@@ -163,10 +201,179 @@ D3DViewport::D3DViewport(StudioAppState& state, QWidget* parent)
     connect(gizmo_, &ViewGizmo::translateRequested, this, &D3DViewport::translate_selection);
     connect(gizmo_, &ViewGizmo::localModeChanged, this,
             [this](bool local) { state_.is_local_coord = local; });
+    install_scene_callbacks();
     place_gizmo();
 }
 
 D3DViewport::~D3DViewport() = default;
+
+void D3DViewport::install_scene_callbacks() {
+    state_.capture_scene = [this] { sync_model_transforms(); };
+    state_.restore_scene = [this] { restore_model_transforms(); };
+    state_.capture_motion = [this] { return copy_motion_data(); };
+    state_.restore_motion = [this](const formats::VmdMotion& motion) { set_motion_data(motion); };
+}
+
+void D3DViewport::sync_model_transforms() {
+    state_.model_transforms.clear();
+    state_.model_transforms.reserve(models_.size());
+    for (const auto& model : models_) {
+        ModelTransformState transform;
+        transform.offset = model->offset;
+        transform.rotation = model->rotation;
+        transform.scale = model->scale;
+        transform.visible = model->visible;
+        state_.model_transforms.push_back(transform);
+    }
+    state_.snapshot_active_model = active_model_;
+}
+
+void D3DViewport::restore_model_transforms() {
+    const std::size_t count = std::min(models_.size(), state_.model_transforms.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const ModelTransformState& transform = state_.model_transforms[i];
+        ModelInstance& model = *models_[i];
+        model.offset = transform.offset;
+        model.rotation = transform.rotation;
+        model.scale = transform.scale;
+        model.visible = transform.visible;
+    }
+    if (ModelInstance* model = active_model(); model != nullptr) {
+        state_.model_offset = model->offset;
+        state_.model_rotation = model->rotation.to_array();
+        state_.model_scale = model->scale;
+        state_.model_visible = model->visible;
+        state_.model_scale_dirty = false;
+        state_.model_transform_dirty = false;
+    } else {
+        sync_active_model_state();
+    }
+    if (state_.audio_path != loaded_audio_path_) {
+        if (state_.audio_path.isEmpty()) {
+            unload_audio();
+        } else {
+            load_audio(state_.audio_path);
+        }
+    }
+    last_editor_frame_ = -1.0f;
+    state_.track_keys_dirty = true;
+    ++state_.keyframe_revision;
+}
+
+void D3DViewport::compute_subset_bounds(ModelInstance& model) {
+    model.subset_bounds.clear();
+    model.subset_bounds.reserve(model.mesh.subsets.size());
+    const auto& vertices = model.mesh.base_vertices;
+    const auto& indices = model.pmx.indices;
+    for (const render::MeshSubset& subset : model.mesh.subsets) {
+        Vec3 minimum(1.0e30f, 1.0e30f, 1.0e30f);
+        Vec3 maximum(-1.0e30f, -1.0e30f, -1.0e30f);
+        bool found = false;
+        const std::size_t end = std::min<std::size_t>(
+            static_cast<std::size_t>(subset.index_start) + subset.index_count, indices.size());
+        for (std::size_t i = subset.index_start; i < end; ++i) {
+            const std::uint32_t vertex_index = indices[i];
+            if (vertex_index >= vertices.size()) {
+                continue;
+            }
+            const Vec3 position = Vec3::from_array(vertices[vertex_index].position);
+            minimum.x = std::min(minimum.x, position.x);
+            minimum.y = std::min(minimum.y, position.y);
+            minimum.z = std::min(minimum.z, position.z);
+            maximum.x = std::max(maximum.x, position.x);
+            maximum.y = std::max(maximum.y, position.y);
+            maximum.z = std::max(maximum.z, position.z);
+            found = true;
+        }
+        SubsetBounds bounds;
+        if (found) {
+            bounds.center = (minimum + maximum) * 0.5f;
+            bounds.radius = (maximum - minimum).length() * 0.5f;
+        } else if (!vertices.empty()) {
+            bounds.center = Vec3::from_array(vertices.front().position);
+            bounds.radius = 0.0f;
+        }
+        model.subset_bounds.push_back(bounds);
+    }
+}
+
+void D3DViewport::rebuild_motion_key_refs() {
+    state_.motion_key_refs.clear();
+    if (!motion_data_) {
+        return;
+    }
+    const formats::VmdMotion& motion = *motion_data_;
+    for (std::size_t i = 0; i < motion.camera_frames.size(); ++i) {
+        const auto& frame = motion.camera_frames[i];
+        state_.motion_key_refs[QStringLiteral("camera")][frame.frame] = {MotionChannel::Camera, i};
+    }
+    for (std::size_t i = 0; i < motion.light_frames.size(); ++i) {
+        const auto& frame = motion.light_frames[i];
+        state_.motion_key_refs[QStringLiteral("light")][frame.frame] = {MotionChannel::Light, i};
+    }
+    for (std::size_t i = 0; i < motion.shadow_frames.size(); ++i) {
+        const auto& frame = motion.shadow_frames[i];
+        state_.motion_key_refs[QStringLiteral("shadow")][frame.frame] = {MotionChannel::Shadow, i};
+    }
+    for (std::size_t i = 0; i < motion.ik_frames.size(); ++i) {
+        const auto& frame = motion.ik_frames[i];
+        state_.motion_key_refs[QStringLiteral("Disp/IK/OP")][frame.frame] = {MotionChannel::Ik, i};
+    }
+
+    const ModelInstance* model = active_model();
+    if (model == nullptr) {
+        return;
+    }
+    for (std::size_t i = 0; i < motion.bone_frames.size(); ++i) {
+        const auto& frame = motion.bone_frames[i];
+        const auto index = model->skeleton.find_bone_index(frame.name);
+        if (!index) {
+            continue;
+        }
+        const int bone_index = static_cast<int>(*index);
+        if (bone_index < 0 || bone_index >= state_.model_bone_names.size()) {
+            continue;
+        }
+        state_.motion_key_refs[state_.model_bone_names[bone_index]][frame.frame] = {
+            MotionChannel::Bone, i};
+    }
+    for (std::size_t i = 0; i < motion.morph_frames.size(); ++i) {
+        const auto& frame = motion.morph_frames[i];
+        for (const auto& morph : model->pmx.morphs) {
+            if (morph.name_local != frame.name && morph.name_universal != frame.name) {
+                continue;
+            }
+            const std::string& display =
+                morph.name_universal.empty() ? morph.name_local : morph.name_universal;
+            state_.motion_key_refs[to_qstring(display)][frame.frame] = {MotionChannel::Morph, i};
+            break;
+        }
+    }
+}
+
+std::optional<formats::VmdMotion> D3DViewport::copy_motion_data() const {
+    if (!motion_data_) {
+        return std::nullopt;
+    }
+    return *motion_data_;
+}
+
+void D3DViewport::set_motion_data(formats::VmdMotion motion) {
+    motion_data_ = std::move(motion);
+    motion_player_.emplace(*motion_data_);
+    rebuild_motion_keyframes();
+    std::set<std::pair<QString, unsigned int>> filtered;
+    for (const auto& key : state_.selected_motion_keyframes) {
+        const auto track = state_.motion_keyframes.find(key.first);
+        if (track != state_.motion_keyframes.end() && track.value().contains(key.second)) {
+            filtered.insert(key);
+        }
+    }
+    state_.selected_motion_keyframes = std::move(filtered);
+    last_editor_frame_ = -1.0f;
+    state_.track_keys_dirty = true;
+    ++state_.keyframe_revision;
+}
 
 bool D3DViewport::initialize() {
     if (initialized_) {
@@ -325,6 +532,7 @@ bool D3DViewport::load_model(const QString& path) {
                                        (minimum[2] + maximum[2]) * 0.5f);
         instance->shadow_radius =
             std::max({(maximum[0] - minimum[0]) * 0.5f, (maximum[2] - minimum[2]) * 0.5f, 2.0f});
+        compute_subset_bounds(*instance);
         // Every model keeps its authored origin. MMD scenes rely on this: stages and
         // characters are authored around world zero and must line up without an offset.
         instance->offset = Vec3(0.0f, 0.0f, 0.0f);
@@ -412,6 +620,9 @@ void D3DViewport::sync_active_model_state() {
         state_.model_name.clear();
         state_.model_scale = 1.0f;
         state_.model_scale_dirty = false;
+        state_.model_transform_dirty = false;
+        state_.model_offset = Vec3::zero();
+        state_.model_rotation = Quat::identity().to_array();
         state_.model_bone_names.clear();
         state_.selected_bone_idx.reset();
         state_.morph_weights.clear();
@@ -429,6 +640,9 @@ void D3DViewport::sync_active_model_state() {
     state_.model_name = model->name;
     state_.model_scale = model->scale;
     state_.model_scale_dirty = false;
+    state_.model_transform_dirty = false;
+    state_.model_offset = model->offset;
+    state_.model_rotation = model->rotation.to_array();
     state_.model_visible = model->visible;
     state_.model_bone_names.clear();
     for (std::size_t i = 0; i < model->skeleton.bones.size(); ++i) {
@@ -490,6 +704,7 @@ void D3DViewport::set_model_visible(int index, bool visible) {
     models_[static_cast<std::size_t>(index)]->visible = visible;
     if (index == active_model_) {
         state_.model_visible = visible;
+        state_.model_transform_dirty = true;
     }
 }
 
@@ -507,8 +722,55 @@ void D3DViewport::set_model_scale(int index, float scale) {
         state_.model_scale = scale;
         // Keep the edited value visible until the user registers a scale key.
         state_.model_scale_dirty = true;
+        state_.model_transform_dirty = true;
     }
     state_.set_status(QStringLiteral("Model scale: %1x").arg(scale, 0, 'f', 3));
+}
+
+void D3DViewport::set_model_position(int index, const std::array<float, 3>& position) {
+    if (index < 0 || index >= static_cast<int>(models_.size())) {
+        return;
+    }
+    ModelInstance& model = *models_[static_cast<std::size_t>(index)];
+    const Vec3 value = Vec3::from_array(position);
+    if ((model.offset - value).length_squared() < 1.0e-10f) {
+        return;
+    }
+    model.offset = value;
+    if (index == active_model_) {
+        state_.model_offset = value;
+        state_.model_transform_dirty = true;
+    }
+    state_.set_status(QStringLiteral("Model position: %1, %2, %3")
+                          .arg(value.x, 0, 'f', 2)
+                          .arg(value.y, 0, 'f', 2)
+                          .arg(value.z, 0, 'f', 2));
+}
+
+void D3DViewport::set_model_rotation(int index, const Quat& rotation) {
+    if (index < 0 || index >= static_cast<int>(models_.size())) {
+        return;
+    }
+    ModelInstance& model = *models_[static_cast<std::size_t>(index)];
+    const Quat value = rotation.normalize();
+    const float dot = std::abs(model.rotation.x * value.x + model.rotation.y * value.y +
+                               model.rotation.z * value.z + model.rotation.w * value.w);
+    if (dot > 1.0f - 1.0e-6f) {
+        return;
+    }
+    model.rotation = value;
+    if (index == active_model_) {
+        state_.model_rotation = value.to_array();
+        state_.model_transform_dirty = true;
+    }
+    state_.set_status(QStringLiteral("Model rotation updated"));
+}
+
+void D3DViewport::set_model_transform(int index, const std::array<float, 3>& position,
+                                      const Quat& rotation, float scale) {
+    set_model_position(index, position);
+    set_model_rotation(index, rotation);
+    set_model_scale(index, scale);
 }
 
 void D3DViewport::remove_active_model() {
@@ -668,6 +930,7 @@ bool D3DViewport::load_audio(const QString& path) {
         return false;
     }
     state_.audio_path = path;
+    loaded_audio_path_ = path;
     state_.audio_name = QFileInfo(path).completeBaseName();
     state_.audio_duration = duration;
     state_.audio_peaks_per_second =
@@ -685,6 +948,7 @@ void D3DViewport::unload_audio() {
         audio_player_->unload();
     }
     audio_playing_ = false;
+    loaded_audio_path_.clear();
     state_.audio_path.clear();
     state_.audio_name.clear();
     state_.audio_duration = 0.0;
@@ -871,6 +1135,7 @@ bool D3DViewport::apply_parsed_motion(const formats::VmdMotion& motion, const QS
 
 void D3DViewport::rebuild_motion_keyframes() {
     state_.motion_keyframes.clear();
+    state_.motion_key_refs.clear();
     if (!motion_data_) {
         return;
     }
@@ -890,6 +1155,7 @@ void D3DViewport::rebuild_motion_keyframes() {
 
     const ModelInstance* model = active_model();
     if (model == nullptr) {
+        rebuild_motion_key_refs();
         return;
     }
     // VMD frames are keyed by the names stored in the file. Map them onto the
@@ -917,6 +1183,7 @@ void D3DViewport::rebuild_motion_keyframes() {
             break;
         }
     }
+    rebuild_motion_key_refs();
 }
 
 HikariMotion D3DViewport::build_hikari_motion() const {
@@ -929,10 +1196,10 @@ HikariMotion D3DViewport::build_hikari_motion() const {
             ModelTransformKey transform;
             transform.frame = frame;
             transform.scale = key.scale;
-            if (model != nullptr) {
-                transform.position = model->offset.to_array();
-                transform.visible = model->visible;
-            }
+            transform.position = key.position;
+            const Vec3 euler = Quat::from_array(key.rotation).to_euler_xyz();
+            transform.rotation = euler.to_array();
+            transform.visible = key.visible;
             result.model_keys.push_back(transform);
         }
     } else if (model != nullptr) {
@@ -940,6 +1207,7 @@ HikariMotion D3DViewport::build_hikari_motion() const {
         transform.frame = 0;
         transform.scale = model->scale;
         transform.position = model->offset.to_array();
+        transform.rotation = model->rotation.to_euler_xyz().to_array();
         transform.visible = model->visible;
         result.model_keys.push_back(transform);
     }
@@ -982,6 +1250,9 @@ bool D3DViewport::load_motion_hkm(const QString& path) {
         for (const auto& transform : motion->model_keys) {
             TrackKeyframe key;
             key.scale = transform.scale;
+            key.position = transform.position;
+            key.rotation = Quat::from_euler_xyz(Vec3::from_array(transform.rotation)).to_array();
+            key.visible = transform.visible;
             track[transform.frame] = key;
         }
         state_.max_timeline_frame =
@@ -989,11 +1260,19 @@ bool D3DViewport::load_motion_hkm(const QString& path) {
                      static_cast<int>(motion->model_keys.back().frame));
         state_.play_range.second = state_.max_timeline_frame;
         if (ModelInstance* model = active_model()) {
-            model->scale = motion->model_keys.front().scale;
+            const ModelTransformKey& first = motion->model_keys.front();
+            model->scale = first.scale;
+            model->offset = Vec3::from_array(first.position);
+            model->rotation = Quat::from_euler_xyz(Vec3::from_array(first.rotation)).normalize();
+            model->visible = first.visible;
             state_.model_scale = model->scale;
+            state_.model_offset = model->offset;
+            state_.model_rotation = model->rotation.to_array();
+            state_.model_visible = model->visible;
         }
     }
     state_.model_scale_dirty = false;
+    state_.model_transform_dirty = false;
     state_.track_keys_dirty = true;
     emit statusMessage(QStringLiteral("Loaded Hikari motion: %1").arg(path));
     return true;
@@ -1037,6 +1316,7 @@ bool D3DViewport::save_project(const QString& path) {
         entry.path = model->path;
         entry.name = model->name;
         entry.offset = model->offset;
+        entry.rotation = model->rotation;
         entry.scale = model->scale;
         entry.visible = model->visible;
         project.models.push_back(std::move(entry));
@@ -1088,6 +1368,7 @@ bool D3DViewport::load_project(const QString& path) {
         }
         ModelInstance& model = *models_.back();
         model.offset = entry.offset;
+        model.rotation = entry.rotation.normalize();
         model.scale = entry.scale;
         model.visible = entry.visible;
     }
@@ -1711,7 +1992,7 @@ void D3DViewport::reset_camera() {
         return;
     }
     const Vec3 center =
-        (model->bounds_min + model->bounds_max) * 0.5f * model->scale + model->offset;
+        model->model_point(model->bounds_center());
     const float height =
         std::max((model->bounds_max.y - model->bounds_min.y) * model->scale, 1.0f);
     const float radius = std::max(model->shadow_radius * model->scale, 1.0f);
@@ -1958,15 +2239,14 @@ void D3DViewport::update_camera() {
         if (const ModelInstance* model = active_model()) {
             bool resolved = false;
             if (state_.camera_target == CameraTarget::Model) {
-                focus = (model->bounds_min + model->bounds_max) * 0.5f * model->scale +
-                        model->offset;
+                focus = model->model_point(model->bounds_center());
                 resolved = true;
             } else if (state_.camera_target == CameraTarget::SelectedBone &&
                        state_.selected_bone_idx) {
                 const std::size_t index =
                     static_cast<std::size_t>(*state_.selected_bone_idx);
                 if (index < model->skeleton.world_positions.size()) {
-                    focus = model->skeleton.world_positions[index] * model->scale + model->offset;
+                    focus = model->model_point(model->skeleton.world_positions[index]);
                     resolved = true;
                 }
             }
@@ -2020,8 +2300,8 @@ bool D3DViewport::camera_follow_state(Vec3& bone_position, Quat& rotation,
         return false;
     }
     const auto index = static_cast<std::size_t>(bone_index);
-    bone_position = parent.skeleton.world_positions[index] * parent.scale + parent.offset;
-    rotation = parent.skeleton.world_rotations[index];
+    bone_position = parent.model_point(parent.skeleton.world_positions[index]);
+    rotation = (parent.rotation * parent.skeleton.world_rotations[index]).normalize();
     scale = std::max(parent.scale, 1.0e-4f);
     return true;
 }
@@ -2085,9 +2365,10 @@ void D3DViewport::evaluate_frame(float frame) {
         model->skeleton.update_transforms();
     }
     if (frame != last_editor_frame_) {
-        // A pending scale edit belongs to the frame where it was made. Moving the
-        // playhead hands control back to the authored scale track.
+        // A pending transform edit belongs to the frame where it was made. Moving
+        // the playhead hands control back to the authored transform track.
         state_.model_scale_dirty = false;
+        state_.model_transform_dirty = false;
     }
     const float evaluated =
         motion_player_ && motion_player_->max_frame > 0
@@ -2372,9 +2653,19 @@ void D3DViewport::apply_editor_tracks(ModelInstance* model, float frame,
         };
 
         if (track == QStringLiteral("model scale")) {
-            if (model != nullptr && !state_.model_scale_dirty) {
+            if (model != nullptr && !state_.model_transform_dirty) {
+                model->offset = Vec3::from_array(mix3(first->position, second->position));
+                model->rotation =
+                    Quat::from_array(first->rotation)
+                        .slerp(Quat::from_array(second->rotation), ease)
+                        .normalize();
                 model->scale = std::clamp(mix(first->scale, second->scale), 0.05f, 20.0f);
+                model->visible = first->visible;
+                state_.model_offset = model->offset;
+                state_.model_rotation = model->rotation.to_array();
                 state_.model_scale = model->scale;
+                state_.model_visible = model->visible;
+                state_.model_scale_dirty = false;
             }
             continue;
         }
@@ -2514,6 +2805,333 @@ void D3DViewport::apply_material_morphs(ModelInstance& model,
     }
 }
 
+std::optional<TrackKeyframe> D3DViewport::bake_motion_key(const QString& track,
+                                                          unsigned int frame) {
+    if (!motion_player_ || !motion_data_) {
+        return std::nullopt;
+    }
+    ModelInstance* model = active_model();
+    const auto refs = state_.motion_key_refs.find(track);
+    if (refs == state_.motion_key_refs.end()) {
+        return std::nullopt;
+    }
+    const auto ref = refs.value().find(frame);
+    if (ref == refs.value().end()) {
+        return std::nullopt;
+    }
+    constexpr std::array<std::uint8_t, 4> linear{20, 20, 20, 20};
+    const auto curve_from_vmd = [](const auto& bytes) {
+        return std::array<std::uint8_t, 4>{bytes[0], bytes[4], bytes[8], bytes[12]};
+    };
+
+    TrackKeyframe key;
+    key.interpolation = linear;
+    const MotionKeyRef reference = ref.value();
+    switch (reference.channel) {
+    case MotionChannel::Camera: {
+        const auto sample = motion_player_->evaluate_scene(static_cast<float>(frame));
+        if (!sample || !sample->camera) {
+            return std::nullopt;
+        }
+        key.position = sample->camera->position;
+        key.angles = {sample->camera->rotation[1], sample->camera->rotation[0],
+                      sample->camera->rotation[2]};
+        key.distance = -sample->camera->distance;
+        key.fov = sample->camera->fov;
+        const auto& vmd_frame = motion_data_->camera_frames[reference.index];
+        key.interpolation = curve_from_vmd(vmd_frame.interpolation);
+        break;
+    }
+    case MotionChannel::Light: {
+        const auto sample = motion_player_->evaluate_scene(static_cast<float>(frame));
+        if (!sample || !sample->light) {
+            return std::nullopt;
+        }
+        key.position = sample->light->color;
+        key.angles = sample->light->direction;
+        break;
+    }
+    case MotionChannel::Shadow: {
+        const auto sample = motion_player_->evaluate_scene(static_cast<float>(frame));
+        if (!sample || !sample->shadow) {
+            return std::nullopt;
+        }
+        key.weight = static_cast<float>(sample->shadow->mode);
+        key.distance = sample->shadow->distance;
+        break;
+    }
+    case MotionChannel::Ik: {
+        if (model == nullptr) {
+            return std::nullopt;
+        }
+        animation::Skeleton scratch = model->skeleton;
+        motion_player_->apply_ik(static_cast<float>(frame), scratch);
+        for (std::size_t i = 0;
+             i < scratch.ik_enabled.size() && i < model->skeleton.bones.size(); ++i) {
+            key.ik_enabled.insert(to_qstring(model->skeleton.bones[i].name),
+                                  scratch.ik_enabled[i]);
+        }
+        break;
+    }
+    case MotionChannel::Bone: {
+        if (model == nullptr) {
+            return std::nullopt;
+        }
+        const auto& vmd_frame = motion_data_->bone_frames[reference.index];
+        const auto bone = model->skeleton.find_bone_index(vmd_frame.name);
+        if (!bone) {
+            return std::nullopt;
+        }
+        animation::Skeleton scratch = model->skeleton;
+        animation::MorphEvaluator morphs = model->morphs;
+        motion_player_->evaluate_pose(static_cast<float>(frame), scratch, morphs);
+        motion_player_->apply_ik(static_cast<float>(frame), scratch);
+        key.position = scratch.local_translations[*bone].to_array();
+        key.rotation = scratch.local_rotations[*bone].to_array();
+        key.interpolation = curve_from_vmd(vmd_frame.interpolation);
+        break;
+    }
+    case MotionChannel::Morph: {
+        if (model == nullptr) {
+            return std::nullopt;
+        }
+        const auto& vmd_frame = motion_data_->morph_frames[reference.index];
+        const formats::PmxMorph* target = nullptr;
+        for (const auto& morph : model->pmx.morphs) {
+            if (morph.name_local == vmd_frame.name || morph.name_universal == vmd_frame.name) {
+                target = &morph;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            return std::nullopt;
+        }
+        std::vector<const formats::VmdMorphFrame*> morph_track;
+        for (const auto& frame_key : motion_data_->morph_frames) {
+            if (frame_key.name == target->name_local ||
+                frame_key.name == target->name_universal) {
+                morph_track.push_back(&frame_key);
+            }
+        }
+        if (morph_track.empty()) {
+            return std::nullopt;
+        }
+        std::stable_sort(morph_track.begin(), morph_track.end(),
+                         [](const auto* a, const auto* b) { return a->frame < b->frame; });
+        float weight = morph_track.front()->weight;
+        if (frame >= morph_track.back()->frame) {
+            weight = morph_track.back()->weight;
+        } else if (frame > morph_track.front()->frame) {
+            for (std::size_t i = 1; i < morph_track.size(); ++i) {
+                if (morph_track[i]->frame < frame) {
+                    continue;
+                }
+                const auto* previous = morph_track[i - 1];
+                const auto* next = morph_track[i];
+                const float span =
+                    static_cast<float>(next->frame) - static_cast<float>(previous->frame);
+                const float t =
+                    span > 0.0f ? (static_cast<float>(frame) - previous->frame) / span : 0.0f;
+                weight = previous->weight + (next->weight - previous->weight) * t;
+                break;
+            }
+        }
+        key.weight = weight;
+        break;
+    }
+    }
+    return key;
+}
+
+void D3DViewport::bake_motion_keys(
+    const std::set<std::pair<QString, unsigned int>>& keys) {
+    // Chosen policy: loaded VMD data keeps ownership of playback. Baking copies
+    // the sampled value at the selected frame into an authored key, which then
+    // takes priority through the normal editor track pipeline.
+    if (keys.empty() || !motion_data_) {
+        return;
+    }
+    std::vector<std::pair<QString, unsigned int>> ordered(keys.begin(), keys.end());
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        return a.second != b.second ? a.second < b.second : a.first < b.first;
+    });
+    std::vector<std::pair<QString, unsigned int>> baked;
+    std::vector<TrackKeyframe> values;
+    for (const auto& entry : ordered) {
+        if (auto key = bake_motion_key(entry.first, entry.second)) {
+            baked.push_back(entry);
+            values.push_back(std::move(*key));
+        }
+    }
+    if (baked.empty()) {
+        emit statusMessage(QStringLiteral("No VMD keys could be baked"));
+        return;
+    }
+    state_.push_undo_snapshot();
+    state_.selected_keyframes.clear();
+    state_.selected_motion_keyframes.clear();
+    for (std::size_t i = 0; i < baked.size(); ++i) {
+        state_.track_keyframes[baked[i].first][baked[i].second] = values[i];
+        state_.selected_keyframes.insert(baked[i]);
+    }
+    state_.track_keys_dirty = true;
+    ++state_.keyframe_revision;
+    last_editor_frame_ = -1.0f;
+    emit statusMessage(QStringLiteral("Baked %1 VMD keyframe(s) into authored tracks")
+                           .arg(static_cast<int>(baked.size())));
+}
+
+void D3DViewport::delete_motion_keys(
+    const std::set<std::pair<QString, unsigned int>>& keys) {
+    if (keys.empty() || !motion_data_) {
+        return;
+    }
+    std::map<MotionChannel, std::vector<std::size_t>> by_channel;
+    for (const auto& entry : keys) {
+        const auto track = state_.motion_key_refs.find(entry.first);
+        if (track == state_.motion_key_refs.end()) {
+            continue;
+        }
+        const auto ref = track.value().find(entry.second);
+        if (ref == track.value().end()) {
+            continue;
+        }
+        by_channel[ref.value().channel].push_back(ref.value().index);
+    }
+    if (by_channel.empty()) {
+        return;
+    }
+    state_.begin_motion_edit();
+    state_.push_undo_snapshot();
+
+    formats::VmdMotion motion = *motion_data_;
+    const auto erase_indices = [](auto& frames, std::vector<std::size_t>& indices) {
+        std::sort(indices.begin(), indices.end(), std::greater<>());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        for (const std::size_t index : indices) {
+            if (index < frames.size()) {
+                frames.erase(frames.begin() + static_cast<std::ptrdiff_t>(index));
+            }
+        }
+    };
+    if (auto it = by_channel.find(MotionChannel::Camera); it != by_channel.end()) {
+        erase_indices(motion.camera_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Light); it != by_channel.end()) {
+        erase_indices(motion.light_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Shadow); it != by_channel.end()) {
+        erase_indices(motion.shadow_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Ik); it != by_channel.end()) {
+        erase_indices(motion.ik_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Bone); it != by_channel.end()) {
+        erase_indices(motion.bone_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Morph); it != by_channel.end()) {
+        erase_indices(motion.morph_frames, it->second);
+    }
+    const std::size_t removed = keys.size();
+    state_.selected_motion_keyframes.clear();
+    set_motion_data(std::move(motion));
+    emit statusMessage(QStringLiteral("Deleted %1 VMD keyframe(s)")
+                           .arg(static_cast<int>(removed)));
+}
+
+void D3DViewport::move_motion_keys(
+    const std::set<std::pair<QString, unsigned int>>& keys, int delta) {
+    if (keys.empty() || delta == 0 || !motion_data_) {
+        return;
+    }
+    std::map<MotionChannel, std::vector<std::size_t>> by_channel;
+    std::set<std::pair<QString, unsigned int>> moved;
+    for (const auto& entry : keys) {
+        const auto track = state_.motion_key_refs.find(entry.first);
+        if (track == state_.motion_key_refs.end()) {
+            continue;
+        }
+        const auto ref = track.value().find(entry.second);
+        if (ref == track.value().end()) {
+            continue;
+        }
+        by_channel[ref.value().channel].push_back(ref.value().index);
+        moved.insert({entry.first, static_cast<unsigned int>(
+                                        std::max(0, static_cast<int>(entry.second) + delta))});
+    }
+    if (by_channel.empty()) {
+        return;
+    }
+    state_.begin_motion_edit();
+    state_.push_undo_snapshot();
+
+    formats::VmdMotion motion = *motion_data_;
+    const auto move_indices = [delta](auto& frames, std::vector<std::size_t>& indices) {
+        for (const std::size_t index : indices) {
+            if (index >= frames.size()) {
+                continue;
+            }
+            const int next = std::max(0, static_cast<int>(frames[index].frame) + delta);
+            frames[index].frame = static_cast<std::uint32_t>(next);
+        }
+    };
+    if (auto it = by_channel.find(MotionChannel::Camera); it != by_channel.end()) {
+        move_indices(motion.camera_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Light); it != by_channel.end()) {
+        move_indices(motion.light_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Shadow); it != by_channel.end()) {
+        move_indices(motion.shadow_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Ik); it != by_channel.end()) {
+        move_indices(motion.ik_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Bone); it != by_channel.end()) {
+        move_indices(motion.bone_frames, it->second);
+    }
+    if (auto it = by_channel.find(MotionChannel::Morph); it != by_channel.end()) {
+        move_indices(motion.morph_frames, it->second);
+    }
+
+    const auto deduplicate = [](auto& frames, const auto& same_key) {
+        std::stable_sort(frames.begin(), frames.end(),
+                         [&same_key](const auto& a, const auto& b) {
+                             if (a.frame != b.frame) {
+                                 return a.frame < b.frame;
+                             }
+                             return same_key(a, b);
+                         });
+        frames.erase(std::unique(frames.begin(), frames.end(),
+                                 [&same_key](const auto& a, const auto& b) {
+                                     return a.frame == b.frame && same_key(a, b);
+                                 }),
+                     frames.end());
+    };
+    deduplicate(motion.camera_frames, [](const auto&, const auto&) { return true; });
+    deduplicate(motion.light_frames, [](const auto&, const auto&) { return true; });
+    deduplicate(motion.shadow_frames, [](const auto&, const auto&) { return true; });
+    deduplicate(motion.ik_frames, [](const auto&, const auto&) { return true; });
+    deduplicate(motion.bone_frames,
+                [](const auto& a, const auto& b) { return a.name == b.name; });
+    deduplicate(motion.morph_frames,
+                [](const auto& a, const auto& b) { return a.name == b.name; });
+
+    state_.selected_motion_keyframes.clear();
+    set_motion_data(std::move(motion));
+    std::set<std::pair<QString, unsigned int>> valid;
+    for (const auto& entry : moved) {
+        const auto track = state_.motion_keyframes.find(entry.first);
+        if (track != state_.motion_keyframes.end() && track.value().contains(entry.second)) {
+            valid.insert(entry);
+        }
+    }
+    state_.selected_motion_keyframes = std::move(valid);
+    emit statusMessage(QStringLiteral("Moved %1 VMD keyframe(s) by %2 frame(s)")
+                           .arg(static_cast<int>(moved.size()))
+                           .arg(delta));
+}
+
 void D3DViewport::apply_editor_bone_override() {
     ModelInstance* model = active_model();
     if (model == nullptr || !state_.selected_bone_idx) {
@@ -2570,15 +3188,23 @@ void D3DViewport::render_scene() {
     }
 
     std::vector<render::GroundShadow> shadows;
+    const render::Frustum frustum =
+        render::Frustum::from_view_projection(camera_.view_projection_matrix());
+    culled_models_ = 0;
+    culled_subsets_ = 0;
     if (state_.ground_shadow) {
         shadows.reserve(models_.size());
         for (const auto& model : models_) {
             if (!model->visible) {
                 continue;
             }
-            shadows.push_back({Vec3(model->shadow_center.x * model->scale + model->offset.x,
-                                    0.0f,
-                                    model->shadow_center.z * model->scale + model->offset.z),
+            const Vec3 center = model->model_point(model->shadow_center);
+            const render::BoundingSphere shadow_sphere{
+                Vec3(center.x, 0.0f, center.z), model->shadow_radius * model->scale};
+            if (!frustum.intersects(shadow_sphere)) {
+                continue;
+            }
+            shadows.push_back({Vec3(center.x, 0.0f, center.z),
                                model->shadow_radius * model->scale,
                                {0.10f, 0.11f, 0.14f, 0.32f}});
         }
@@ -2592,10 +3218,15 @@ void D3DViewport::render_scene() {
         if (!model->visible || model->mesh.subsets.empty()) {
             continue;
         }
+        const render::BoundingSphere model_sphere{
+            model->model_point(model->bounds_center()),
+            model->bounds_radius() * model->scale * 1.3f + 0.01f};
+        if (!frustum.intersects(model_sphere)) {
+            ++culled_models_;
+            continue;
+        }
         render_palette_.resize(model->skeleton.skinning_palette.size());
-        const Mat4 model_transform =
-            Mat4::from_scale(Vec3(model->scale, model->scale, model->scale)) *
-            Mat4::from_translation(model->offset);
+        const Mat4 model_transform = model->model_matrix();
         for (std::size_t i = 0; i < render_palette_.size(); ++i) {
             render_palette_[i] = model->skeleton.skinning_palette[i] * model_transform;
         }
@@ -2603,6 +3234,15 @@ void D3DViewport::render_scene() {
 
         for (std::size_t i = 0; i < model->mesh.subsets.size(); ++i) {
             const render::MeshSubset& subset = model->mesh.subsets[i];
+            if (i < model->subset_bounds.size()) {
+                const render::BoundingSphere subset_sphere =
+                    subset_world_bounds(model->pmx.indices, model->mesh.current_vertices,
+                                        subset, render_palette_);
+                if (subset_sphere.radius > 0.0f && !frustum.intersects(subset_sphere)) {
+                    ++culled_subsets_;
+                    continue;
+                }
+            }
             const bool transparent =
                 subset.material_index < model->materials.size() &&
                 model->materials[subset.material_index].constants.diffuse[3] < 0.999f;
@@ -2622,6 +3262,11 @@ void D3DViewport::render_scene() {
                 opaque_draws.push_back(draw);
             }
         }
+    }
+
+    if ((culled_models_ > 0 || culled_subsets_ > 0) && ++cull_log_counter_ % 120 == 0) {
+        core::log_msg("[studio] frustum culled models=" + std::to_string(culled_models_) +
+                      " subsets=" + std::to_string(culled_subsets_));
     }
 
     const auto opaque_lists =
@@ -2768,8 +3413,9 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
     }
 
     const auto append_bones = [&](const ModelInstance& bone_model, bool is_active_model) {
-        const Vec3 offset = bone_model.offset;
-        const float scale = bone_model.scale;
+        const auto to_world = [&bone_model](const Vec3& point) {
+            return bone_model.model_point(point);
+        };
         const animation::Skeleton& skeleton = bone_model.skeleton;
         const auto types = skeleton.bone_visual_types();
         const auto* rig = bone_model.physics_rig ? &*bone_model.physics_rig : nullptr;
@@ -2796,8 +3442,8 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
                 hidden(bone.ik_target_bone)) {
                 continue;
             }
-            ribbon(skeleton.world_positions[i] * scale + offset,
-                   skeleton.world_positions[bone.ik_target_bone] * scale + offset, 1.0f,
+            ribbon(to_world(skeleton.world_positions[i]),
+                   to_world(skeleton.world_positions[bone.ik_target_bone]), 1.0f,
                    ik_link_color);
         }
 
@@ -2819,8 +3465,8 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
                 color = selected_color;
             }
 
-            const Vec3 base = skeleton.world_positions[i] * scale + offset;
-            const Vec3 tail = bone_tail_world(skeleton, i) * scale + offset;
+            const Vec3 base = to_world(skeleton.world_positions[i]);
+            const Vec3 tail = to_world(bone_tail_world(skeleton, i));
             const Vec3 direction = tail - base;
             Vec3 perpendicular = direction.cross(view_forward);
             perpendicular = perpendicular.length_squared() < 1.0e-8f
@@ -2848,7 +3494,7 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
         }
 
         if (has_selection && (skeleton.bones[selected].flags & 0x0008) != 0) {
-            const Vec3 origin = skeleton.world_positions[selected] * scale + offset;
+            const Vec3 origin = to_world(skeleton.world_positions[selected]);
             const std::array<std::array<float, 4>, 3> axis_colors{
                 std::array<float, 4>{0.86f, 0.30f, 0.33f, 1.0f},
                 std::array<float, 4>{0.48f, 0.72f, 0.38f, 1.0f},
@@ -2857,7 +3503,8 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
                 Vec3 direction(axis == 0 ? 1.0f : 0.0f, axis == 1 ? 1.0f : 0.0f,
                                axis == 2 ? 1.0f : 0.0f);
                 if (state_.is_local_coord) {
-                    direction = skeleton.world_rotations[selected].rotate_vec3(direction);
+                    direction = (bone_model.rotation * skeleton.world_rotations[selected])
+                                    .rotate_vec3(direction);
                 }
                 arrow(origin, direction.normalize(), 34.0f,
                       axis_colors[static_cast<std::size_t>(axis)]);
@@ -2884,14 +3531,13 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
         line(point - view_up * size, point + view_up * size, color);
     };
     if (active->visible && active->physics_rig) {
-        const Vec3 offset = active->offset;
-        const float scale = active->scale;
+        const auto to_world = [&active](const auto& position) {
+            return active->model_point(Vec3(position[0], position[1], position[2]));
+        };
         const auto* rig = &*active->physics_rig;
         if (state_.show_rigid_bodies) {
             for (const auto& body : rig->get_debug_rigid_bodies()) {
-                const Vec3 position(body.position[0] * scale + offset.x,
-                                    body.position[1] * scale + offset.y,
-                                    body.position[2] * scale + offset.z);
+                const Vec3 position = to_world(body.position);
                 const std::array<float, 4> color =
                     body.mode == 0 ? std::array<float, 4>{0.47f, 0.70f, 0.47f, 0.9f}
                     : body.mode == 1 ? std::array<float, 4>{0.84f, 0.75f, 0.41f, 0.9f}
@@ -2901,15 +3547,19 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
         }
         if (state_.show_joints) {
             for (const auto& joint : rig->get_debug_joints()) {
-                debug_cross(Vec3(joint.position[0] * scale + offset.x,
-                                 joint.position[1] * scale + offset.y,
-                                 joint.position[2] * scale + offset.z),
-                            {0.62f, 0.53f, 0.77f, 0.9f});
+                debug_cross(to_world(joint.position), {0.62f, 0.53f, 0.77f, 0.9f});
             }
         }
     }
 
     return geometry;
+}
+
+void D3DViewport::record_camera_edit() {
+    if (!camera_edit_timer_.isValid() || camera_edit_timer_.elapsed() > 500) {
+        state_.push_undo_snapshot();
+        camera_edit_timer_.restart();
+    }
 }
 
 void D3DViewport::mousePressEvent(QMouseEvent* event) {
@@ -2931,8 +3581,8 @@ void D3DViewport::mousePressEvent(QMouseEvent* event) {
                     continue;
                 }
                 const auto projected = project_to_screen(
-                    model->skeleton.world_positions[i] * model->scale + model->offset,
-                    view_projection, scene_rect());
+                    model->model_point(model->skeleton.world_positions[i]), view_projection,
+                    scene_rect());
                 if (!projected) {
                     continue;
                 }
@@ -2955,9 +3605,11 @@ void D3DViewport::mousePressEvent(QMouseEvent* event) {
         }
     } else if (event->button() == Qt::RightButton) {
         right_down_ = true;
+        record_camera_edit();
         setCursor(Qt::SizeAllCursor);
     } else if (event->button() == Qt::MiddleButton) {
         middle_down_ = true;
+        record_camera_edit();
         setCursor(Qt::ClosedHandCursor);
     }
     setFocus();
@@ -3015,6 +3667,7 @@ void D3DViewport::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void D3DViewport::wheelEvent(QWheelEvent* event) {
+    record_camera_edit();
     // Studio distance grows when the eye moves away from the focus, so wheel up
     // (zoom in) subtracts and wheel down (zoom out) adds.
     state_.camera_distance =

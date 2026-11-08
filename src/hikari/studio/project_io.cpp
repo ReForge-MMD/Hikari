@@ -261,6 +261,7 @@ QJsonObject key_to_json(const TrackKeyframe& key) {
     object[QStringLiteral("distance")] = key.distance;
     object[QStringLiteral("fov")] = key.fov;
     object[QStringLiteral("scale")] = key.scale;
+    object[QStringLiteral("visible")] = key.visible;
     object[QStringLiteral("parent_model")] = key.parent_model;
     object[QStringLiteral("parent_bone")] = key.parent_bone;
     object[QStringLiteral("follow_offset")] = to_json(key.follow_offset);
@@ -312,6 +313,7 @@ TrackKeyframe key_from_json(const QJsonObject& object) {
     key.distance = static_cast<float>(object.value(QStringLiteral("distance")).toDouble());
     key.fov = static_cast<float>(object.value(QStringLiteral("fov")).toDouble());
     key.scale = static_cast<float>(object.value(QStringLiteral("scale")).toDouble(1.0));
+    key.visible = object.value(QStringLiteral("visible")).toBool(true);
     key.parent_model = std::max(object.value(QStringLiteral("parent_model")).toInt(-1), -1);
     key.parent_bone =
         std::max(object.value(QStringLiteral("parent_bone")).toInt(0), 0);
@@ -456,6 +458,7 @@ QByteArray hkp_to_json(const ProjectData& project) {
         item[QStringLiteral("path")] = model.path;
         item[QStringLiteral("name")] = model.name;
         item[QStringLiteral("offset")] = to_json(model.offset.to_array());
+        item[QStringLiteral("rotation")] = to_json(model.rotation.to_array());
         item[QStringLiteral("scale")] = model.scale;
         item[QStringLiteral("visible")] = model.visible;
         models.append(item);
@@ -563,6 +566,9 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
         model.path = item.value(QStringLiteral("path")).toString();
         model.name = item.value(QStringLiteral("name")).toString();
         model.offset = Vec3::from_array(read_vec3(item.value(QStringLiteral("offset"))));
+        model.rotation = Quat::from_array(
+            read_vec4(item.value(QStringLiteral("rotation")), {0.0f, 0.0f, 0.0f, 1.0f}))
+                             .normalize();
         model.scale = static_cast<float>(item.value(QStringLiteral("scale")).toDouble(1.0));
         model.visible = item.value(QStringLiteral("visible")).toBool(true);
         project.models.push_back(std::move(model));

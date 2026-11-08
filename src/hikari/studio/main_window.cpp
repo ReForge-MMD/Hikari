@@ -52,7 +52,9 @@
 #include <cmath>
 #include <numeric>
 
+#include "hikari/studio/curve_editor.hpp"
 #include "hikari/studio/d3d_viewport.hpp"
+#include "hikari/studio/localization.hpp"
 #include "hikari/studio/timeline_widget.hpp"
 #include "hikari/studio/theme.hpp"
 #include "hikari/studio/viewport_chrome.hpp"
@@ -191,6 +193,16 @@ QWidget* make_divider() {
     return divider;
 }
 
+void show_localized_message(QWidget* parent, const QString& title, const QString& text) {
+    QMessageBox box(parent);
+    box.setWindowTitle(title);
+    box.setText(text);
+    box.setIcon(QMessageBox::Information);
+    box.setStandardButtons(QMessageBox::Ok);
+    localization::apply(&box);
+    box.exec();
+}
+
 enum class Glyph { First, Previous, Next, Last, Add, Remove };
 
 QIcon make_glyph_icon(Glyph glyph) {
@@ -257,9 +269,13 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
       model_path_(std::move(model_path)),
       motion_path_(std::move(motion_path)),
       audio_path_(std::move(audio_path)) {
+    localization::load_language();
     setWindowTitle(QStringLiteral("Hikari Studio"));
     resize(1440, 900);
     setStyleSheet(NordicTheme::style_sheet());
+    scene_edit_timer_ = new QTimer(this);
+    scene_edit_timer_->setSingleShot(true);
+    scene_edit_timer_->setInterval(500);
 
     setCentralWidget(build_viewport_area());
     build_docks();
@@ -269,7 +285,7 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
 
     statusBar()->setSizeGripEnabled(true);
     persistent_status_ = QStringLiteral("Hikari Studio ready");
-    info_label_ = new QLabel(persistent_status_);
+    info_label_ = new QLabel(localization::text(persistent_status_));
     info_label_->setObjectName(QStringLiteral("StatusLabel"));
     stats_label_ = new QLabel(QStringLiteral("60.0 fps  ·  16.7 ms"));
     stats_label_->setObjectName(QStringLiteral("StatsLabel"));
@@ -278,9 +294,12 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
 
     connect(viewport_, &D3DViewport::statsChanged, this,
             [this](float fps, float frame_ms) {
-                stats_label_->setText(QStringLiteral("%1 fps  ·  %2 ms")
+                stats_label_->setText(QStringLiteral("%1 fps  ·  %2 ms  ·  %3 %4/%5")
                                           .arg(fps, 0, 'f', 1)
-                                          .arg(frame_ms, 0, 'f', 1));
+                                          .arg(frame_ms, 0, 'f', 1)
+                                          .arg(localization::text(QStringLiteral("culled")))
+                                          .arg(viewport_->culled_models())
+                                          .arg(viewport_->culled_subsets()));
             });
     connect(viewport_, &D3DViewport::statusMessage, this,
             [this](const QString& message) { state_.set_status(message); });
@@ -288,8 +307,9 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
             [this](const QString& name, int vertices, int bones) {
                 refresh_targets();
                 refresh_morph_combos();
-                persistent_status_ =
-                    QStringLiteral("%1  ·  %2 vertices  ·  %3 bones").arg(name).arg(vertices).arg(bones);
+                persistent_model_name_ = name;
+                persistent_vertices_ = vertices;
+                persistent_bones_ = bones;
             });
     connect(viewport_, &D3DViewport::screenSizeChanged, this, [this](int width, int height) {
         state_.screen_size_width = width;
@@ -339,6 +359,8 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
                               ? QStringLiteral("Editing the camera")
                               : QStringLiteral("Editing the model"));
     });
+    connect(footer_, &ViewportFooter::valueEdited, this,
+            [this] { record_scene_edit(); });
     connect(footer_, &ViewportFooter::modelLoadRequested, this, [this] {
         choose_model();
         if (!state_.model_loaded) {
@@ -371,9 +393,27 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
         timeline_->update();
         if (stats_label_ != nullptr) {
             stats_label_->setVisible(state_.info_display);
+            if (state_.info_display) {
+                stats_label_->setText(
+                    QStringLiteral("%1 fps  ·  %2 ms  ·  %3 %4/%5")
+                        .arg(viewport_->current_fps(), 0, 'f', 1)
+                        .arg(viewport_->current_frame_ms(), 0, 'f', 1)
+                        .arg(localization::text(QStringLiteral("culled")))
+                        .arg(viewport_->culled_models())
+                        .arg(viewport_->culled_subsets()));
+            }
         }
         if (info_label_ != nullptr) {
-            info_label_->setText(state_.current_status().value_or(persistent_status_));
+            const QString base_status =
+                persistent_model_name_.isEmpty()
+                    ? localization::text(QStringLiteral("Hikari Studio ready"))
+                    : QStringLiteral("%1  ·  %2 %3  ·  %4 %5")
+                          .arg(persistent_model_name_)
+                          .arg(persistent_vertices_)
+                          .arg(localization::text(QStringLiteral("vertices")))
+                          .arg(persistent_bones_)
+                          .arg(localization::text(QStringLiteral("bones")));
+            info_label_->setText(state_.current_status().value_or(base_status));
             info_label_->setVisible(state_.info_display);
         }
     });
@@ -404,6 +444,37 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
             emit startupFinished();
         });
     }
+    retranslate_interface();
+}
+
+void MainWindow::retranslate_interface() {
+    for (QWidget* widget : {static_cast<QWidget*>(model_combo_),
+                            static_cast<QWidget*>(camera_parent_model_),
+                            static_cast<QWidget*>(camera_parent_bone_),
+                            static_cast<QWidget*>(camera_preset_combo_),
+                            static_cast<QWidget*>(audio_label_),
+                            static_cast<QWidget*>(info_label_),
+                            static_cast<QWidget*>(stats_label_)}) {
+        localization::skip(widget);
+    }
+    for (QComboBox* combo : morph_combo_) {
+        localization::skip(combo);
+    }
+    localization::apply(this);
+    refresh_tab_title_bars();
+    if (footer_ != nullptr) {
+        footer_->sync();
+    }
+    refresh_camera_follow_combos();
+    if (timeline_ != nullptr) {
+        timeline_->update();
+    }
+    if (viewport_ != nullptr) {
+        viewport_->update();
+        for (QWidget* widget : viewport_->findChildren<QWidget*>()) {
+            widget->update();
+        }
+    }
 }
 
 QWidget* MainWindow::build_viewport_area() {
@@ -433,8 +504,8 @@ void MainWindow::build_menus() {
     });
     auto* open_project = file_menu->addAction(QStringLiteral("Open Project (.hkp)..."), this, [this] {
         const QString path = QFileDialog::getOpenFileName(
-            this, QStringLiteral("Open Hikari project"), state_.default_directory,
-            QStringLiteral("Hikari Project (*.hkp)"));
+            this, localization::text(QStringLiteral("Open Hikari project")), state_.default_directory,
+            localization::text(QStringLiteral("Hikari Project (*.hkp)")));
         if (path.isEmpty()) {
             return;
         }
@@ -452,8 +523,8 @@ void MainWindow::build_menus() {
     open_project->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+O")));
     auto* save_project = file_menu->addAction(QStringLiteral("Save Project (.hkp)..."), this, [this] {
         const QString path = QFileDialog::getSaveFileName(
-            this, QStringLiteral("Save Hikari project"), state_.default_directory,
-            QStringLiteral("Hikari Project (*.hkp)"));
+            this, localization::text(QStringLiteral("Save Hikari project")), state_.default_directory,
+            localization::text(QStringLiteral("Hikari Project (*.hkp)")));
         if (!path.isEmpty()) {
             viewport_->save_project(path);
         }
@@ -466,9 +537,8 @@ void MainWindow::build_menus() {
                          [this] { choose_motion(); });
     file_menu->addAction(QStringLiteral("Load Audio..."), this, [this] {
         const QString path = QFileDialog::getOpenFileName(
-            this, QStringLiteral("Load audio"), state_.default_directory,
-            QStringLiteral("Audio files (*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.opus *.wma "
-                           "*.aiff *.aif *.wv *.ape);;All files (*)"));
+            this, localization::text(QStringLiteral("Load audio")), state_.default_directory,
+            localization::text(QStringLiteral("Audio files (*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.opus *.wma *.aiff *.aif *.wv *.ape);;All files (*)")));
         if (path.isEmpty()) {
             return;
         }
@@ -485,8 +555,8 @@ void MainWindow::build_menus() {
     });
     auto* load_hkm = file_menu->addAction(QStringLiteral("Load Hikari Motion (.hkm)..."), this, [this] {
         const QString path = QFileDialog::getOpenFileName(
-            this, QStringLiteral("Load Hikari motion"), state_.default_directory,
-            QStringLiteral("Hikari Motion (*.hkm)"));
+            this, localization::text(QStringLiteral("Load Hikari motion")), state_.default_directory,
+            localization::text(QStringLiteral("Hikari Motion (*.hkm)")));
         if (path.isEmpty()) {
             return;
         }
@@ -508,8 +578,8 @@ void MainWindow::build_menus() {
                          [this] { choose_motion_save(); });
     auto* save_hkm = file_menu->addAction(QStringLiteral("Save Hikari Motion (.hkm)..."), this, [this] {
         const QString path = QFileDialog::getSaveFileName(
-            this, QStringLiteral("Save Hikari motion"), state_.default_directory,
-            QStringLiteral("Hikari Motion (*.hkm)"));
+            this, localization::text(QStringLiteral("Save Hikari motion")), state_.default_directory,
+            localization::text(QStringLiteral("Hikari Motion (*.hkm)")));
         if (!path.isEmpty()) {
             viewport_->save_motion_hkm(path);
         }
@@ -522,7 +592,8 @@ void MainWindow::build_menus() {
                          [this] { show_render_video_dialog(); });
     file_menu->addAction(QStringLiteral("Set Working Directory..."), this, [this] {
         const QString directory =
-            QFileDialog::getExistingDirectory(this, QStringLiteral("Working directory"));
+            QFileDialog::getExistingDirectory(this,
+                                              localization::text(QStringLiteral("Working directory")));
         if (!directory.isEmpty()) {
             state_.default_directory = directory;
             state_.set_status(QStringLiteral("Default directory set: %1").arg(directory));
@@ -577,6 +648,14 @@ void MainWindow::build_menus() {
         timeline_->refresh_layout();
         timeline_->update();
         update_edit_actions();
+    });
+    edit_menu->addAction(QStringLiteral("Interpolation Curve Editor..."), this, [this] {
+        CurveEditorDialog dialog(state_, this);
+        localization::apply(&dialog);
+        if (dialog.exec() == QDialog::Accepted) {
+            timeline_->update();
+            update_edit_actions();
+        }
     });
 
     auto* view_menu = menuBar()->addMenu(QStringLiteral("&View"));
@@ -645,6 +724,26 @@ void MainWindow::build_menus() {
     panels_menu_->addSeparator();
     panels_menu_->addAction(QStringLiteral("Reset Panel Layout"), this,
                             [this] { reset_panel_layout(); });
+    auto* language_menu = view_menu->addMenu(QStringLiteral("Language"));
+    auto* language_group = new QActionGroup(this);
+    language_group->setExclusive(true);
+    const auto add_language = [this, language_menu, language_group](
+                                  const QString& label,
+                                  localization::Language language) {
+        QAction* action = language_menu->addAction(label);
+        action->setCheckable(true);
+        action->setChecked(localization::current_language() == language);
+        language_group->addAction(action);
+        connect(action, &QAction::triggered, this, [this, language] {
+            localization::set_language(language);
+            retranslate_interface();
+            state_.set_status(QStringLiteral("Interface language: %1")
+                                  .arg(localization::language_name(language)));
+        });
+    };
+    add_language(QStringLiteral("English"), localization::Language::English);
+    add_language(QStringLiteral("Russian"), localization::Language::Russian);
+    add_language(QStringLiteral("Japanese"), localization::Language::Japanese);
 
     auto* facial_menu = menuBar()->addMenu(QStringLiteral("&Facial"));
     facial_menu->addAction(QStringLiteral("Reset All Facial Values"), this, [this] {
@@ -821,6 +920,8 @@ void MainWindow::refresh_tab_title_bars() {
         if (bar->drawBase()) {
             bar->setDrawBase(false);
         }
+        bar->updateGeometry();
+        bar->update();
         // Qt draws no close button on dock tabs, so place one inside each tab.
         // It is a plain child of the bar rather than a tab button: QTabBar
         // reserves a wide, non-styleable gap for tab buttons, which would keep
@@ -1100,6 +1201,12 @@ QWidget* MainWindow::build_timeline_panel() {
     auto* delete_button = new QPushButton(QStringLiteral("Delete keys"));
     delete_button->setObjectName(QStringLiteral("DangerButton"));
     delete_button->setToolTip(QStringLiteral("Delete the selected keyframes"));
+    auto* bake_motion = new QPushButton(QStringLiteral("Bake VMD"));
+    bake_motion->setToolTip(
+        QStringLiteral("Bake the selected VMD keys into authored tracks at their current "
+                       "frames"));
+    auto* delete_motion = new QPushButton(QStringLiteral("Delete VMD"));
+    delete_motion->setToolTip(QStringLiteral("Delete the selected keys from the loaded VMD"));
     actions_row->addWidget(select_all);
     actions_row->addWidget(vsel_button);
     actions_row->addWidget(delete_line);
@@ -1107,6 +1214,9 @@ QWidget* MainWindow::build_timeline_panel() {
     actions_row->addWidget(copy_button_);
     actions_row->addWidget(paste_button_);
     actions_row->addWidget(delete_button);
+    actions_row->addWidget(make_divider());
+    actions_row->addWidget(bake_motion);
+    actions_row->addWidget(delete_motion);
     actions_row->addStretch(1);
     layout->addLayout(actions_row);
 
@@ -1138,6 +1248,20 @@ QWidget* MainWindow::build_timeline_panel() {
             [this] { copy_keyframes(); });
     connect(timeline_, &TimelineWidget::pasteRequested, this,
             [this] { paste_keyframes(); });
+    connect(timeline_, &TimelineWidget::bakeMotionKeysRequested, this,
+            [this] { bake_selected_motion_keys(); });
+    connect(timeline_, &TimelineWidget::deleteMotionKeysRequested, this, [this] {
+        viewport_->delete_motion_keys(state_.selected_motion_keyframes);
+        timeline_->refresh_layout();
+        timeline_->update();
+        update_edit_actions();
+    });
+    connect(timeline_, &TimelineWidget::motionKeysMoveRequested, this, [this](int delta) {
+        viewport_->move_motion_keys(state_.selected_motion_keyframes, delta);
+        timeline_->refresh_layout();
+        timeline_->update();
+        update_edit_actions();
+    });
 
     connect(first_button, &QToolButton::clicked, this, [this] {
         state_.current_frame = 0.0f;
@@ -1196,6 +1320,13 @@ QWidget* MainWindow::build_timeline_panel() {
     });
     connect(delete_button, &QPushButton::clicked, this,
             [this] { delete_selected_keyframes(); });
+    connect(bake_motion, &QPushButton::clicked, this, [this] { bake_selected_motion_keys(); });
+    connect(delete_motion, &QPushButton::clicked, this, [this] {
+        viewport_->delete_motion_keys(state_.selected_motion_keyframes);
+        timeline_->refresh_layout();
+        timeline_->update();
+        update_edit_actions();
+    });
     connect(zoom, &QSlider::valueChanged, this, [this, zoom_value](int value) {
         state_.timeline_zoom = static_cast<float>(value) / 100.0f;
         zoom_value->setText(QStringLiteral("%1%").arg(value));
@@ -1231,6 +1362,7 @@ QWidget* MainWindow::build_model_tab() {
     auto* scale_row = new QHBoxLayout();
     scale_row->addWidget(new QLabel(QStringLiteral("Scale")));
     model_scale_ = make_spin(0.05, 20.0, 0.01, 3, state_.model_scale);
+    make_shrinkable(model_scale_);
     model_scale_->setToolTip(
         QStringLiteral("Uniform model scale. Poses, motions and physics keep their authored "
                        "model-space units and scale together with the model."));
@@ -1244,6 +1376,30 @@ QWidget* MainWindow::build_model_tab() {
         QStringLiteral("Register IK on/off state and outside-parent registrations at the "
                        "current frame. Bone display is not stored in VMD."));
     layout->addWidget(register_button);
+
+    auto* transform_grid = new QGridLayout();
+    transform_grid->setHorizontalSpacing(4);
+    transform_grid->setVerticalSpacing(2);
+    transform_grid->setColumnStretch(1, 1);
+    const char* axis_names = "XYZ";
+    for (int i = 0; i < 3; ++i) {
+        model_pos_[static_cast<std::size_t>(i)] =
+            make_spin(-100000.0, 100000.0, 0.1, 2, state_.model_offset[i]);
+        model_rot_[static_cast<std::size_t>(i)] =
+            make_spin(-720.0, 720.0, 1.0, 1, 0.0);
+        make_shrinkable(model_pos_[static_cast<std::size_t>(i)]);
+        make_shrinkable(model_rot_[static_cast<std::size_t>(i)]);
+        add_row(transform_grid, i, QStringLiteral("Position %1").arg(QChar(axis_names[i])),
+                model_pos_[static_cast<std::size_t>(i)]);
+        add_row(transform_grid, i + 3, QStringLiteral("Rotation %1").arg(QChar(axis_names[i])),
+                model_rot_[static_cast<std::size_t>(i)]);
+    }
+    layout->addLayout(transform_grid);
+    auto* key_transform = new QPushButton(QStringLiteral("Key transform"));
+    key_transform->setToolTip(
+        QStringLiteral("Register model position, rotation, scale and visibility at the "
+                       "current frame"));
+    layout->addWidget(key_transform);
     layout->addStretch(1);
 
     connect(model_combo_, &QComboBox::currentIndexChanged, this, [this](int index) {
@@ -1255,13 +1411,47 @@ QWidget* MainWindow::build_model_tab() {
     connect(remove, &QPushButton::clicked, this,
             [this] { state_.model_delete_requested = true; });
     connect(model_visible_, &QCheckBox::toggled, this, [this](bool checked) {
+        record_scene_edit();
         state_.model_visible = checked;
         viewport_->set_model_visible(viewport_->active_model_index(), checked);
     });
     connect(model_scale_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        record_scene_edit();
         const float scale = static_cast<float>(value);
         state_.model_scale = scale;
         viewport_->set_model_scale(viewport_->active_model_index(), scale);
+    });
+    for (int i = 0; i < 3; ++i) {
+        connect(model_pos_[static_cast<std::size_t>(i)], &QDoubleSpinBox::valueChanged, this,
+                [this, i](double value) {
+                    record_scene_edit();
+                    std::array<float, 3> position = state_.model_offset.to_array();
+                    position[static_cast<std::size_t>(i)] = static_cast<float>(value);
+                    state_.model_offset = Vec3::from_array(position);
+                    viewport_->set_model_position(viewport_->active_model_index(), position);
+                });
+        connect(model_rot_[static_cast<std::size_t>(i)], &QDoubleSpinBox::valueChanged, this,
+                [this, i](double value) {
+                    record_scene_edit();
+                    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+                    Vec3 euler = Quat::from_array(state_.model_rotation).to_euler_xyz();
+                    const float radians = static_cast<float>(value) * kDegToRad;
+                    if (i == 0) {
+                        euler.x = radians;
+                    } else if (i == 1) {
+                        euler.y = radians;
+                    } else {
+                        euler.z = radians;
+                    }
+                    const Quat rotation = Quat::from_euler_xyz(euler);
+                    state_.model_rotation = rotation.to_array();
+                    viewport_->set_model_rotation(viewport_->active_model_index(), rotation);
+                });
+    }
+    connect(key_transform, &QPushButton::clicked, this, [this] {
+        state_.register_keyframe(QStringLiteral("model scale"),
+                                 static_cast<unsigned int>(state_.current_frame));
+        timeline_->update();
     });
     connect(key_scale, &QPushButton::clicked, this, [this] {
         state_.register_keyframe(QStringLiteral("model scale"),
@@ -1554,71 +1744,84 @@ QWidget* MainWindow::build_camera_tab() {
     layout->addStretch(1);
 
     connect(distance, &QDoubleSpinBox::valueChanged, this, [this, distance](double value) {
+        record_scene_edit();
         state_.camera_distance = static_cast<float>(value);
         if (distance->hasFocus()) {
             state_.mode = EditorMode::Camera;
         }
     });
     connect(near_clip, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        record_scene_edit();
         state_.camera_near_clip = static_cast<float>(value);
     });
     connect(far_clip, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        record_scene_edit();
         state_.camera_far_clip = static_cast<float>(value);
     });
     connect(fov, &QDoubleSpinBox::valueChanged, this, [this, fov](double value) {
+        record_scene_edit();
         state_.camera_fov_deg = static_cast<float>(value);
         if (fov->hasFocus()) {
             state_.mode = EditorMode::Camera;
         }
     });
     connect(yaw, &QDoubleSpinBox::valueChanged, this, [this, yaw](double value) {
+        record_scene_edit();
         state_.camera_yaw = static_cast<float>(value) * 3.14159265358979323846 / 180.0;
         if (yaw->hasFocus()) {
             state_.mode = EditorMode::Camera;
         }
     });
     connect(pitch, &QDoubleSpinBox::valueChanged, this, [this, pitch](double value) {
+        record_scene_edit();
         state_.camera_pitch = static_cast<float>(value) * 3.14159265358979323846 / 180.0;
         if (pitch->hasFocus()) {
             state_.mode = EditorMode::Camera;
         }
     });
     connect(roll, &QDoubleSpinBox::valueChanged, this, [this, roll](double value) {
+        record_scene_edit();
         state_.camera_roll = static_cast<float>(value) * 3.14159265358979323846 / 180.0;
         if (roll->hasFocus()) {
             state_.mode = EditorMode::Camera;
         }
     });
     connect(camera_target_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        record_scene_edit();
         state_.camera_target = static_cast<CameraTarget>(std::clamp(index, 0, 2));
         state_.set_status(index == 1 ? QStringLiteral("Camera target: model")
                                      : index == 2 ? QStringLiteral("Camera target: selected bone")
                                                   : QStringLiteral("Camera target: free"));
     });
     connect(camera_follow_, &QCheckBox::toggled, this, [this](bool checked) {
+        record_scene_edit();
         state_.camera_follow = checked;
         state_.set_status(checked ? QStringLiteral("Camera follow bone enabled")
                                   : QStringLiteral("Camera follow bone disabled"));
     });
     connect(camera_parent_model_, &QComboBox::currentIndexChanged, this, [this](int) {
+        record_scene_edit();
         state_.camera_parent_model = camera_parent_model_->currentData().toInt();
         state_.camera_parent_bone = 0;
         state_.camera_follow_offset = {0.0f, 0.0f, 0.0f};
         refresh_camera_follow_combos();
     });
     connect(camera_parent_bone_, &QComboBox::currentIndexChanged, this, [this](int) {
+        record_scene_edit();
         state_.camera_parent_bone = camera_parent_bone_->currentData().toInt();
         state_.camera_follow_offset = {0.0f, 0.0f, 0.0f};
     });
     for (int i = 0; i < 3; ++i) {
         connect(camera_follow_offset_[static_cast<std::size_t>(i)],
                 &QDoubleSpinBox::valueChanged, this, [this, i](double value) {
+                    record_scene_edit();
                     state_.camera_follow_offset[static_cast<std::size_t>(i)] =
                         static_cast<float>(value);
                 });
     }
     refresh_camera_follow_combos();
     connect(reset, &QPushButton::clicked, this, [this, distance, fov, yaw, pitch, roll] {
+        record_scene_edit();
         viewport_->reset_camera();
         state_.mode = EditorMode::Camera;
         distance->setValue(45.0);
@@ -1639,6 +1842,7 @@ QWidget* MainWindow::build_camera_tab() {
         if (!presets.contains(name)) {
             return;
         }
+        record_scene_edit();
         camera_preset_from_json(presets.value(name).toObject(), state_);
         sync_bone_fields();
         update_viewport_title();
@@ -1649,9 +1853,9 @@ QWidget* MainWindow::build_camera_tab() {
     connect(preset_save, &QPushButton::clicked, this, [this] {
         bool ok = false;
         const QString name = QInputDialog::getText(
-                                 this, QStringLiteral("Save camera preset"),
-                                 QStringLiteral("Preset name:"), QLineEdit::Normal, QString(),
-                                 &ok)
+                                 this, localization::text(QStringLiteral("Save camera preset")),
+                                 localization::text(QStringLiteral("Preset name:")),
+                                 QLineEdit::Normal, QString(), &ok)
                                  .trimmed();
         if (!ok || name.isEmpty()) {
             return;
@@ -1676,8 +1880,10 @@ QWidget* MainWindow::build_camera_tab() {
     connect(camera_preset_combo_, &QComboBox::activated, this,
             [apply_current_preset](int) { apply_current_preset(); });
     refresh_camera_presets();
-    connect(ortho, &QCheckBox::toggled, this,
-            [this](bool checked) { state_.camera_orthographic = checked; });
+    connect(ortho, &QCheckBox::toggled, this, [this](bool checked) {
+        record_scene_edit();
+        state_.camera_orthographic = checked;
+    });
     connect(register_button, &QPushButton::clicked, this, [this] {
         state_.register_keyframe(QStringLiteral("camera"),
                                  static_cast<unsigned int>(state_.current_frame));
@@ -1745,16 +1951,19 @@ QWidget* MainWindow::build_light_tab() {
     for (int i = 0; i < 3; ++i) {
         connect(sliders[static_cast<std::size_t>(i)], &QSlider::valueChanged, this,
                 [this, i](int value) {
+                    record_scene_edit();
                     state_.light_color[static_cast<std::size_t>(i)] =
                         static_cast<float>(value) / 100.0f;
                 });
         connect(dir_spins[static_cast<std::size_t>(i)], &QDoubleSpinBox::valueChanged, this,
                 [this, i](double value) {
+                    record_scene_edit();
                     state_.light_direction[static_cast<std::size_t>(i)] =
                         static_cast<float>(value);
                 });
     }
     connect(reset, &QPushButton::clicked, this, [this, sliders, dir_spins] {
+        record_scene_edit();
         state_.light_color = {0.6f, 0.6f, 0.6f};
         state_.light_direction = {-0.5f, -1.0f, -0.5f};
         for (int i = 0; i < 3; ++i) {
@@ -1799,12 +2008,18 @@ QWidget* MainWindow::build_shadow_tab() {
     register_button->setToolTip(tooltip);
     layout->addStretch(1);
 
-    connect(mode, &QComboBox::currentIndexChanged, this,
-            [this](int index) { state_.shadow_mode = static_cast<ShadowMode>(index); });
-    connect(range, &QDoubleSpinBox::valueChanged, this,
-            [this](double value) { state_.shadow_range = static_cast<float>(value); });
-    connect(detail, &QDoubleSpinBox::valueChanged, this,
-            [this](double value) { state_.shadow_detail = static_cast<float>(value); });
+    connect(mode, &QComboBox::currentIndexChanged, this, [this](int index) {
+        record_scene_edit();
+        state_.shadow_mode = static_cast<ShadowMode>(index);
+    });
+    connect(range, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        record_scene_edit();
+        state_.shadow_range = static_cast<float>(value);
+    });
+    connect(detail, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        record_scene_edit();
+        state_.shadow_detail = static_cast<float>(value);
+    });
     connect(register_button, &QPushButton::clicked, this, [this] {
         state_.register_keyframe(QStringLiteral("shadow"),
                                  static_cast<unsigned int>(state_.current_frame));
@@ -1849,9 +2064,9 @@ QWidget* MainWindow::build_accessory_tab() {
     layout->addStretch(1);
 
     connect(load, &QPushButton::clicked, this, [this] {
-        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Accessory"),
-                                                          state_.default_directory,
-                                                          QStringLiteral("DirectX Model (*.x)"));
+        const QString path = QFileDialog::getOpenFileName(
+            this, localization::text(QStringLiteral("Accessory")), state_.default_directory,
+            localization::text(QStringLiteral("DirectX Model (*.x)")));
         if (!path.isEmpty()) {
             state_.accessory_name = QFileInfo(path).completeBaseName();
             state_.set_status(QStringLiteral("Loaded accessory: %1").arg(path));
@@ -1997,9 +2212,11 @@ QWidget* MainWindow::build_playback_tab() {
         }
     });
     connect(audio_offset_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        record_scene_edit();
         state_.audio_offset_frames = static_cast<float>(value);
     });
     connect(audio_volume_, &QSlider::valueChanged, this, [this](int value) {
+        record_scene_edit();
         state_.audio_volume = static_cast<float>(value) / 100.0f;
     });
     connect(loop, &QCheckBox::toggled, this,
@@ -2025,10 +2242,12 @@ QWidget* MainWindow::build_interpolation_tab() {
     auto* row = new QHBoxLayout();
     auto* linear = new QPushButton(QStringLiteral("Linear"));
     auto* scurve = new QPushButton(QStringLiteral("S-Curve"));
+    auto* custom = new QPushButton(QStringLiteral("Custom curve..."));
     row->addWidget(linear);
     row->addWidget(scurve);
     layout->addWidget(automatic);
     layout->addLayout(row);
+    layout->addWidget(custom);
     layout->addWidget(make_hint(QStringLiteral("Applies to selected keyframes, or sets the "
                                                "default for new keys when nothing is selected.")));
     layout->addStretch(1);
@@ -2050,6 +2269,14 @@ QWidget* MainWindow::build_interpolation_tab() {
         state_.apply_curve_to_selection();
         timeline_->update();
         update_edit_actions();
+    });
+    connect(custom, &QPushButton::clicked, this, [this] {
+        CurveEditorDialog dialog(state_, this);
+        localization::apply(&dialog);
+        if (dialog.exec() == QDialog::Accepted) {
+            timeline_->update();
+            update_edit_actions();
+        }
     });
     return page;
 }
@@ -2096,6 +2323,26 @@ void MainWindow::refresh_model_list() {
         model_scale_->setValue(state_.model_scale);
         model_scale_->blockSignals(false);
     }
+    const Vec3 euler = Quat::from_array(state_.model_rotation).to_euler_xyz();
+    std::array<float, 3> rotation_deg{euler.x * 180.0f / 3.14159265358979323846f,
+                                      euler.y * 180.0f / 3.14159265358979323846f,
+                                      euler.z * 180.0f / 3.14159265358979323846f};
+    for (int i = 0; i < 3; ++i) {
+        if (model_pos_[static_cast<std::size_t>(i)] != nullptr) {
+            model_pos_[static_cast<std::size_t>(i)]->setEnabled(loaded);
+            model_pos_[static_cast<std::size_t>(i)]->blockSignals(true);
+            model_pos_[static_cast<std::size_t>(i)]->setValue(
+                state_.model_offset.to_array()[static_cast<std::size_t>(i)]);
+            model_pos_[static_cast<std::size_t>(i)]->blockSignals(false);
+        }
+        if (model_rot_[static_cast<std::size_t>(i)] != nullptr) {
+            model_rot_[static_cast<std::size_t>(i)]->setEnabled(loaded);
+            model_rot_[static_cast<std::size_t>(i)]->blockSignals(true);
+            model_rot_[static_cast<std::size_t>(i)]->setValue(
+                rotation_deg[static_cast<std::size_t>(i)]);
+            model_rot_[static_cast<std::size_t>(i)]->blockSignals(false);
+        }
+    }
     refresh_camera_follow_combos();
 }
 
@@ -2107,7 +2354,7 @@ void MainWindow::refresh_camera_follow_combos() {
     const QStringList models = viewport_->model_names();
     camera_parent_model_->blockSignals(true);
     camera_parent_model_->clear();
-    camera_parent_model_->addItem(QStringLiteral("none"), -1);
+    camera_parent_model_->addItem(localization::text(QStringLiteral("none")), -1);
     for (int i = 0; i < models.size(); ++i) {
         camera_parent_model_->addItem(models[i], i);
     }
@@ -2192,10 +2439,12 @@ void MainWindow::update_viewport_title() {
         return;
     }
     if (state_.mode == EditorMode::Camera) {
-        header_->set_title(QStringLiteral("Camera  ·  Light  ·  Accessory"));
+        header_->set_title(
+            localization::text(QStringLiteral("Camera  ·  Light  ·  Accessory")));
     } else {
-        header_->set_title(state_.model_name.isEmpty() ? QStringLiteral("Model")
-                                                       : state_.model_name);
+        header_->set_title(state_.model_name.isEmpty()
+                               ? localization::text(QStringLiteral("Model"))
+                               : state_.model_name);
     }
 }
 
@@ -2282,8 +2531,9 @@ void MainWindow::sync_bone_fields() {
         }
     }
     if (audio_label_ != nullptr) {
-        audio_label_->setText(state_.audio_name.isEmpty() ? QStringLiteral("None")
-                                                          : state_.audio_name);
+        audio_label_->setText(state_.audio_name.isEmpty()
+                                  ? localization::text(QStringLiteral("None"))
+                                  : state_.audio_name);
         audio_label_->setToolTip(state_.audio_path);
     }
     sync_camera_spin(audio_offset_, state_.audio_offset_frames);
@@ -2296,6 +2546,31 @@ void MainWindow::sync_bone_fields() {
         model_scale_->blockSignals(true);
         model_scale_->setValue(state_.model_scale);
         model_scale_->blockSignals(false);
+    }
+    if (model_visible_ != nullptr) {
+        model_visible_->blockSignals(true);
+        model_visible_->setChecked(state_.model_visible);
+        model_visible_->blockSignals(false);
+    }
+    const Vec3 model_euler = Quat::from_array(state_.model_rotation).to_euler_xyz();
+    const std::array<float, 3> model_rotation_deg{
+        model_euler.x * 180.0f / 3.14159265358979323846f,
+        model_euler.y * 180.0f / 3.14159265358979323846f,
+        model_euler.z * 180.0f / 3.14159265358979323846f};
+    for (int i = 0; i < 3; ++i) {
+        auto* position = model_pos_[static_cast<std::size_t>(i)];
+        if (position != nullptr && !position->hasFocus()) {
+            position->blockSignals(true);
+            position->setValue(
+                state_.model_offset.to_array()[static_cast<std::size_t>(i)]);
+            position->blockSignals(false);
+        }
+        auto* rotation = model_rot_[static_cast<std::size_t>(i)];
+        if (rotation != nullptr && !rotation->hasFocus()) {
+            rotation->blockSignals(true);
+            rotation->setValue(model_rotation_deg[static_cast<std::size_t>(i)]);
+            rotation->blockSignals(false);
+        }
     }
     const auto set_ik_check = [this](bool enabled, bool checked) {
         if (bone_ik_ == nullptr) {
@@ -2356,13 +2631,39 @@ void MainWindow::sync_morph_fields() {
     }
 }
 
+void MainWindow::record_scene_edit() {
+    if (scene_edit_timer_ != nullptr && scene_edit_timer_->isActive()) {
+        return;
+    }
+    state_.push_undo_snapshot();
+    if (scene_edit_timer_ != nullptr) {
+        scene_edit_timer_->start();
+    }
+}
+
 void MainWindow::delete_selected_keyframes() {
-    if (state_.selected_keyframes.empty()) {
+    const bool had_motion = !state_.selected_motion_keyframes.empty();
+    const bool had_authored = !state_.selected_keyframes.empty();
+    if (had_motion) {
+        viewport_->delete_motion_keys(state_.selected_motion_keyframes);
+    }
+    if (had_authored) {
+        state_.delete_keyframes(state_.selected_keyframes);
+    } else if (!had_motion) {
         state_.delete_keyframe(state_.selected_track_name(),
                                static_cast<unsigned int>(state_.current_frame));
-    } else {
-        state_.delete_keyframes(state_.selected_keyframes);
     }
+    timeline_->refresh_layout();
+    timeline_->update();
+    update_edit_actions();
+}
+
+void MainWindow::bake_selected_motion_keys() {
+    if (state_.selected_motion_keyframes.empty()) {
+        state_.set_status(QStringLiteral("Select VMD keys to bake"));
+        return;
+    }
+    viewport_->bake_motion_keys(state_.selected_motion_keyframes);
     timeline_->refresh_layout();
     timeline_->update();
     update_edit_actions();
@@ -2370,8 +2671,8 @@ void MainWindow::delete_selected_keyframes() {
 
 void MainWindow::choose_model() {
     const QString path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Load PMX Model"), state_.default_directory,
-        QStringLiteral("Polygon Model eXtended (*.pmx);;All files (*.*)"));
+        this, localization::text(QStringLiteral("Load PMX Model")), state_.default_directory,
+        localization::text(QStringLiteral("Polygon Model eXtended (*.pmx);;All files (*.*)")));
     if (path.isEmpty()) {
         return;
     }
@@ -2386,8 +2687,8 @@ void MainWindow::choose_model() {
 
 void MainWindow::choose_motion() {
     const QString path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Load VMD Motion"), state_.default_directory,
-        QStringLiteral("Vocaloid Motion Data (*.vmd);;All files (*.*)"));
+        this, localization::text(QStringLiteral("Load VMD Motion")), state_.default_directory,
+        localization::text(QStringLiteral("Vocaloid Motion Data (*.vmd);;All files (*.*)")));
     if (!path.isEmpty()) {
         viewport_->load_motion(path);
         state_.default_directory = QFileInfo(path).absolutePath();
@@ -2397,8 +2698,8 @@ void MainWindow::choose_motion() {
 
 void MainWindow::choose_motion_save() {
     const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("Save VMD Motion"), state_.default_directory,
-        QStringLiteral("Vocaloid Motion Data (*.vmd)"));
+        this, localization::text(QStringLiteral("Save VMD Motion")), state_.default_directory,
+        localization::text(QStringLiteral("Vocaloid Motion Data (*.vmd)")));
     if (!path.isEmpty()) {
         viewport_->save_motion(path);
         state_.default_directory = QFileInfo(path).absolutePath();
@@ -2407,8 +2708,8 @@ void MainWindow::choose_motion_save() {
 
 void MainWindow::choose_vpd_load() {
     const QString path = QFileDialog::getOpenFileName(
-        this, QStringLiteral("Load VPD Pose"), state_.default_directory,
-        QStringLiteral("Vocaloid Pose Data (*.vpd);;All files (*.*)"));
+        this, localization::text(QStringLiteral("Load VPD Pose")), state_.default_directory,
+        localization::text(QStringLiteral("Vocaloid Pose Data (*.vpd);;All files (*.*)")));
     if (!path.isEmpty()) {
         viewport_->load_vpd(path);
         sync_morph_fields();
@@ -2417,8 +2718,8 @@ void MainWindow::choose_vpd_load() {
 
 void MainWindow::choose_vpd_save() {
     const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("Save VPD Pose"), state_.default_directory,
-        QStringLiteral("Vocaloid Pose Data (*.vpd)"));
+        this, localization::text(QStringLiteral("Save VPD Pose")), state_.default_directory,
+        localization::text(QStringLiteral("Vocaloid Pose Data (*.vpd)")));
     if (!path.isEmpty()) {
         viewport_->save_vpd(path);
     }
@@ -2426,8 +2727,8 @@ void MainWindow::choose_vpd_save() {
 
 void MainWindow::choose_render_image() {
     const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("Render Image"), state_.default_directory,
-        QStringLiteral("Bitmap Image (*.bmp)"));
+        this, localization::text(QStringLiteral("Render Image")), state_.default_directory,
+        localization::text(QStringLiteral("Bitmap Image (*.bmp)")));
     if (!path.isEmpty()) {
         viewport_->capture_image(path);
     }
@@ -2445,6 +2746,11 @@ void MainWindow::show_gravity_dialog() {
             make_spin(-100.0, 100.0, 0.1, 2, state_.gravity[static_cast<std::size_t>(i)]);
         add_row(grid, i, QStringLiteral("Gravity %1").arg(QChar(axis_names[i])),
                 spins[static_cast<std::size_t>(i)]);
+        connect(spins[static_cast<std::size_t>(i)], &QDoubleSpinBox::valueChanged, &dialog,
+                [this, i](double value) {
+                    record_scene_edit();
+                    state_.gravity[static_cast<std::size_t>(i)] = static_cast<float>(value);
+                });
     }
     layout->addLayout(grid);
     auto* noise = make_spin(0.0, 10.0, 0.1, 2, state_.gravity_noise);
@@ -2458,6 +2764,7 @@ void MainWindow::show_gravity_dialog() {
     buttons->addButton(zero, QDialogButtonBox::ActionRole);
     layout->addWidget(buttons);
     connect(earth, &QPushButton::clicked, &dialog, [this, spins] {
+        record_scene_edit();
         state_.gravity = {0.0f, -9.8f, 0.0f};
         for (int i = 0; i < 3; ++i) {
             spins[static_cast<std::size_t>(i)]->setValue(
@@ -2465,22 +2772,26 @@ void MainWindow::show_gravity_dialog() {
         }
     });
     connect(zero, &QPushButton::clicked, &dialog, [this, spins] {
+        record_scene_edit();
         state_.gravity = {0.0f, 0.0f, 0.0f};
         for (int i = 0; i < 3; ++i) {
             spins[static_cast<std::size_t>(i)]->setValue(0.0);
         }
     });
-    connect(noise, &QDoubleSpinBox::valueChanged, &dialog,
-            [this](double value) { state_.gravity_noise = static_cast<float>(value); });
+    connect(noise, &QDoubleSpinBox::valueChanged, &dialog, [this](double value) {
+        record_scene_edit();
+        state_.gravity_noise = static_cast<float>(value);
+    });
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    localization::apply(&dialog);
     dialog.exec();
 }
 
 void MainWindow::show_op_dialog() {
     if (!state_.model_loaded || viewport_ == nullptr) {
-        QMessageBox::information(this, QStringLiteral("Outside Parent (OP) Register"),
-                                 QStringLiteral("Load a PMX model first."));
+        show_localized_message(this, QStringLiteral("Outside Parent (OP) Register"),
+                               QStringLiteral("Load a PMX model first."));
         return;
     }
 
@@ -2637,21 +2948,26 @@ void MainWindow::show_op_dialog() {
     QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 
     load_subject();
+    localization::skip(subject);
+    localization::skip(target_model);
+    localization::skip(target_bone);
+    localization::apply(&dialog);
     dialog.exec();
 }
 
 void MainWindow::show_physics_dialog() {
-    QMessageBox::information(this, QStringLiteral("About Physics"),
-                             QStringLiteral("Jolt Physics 5.x\n\n"
-                                            "• 60 Hz substepping with distance constraint chains\n"
-                                            "• 6DOF spring joints matching PMX rest frames\n"
-                                            "• Rest-pose overlap protection and kinematic bone driving\n"
-                                            "• SIMD rigid bodies: spheres, boxes and capsules\n"
-                                            "• Multithreaded solver and CCD on kinematic limbs"));
+    show_localized_message(
+        this, QStringLiteral("About Physics"),
+        QStringLiteral("Jolt Physics 5.x\n\n"
+                       "• 60 Hz substepping with distance constraint chains\n"
+                       "• 6DOF spring joints matching PMX rest frames\n"
+                       "• Rest-pose overlap protection and kinematic bone driving\n"
+                       "• SIMD rigid bodies: spheres, boxes and capsules\n"
+                       "• Multithreaded solver and CCD on kinematic limbs"));
 }
 
 void MainWindow::show_shortcuts_dialog() {
-    QMessageBox::information(
+    show_localized_message(
         this, QStringLiteral("Keyboard & Mouse Shortcuts"),
         QStringLiteral("Right mouse drag - orbit camera\n"
                        "Middle mouse drag - pan camera\n"
@@ -2663,16 +2979,19 @@ void MainWindow::show_shortcuts_dialog() {
                        "V - VSync\n"
                        "P - physics simulation\n"
                        "J - jiggle dynamics\n"
-                       "R - reset physics"));
+                       "R - reset physics\n\n"
+                       "Undo restores scene values, model transforms and keyframes. The playhead "
+                       "is not restored."));
 }
 
 void MainWindow::show_about_dialog() {
-    QMessageBox::about(this, QStringLiteral("About Hikari Studio"),
-                       QStringLiteral("HIKARI STUDIO\n\n"
-                                      "Direct3D 11 MMD/MME runtime and animation studio.\n"
-                                      "C++20, Qt 6, Jolt Physics, vcpkg and ccache.\n\n"
-                                      "Shader Model 5.0, shader reflection, MRT, compute "
-                                      "shaders and a 64 KB MME constant buffer."));
+    show_localized_message(
+        this, QStringLiteral("About Hikari Studio"),
+        QStringLiteral("HIKARI STUDIO\n\n"
+                       "Direct3D 11 MMD/MME runtime and animation studio.\n"
+                       "C++20, Qt 6, Jolt Physics, vcpkg and ccache.\n\n"
+                       "Shader Model 5.0, shader reflection, MRT, compute "
+                       "shaders and a 64 KB MME constant buffer."));
 }
 
 void MainWindow::show_screen_size_dialog() {
@@ -2779,6 +3098,7 @@ void MainWindow::show_screen_size_dialog() {
                 dialog.accept();
             });
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    localization::apply(&dialog);
     dialog.exec();
 }
 
@@ -2817,7 +3137,8 @@ void MainWindow::show_render_video_dialog() {
     QString render_directory = state_.default_directory + QStringLiteral("/renders");
     connect(choose, &QPushButton::clicked, &dialog, [this, &render_directory, directory] {
         const QString path =
-            QFileDialog::getExistingDirectory(this, QStringLiteral("Render directory"),
+            QFileDialog::getExistingDirectory(this,
+                                              localization::text(QStringLiteral("Render directory")),
                                               state_.default_directory);
         if (!path.isEmpty()) {
             render_directory = path;
@@ -2834,6 +3155,7 @@ void MainWindow::show_render_video_dialog() {
                 dialog.accept();
             });
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    localization::apply(&dialog);
     dialog.exec();
 }
 

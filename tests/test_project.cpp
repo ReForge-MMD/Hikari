@@ -92,6 +92,7 @@ TEST_CASE("HKM round trips VMD tracks and model transform keys", "[project]") {
     REQUIRE(parsed->model_keys.size() == 2);
     REQUIRE(parsed->model_keys[0].scale == Catch::Approx(0.1f));
     REQUIRE(parsed->model_keys[0].position[2] == Catch::Approx(2.0f));
+    REQUIRE(parsed->model_keys[0].rotation[1] == Catch::Approx(0.159f));
     REQUIRE(parsed->model_keys[1].frame == 24);
     REQUIRE(parsed->model_keys[1].scale == Catch::Approx(2.0f));
     REQUIRE_FALSE(parsed->model_keys[1].visible);
@@ -122,6 +123,7 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     first.path = "models/first.pmx";
     first.name = "First";
     first.offset = {1.0f, 0.0f, -1.0f};
+    first.rotation = {0.0f, 0.7071068f, 0.0f, 0.7071068f};
     first.scale = 0.5f;
     hikari::studio::ProjectModel second;
     second.path = "models/second.pmx";
@@ -176,6 +178,8 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE(parsed->models.size() == 2);
     REQUIRE(parsed->models[0].path == "models/first.pmx");
     REQUIRE(parsed->models[0].scale == Catch::Approx(0.5f));
+    REQUIRE(parsed->models[0].rotation.y == Catch::Approx(0.7071068f));
+    REQUIRE(parsed->models[0].rotation.w == Catch::Approx(0.7071068f));
     REQUIRE_FALSE(parsed->models[1].visible);
     REQUIRE(parsed->tracks.size() == 2);
     REQUIRE(parsed->tracks[0].name == "センター");
@@ -194,4 +198,18 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE(model_op.model == "Second");
     REQUIRE(parsed->motion.has_value());
     REQUIRE(parsed->motion->model_keys.size() == 2);
+}
+
+TEST_CASE("Old HKP files without model rotation load as identity", "[project]") {
+    const QByteArray bytes = R"({
+        "format": "hikari-project",
+        "version": 1,
+        "models": [{"path": "old.pmx", "name": "Old", "offset": [1, 2, 3], "scale": 1.0}]
+    })";
+    QString error;
+    const auto parsed = hikari::studio::hkp_from_json(bytes, &error);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->models.size() == 1);
+    REQUIRE(parsed->models[0].rotation.w == Catch::Approx(1.0f));
+    REQUIRE(parsed->models[0].rotation.x == Catch::Approx(0.0f));
 }

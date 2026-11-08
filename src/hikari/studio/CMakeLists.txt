@@ -4,9 +4,13 @@ set(CMAKE_AUTORCC ON)
 add_executable(hikari_studio WIN32
   app_state.cpp
   app_state.hpp
+  curve_editor.cpp
+  curve_editor.hpp
   d3d_viewport.cpp
   d3d_viewport.hpp
   hikari.rc
+  localization.cpp
+  localization.hpp
   main.cpp
   main_window.cpp
   main_window.hpp

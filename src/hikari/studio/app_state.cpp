@@ -7,6 +7,7 @@
 #include <iterator>
 
 #include "hikari/math.hpp"
+#include "hikari/studio/localization.hpp"
 
 namespace hikari::studio {
 
@@ -28,7 +29,7 @@ StudioAppState::StudioAppState() {
 }
 
 void StudioAppState::set_status(const QString& message) {
-    status_message = message;
+    status_message = localization::message(message);
     status_timer.restart();
 }
 
@@ -90,7 +91,10 @@ TrackKeyframe StudioAppState::capture_keyframe(const QString& track) const {
         return key;
     }
     if (track == QStringLiteral("model scale")) {
+        key.position = model_offset.to_array();
+        key.rotation = model_rotation;
         key.scale = model_scale;
+        key.visible = model_visible;
         return key;
     }
     if (track == QStringLiteral("accessory")) {
@@ -121,45 +125,186 @@ TrackKeyframe StudioAppState::capture_keyframe(const QString& track) const {
 }
 
 void StudioAppState::push_undo_snapshot() {
-    undo_stack.push_back({track_keyframes, selected_keyframes});
+    const bool capture_pending_motion = motion_edit_pending;
+    motion_edit_pending = false;
+    undo_stack.push_back(capture_snapshot(capture_pending_motion));
     if (undo_stack.size() > kUndoLimit) {
         undo_stack.erase(undo_stack.begin());
     }
     redo_stack.clear();
 }
 
-void StudioAppState::undo_keyframes() {
-    if (undo_stack.empty()) {
+void StudioAppState::begin_motion_edit() {
+    motion_edit_pending = true;
+}
+
+SceneSnapshot StudioAppState::capture_snapshot(bool capture_pending_motion) {
+    if (capture_scene) {
+        capture_scene();
+    }
+    SceneSnapshot snapshot;
+    snapshot.track_keyframes = track_keyframes;
+    snapshot.selection = selected_keyframes;
+    snapshot.motion_selection = selected_motion_keyframes;
+
+    snapshot.camera_pan = camera_pan;
+    snapshot.camera_yaw = camera_yaw;
+    snapshot.camera_pitch = camera_pitch;
+    snapshot.camera_roll = camera_roll;
+    snapshot.camera_distance = camera_distance;
+    snapshot.camera_fov_deg = camera_fov_deg;
+    snapshot.camera_orthographic = camera_orthographic;
+    snapshot.camera_target = camera_target;
+    snapshot.camera_follow = camera_follow;
+    snapshot.camera_parent_model = camera_parent_model;
+    snapshot.camera_parent_bone = camera_parent_bone;
+    snapshot.camera_follow_offset = camera_follow_offset;
+    snapshot.camera_near_clip = camera_near_clip;
+    snapshot.camera_far_clip = camera_far_clip;
+
+    snapshot.light_color = light_color;
+    snapshot.light_direction = light_direction;
+    snapshot.shadow_mode = shadow_mode;
+    snapshot.shadow_range = shadow_range;
+    snapshot.shadow_detail = shadow_detail;
+    snapshot.gravity = gravity;
+    snapshot.gravity_noise = gravity_noise;
+
+    snapshot.audio_path = audio_path;
+    snapshot.audio_duration = audio_duration;
+    snapshot.audio_offset_frames = audio_offset_frames;
+    snapshot.audio_volume = audio_volume;
+
+    snapshot.models = model_transforms;
+    snapshot.active_model = snapshot_active_model;
+    if (capture_pending_motion && capture_motion) {
+        if (auto motion = capture_motion()) {
+            snapshot.motion = std::make_shared<formats::VmdMotion>(std::move(*motion));
+        }
+    }
+    return snapshot;
+}
+
+void StudioAppState::discard_last_undo_snapshot() {
+    if (!undo_stack.empty()) {
+        undo_stack.pop_back();
+    }
+    redo_stack.clear();
+}
+
+void StudioAppState::undo_keyframes() {    if (undo_stack.empty()) {
         return;
     }
-    redo_stack.push_back({track_keyframes, selected_keyframes});
+    const bool include_motion = undo_stack.back().motion != nullptr;
+    redo_stack.push_back(capture_snapshot(include_motion));
     if (redo_stack.size() > kUndoLimit) {
         redo_stack.erase(redo_stack.begin());
     }
-    KeyframeSnapshot snapshot = std::move(undo_stack.back());
+    SceneSnapshot snapshot = std::move(undo_stack.back());
     undo_stack.pop_back();
+
     track_keyframes = std::move(snapshot.track_keyframes);
     selected_keyframes = std::move(snapshot.selection);
+    selected_motion_keyframes = std::move(snapshot.motion_selection);
+
+    camera_pan = snapshot.camera_pan;
+    camera_yaw = snapshot.camera_yaw;
+    camera_pitch = snapshot.camera_pitch;
+    camera_roll = snapshot.camera_roll;
+    camera_distance = snapshot.camera_distance;
+    camera_fov_deg = snapshot.camera_fov_deg;
+    camera_orthographic = snapshot.camera_orthographic;
+    camera_target = snapshot.camera_target;
+    camera_follow = snapshot.camera_follow;
+    camera_parent_model = snapshot.camera_parent_model;
+    camera_parent_bone = snapshot.camera_parent_bone;
+    camera_follow_offset = snapshot.camera_follow_offset;
+    camera_near_clip = snapshot.camera_near_clip;
+    camera_far_clip = snapshot.camera_far_clip;
+
+    light_color = snapshot.light_color;
+    light_direction = snapshot.light_direction;
+    shadow_mode = snapshot.shadow_mode;
+    shadow_range = snapshot.shadow_range;
+    shadow_detail = snapshot.shadow_detail;
+    gravity = snapshot.gravity;
+    gravity_noise = snapshot.gravity_noise;
+
+    audio_path = snapshot.audio_path;
+    audio_duration = snapshot.audio_duration;
+    audio_offset_frames = snapshot.audio_offset_frames;
+    audio_volume = snapshot.audio_volume;
+
+    model_transforms = snapshot.models;
+    if (snapshot.motion && restore_motion) {
+        restore_motion(*snapshot.motion);
+    }
+    if (restore_scene) {
+        restore_scene();
+    }
+    model_scale_dirty = false;
+    model_transform_dirty = false;
     track_keys_dirty = true;
     ++keyframe_revision;
-    set_status(QStringLiteral("Undo keyframe edit"));
+    set_status(QStringLiteral("Undo"));
 }
 
 void StudioAppState::redo_keyframes() {
     if (redo_stack.empty()) {
         return;
     }
-    undo_stack.push_back({track_keyframes, selected_keyframes});
+    const bool include_motion = redo_stack.back().motion != nullptr;
+    undo_stack.push_back(capture_snapshot(include_motion));
     if (undo_stack.size() > kUndoLimit) {
         undo_stack.erase(undo_stack.begin());
     }
-    KeyframeSnapshot snapshot = std::move(redo_stack.back());
+    SceneSnapshot snapshot = std::move(redo_stack.back());
     redo_stack.pop_back();
+
     track_keyframes = std::move(snapshot.track_keyframes);
     selected_keyframes = std::move(snapshot.selection);
+    selected_motion_keyframes = std::move(snapshot.motion_selection);
+
+    camera_pan = snapshot.camera_pan;
+    camera_yaw = snapshot.camera_yaw;
+    camera_pitch = snapshot.camera_pitch;
+    camera_roll = snapshot.camera_roll;
+    camera_distance = snapshot.camera_distance;
+    camera_fov_deg = snapshot.camera_fov_deg;
+    camera_orthographic = snapshot.camera_orthographic;
+    camera_target = snapshot.camera_target;
+    camera_follow = snapshot.camera_follow;
+    camera_parent_model = snapshot.camera_parent_model;
+    camera_parent_bone = snapshot.camera_parent_bone;
+    camera_follow_offset = snapshot.camera_follow_offset;
+    camera_near_clip = snapshot.camera_near_clip;
+    camera_far_clip = snapshot.camera_far_clip;
+
+    light_color = snapshot.light_color;
+    light_direction = snapshot.light_direction;
+    shadow_mode = snapshot.shadow_mode;
+    shadow_range = snapshot.shadow_range;
+    shadow_detail = snapshot.shadow_detail;
+    gravity = snapshot.gravity;
+    gravity_noise = snapshot.gravity_noise;
+
+    audio_path = snapshot.audio_path;
+    audio_duration = snapshot.audio_duration;
+    audio_offset_frames = snapshot.audio_offset_frames;
+    audio_volume = snapshot.audio_volume;
+
+    model_transforms = snapshot.models;
+    if (snapshot.motion && restore_motion) {
+        restore_motion(*snapshot.motion);
+    }
+    if (restore_scene) {
+        restore_scene();
+    }
+    model_scale_dirty = false;
+    model_transform_dirty = false;
     track_keys_dirty = true;
     ++keyframe_revision;
-    set_status(QStringLiteral("Redo keyframe edit"));
+    set_status(QStringLiteral("Redo"));
 }
 
 void StudioAppState::register_keyframe(const QString& track, unsigned int frame, bool record_undo) {
@@ -169,6 +314,7 @@ void StudioAppState::register_keyframe(const QString& track, unsigned int frame,
     track_keyframes[track][frame] = capture_keyframe(track);
     if (track == QStringLiteral("model scale")) {
         model_scale_dirty = false;
+        model_transform_dirty = false;
     }
     track_keys_dirty = true;
     ++keyframe_revision;

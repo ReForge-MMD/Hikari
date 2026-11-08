@@ -25,6 +25,7 @@
 #include <cmath>
 
 #include "hikari/studio/app_state.hpp"
+#include "hikari/studio/localization.hpp"
 #include "hikari/studio/theme.hpp"
 
 namespace hikari::studio {
@@ -187,7 +188,8 @@ void ViewGizmo::paintEvent(QPaintEvent*) {
     painter.setFont(header_font);
     painter.drawText(QRect(kMargin, 0, width() - kMargin * 2, kHeader),
                      Qt::AlignLeft | Qt::AlignVCenter,
-                     local_ ? QStringLiteral("Local") : QStringLiteral("Global"));
+                     local_ ? localization::text(QStringLiteral("Local"))
+                            : localization::text(QStringLiteral("Global")));
 
     for (int cell = 0; cell < kColumns * kRows; ++cell) {
         const QRect box = cell_rect(cell);
@@ -463,8 +465,9 @@ void ViewportFooter::sync() {
     const bool camera = state_.mode == EditorMode::Camera;
     mode_->setToolTip(state_.model_loaded
                           ? QString()
-                          : QStringLiteral("To model mode: load a model first"));
-    mode_->setText(camera ? QStringLiteral("To Model") : QStringLiteral("To Camera"));
+                          : localization::text(QStringLiteral("To model mode: load a model first")));
+    mode_->setText(camera ? localization::text(QStringLiteral("To Model"))
+                          : localization::text(QStringLiteral("To Camera")));
     if (camera) {
         for (int axis = 0; axis < 3; ++axis) {
             if (!position_[axis]->hasFocus()) {
@@ -505,6 +508,7 @@ void ViewportFooter::apply_camera_fields() {
     if (syncing_) {
         return;
     }
+    emit valueEdited();
     if (state_.mode == EditorMode::Camera) {
         for (int axis = 0; axis < 3; ++axis) {
             state_.camera_pan[static_cast<std::size_t>(axis)] =
@@ -520,7 +524,6 @@ void ViewportFooter::apply_camera_fields() {
     } else {
         apply_bone_fields();
     }
-    emit valueEdited();
 }
 
 void ViewportFooter::apply_bone_fields() {

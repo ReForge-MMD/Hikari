@@ -35,6 +35,7 @@ struct ProjectModel {
     QString path;
     QString name;
     Vec3 offset{0.0f, 0.0f, 0.0f};
+    Quat rotation{0.0f, 0.0f, 0.0f, 1.0f};
     float scale = 1.0f;
     bool visible = true;
 };

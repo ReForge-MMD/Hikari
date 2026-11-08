@@ -8,11 +8,16 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <utility>
 #include <vector>
+
+#include "hikari/formats/vmd.hpp"
+#include "hikari/math.hpp"
 
 namespace hikari::studio {
 
@@ -52,6 +57,7 @@ struct TrackKeyframe {
     float distance = 0.0f;
     float fov = 0.0f;
     float scale = 1.0f;
+    bool visible = true;
     // MMD Bezier control points (X1, Y1, X2, Y2) in the 0..127 byte range.
     // Equal X/Y pairs evaluate as linear.
     std::array<std::uint8_t, 4> interpolation{20, 20, 20, 20};
@@ -73,9 +79,61 @@ struct TrackKeyframe {
 
 using TrackKeyframeMap = std::map<QString, std::map<unsigned int, TrackKeyframe>>;
 
-struct KeyframeSnapshot {
+enum class MotionChannel { Camera, Light, Shadow, Ik, Bone, Morph };
+
+// Identifies one key inside the loaded VMD so the timeline can move or delete
+// it without knowing the VMD layout.
+struct MotionKeyRef {
+    MotionChannel channel = MotionChannel::Bone;
+    std::size_t index = 0;
+};
+
+// Position, rotation, scale and visibility of one model at snapshot time.
+struct ModelTransformState {
+    Vec3 offset{0.0f, 0.0f, 0.0f};
+    Quat rotation{0.0f, 0.0f, 0.0f, 1.0f};
+    float scale = 1.0f;
+    bool visible = true;
+};
+
+// One undo entry for the whole scene. The motion copy is present only when a
+// VMD edit is pending, so ordinary key edits stay cheap.
+struct SceneSnapshot {
     TrackKeyframeMap track_keyframes;
     std::set<std::pair<QString, unsigned int>> selection;
+    std::set<std::pair<QString, unsigned int>> motion_selection;
+
+    std::array<float, 3> camera_pan{0.0f, 10.0f, 0.0f};
+    float camera_yaw = 0.0f;
+    float camera_pitch = 0.0f;
+    float camera_roll = 0.0f;
+    float camera_distance = 45.0f;
+    float camera_fov_deg = 30.0f;
+    bool camera_orthographic = false;
+    CameraTarget camera_target = CameraTarget::Free;
+    bool camera_follow = false;
+    int camera_parent_model = -1;
+    int camera_parent_bone = 0;
+    std::array<float, 3> camera_follow_offset{0.0f, 0.0f, 0.0f};
+    float camera_near_clip = 0.1f;
+    float camera_far_clip = 1000.0f;
+
+    std::array<float, 3> light_color{0.6f, 0.6f, 0.6f};
+    std::array<float, 3> light_direction{-0.5f, -1.0f, -0.5f};
+    ShadowMode shadow_mode = ShadowMode::Mode1;
+    float shadow_range = 8875.0f;
+    float shadow_detail = 0.5f;
+    std::array<float, 3> gravity{0.0f, -9.8f, 0.0f};
+    float gravity_noise = 0.0f;
+
+    QString audio_path;
+    double audio_duration = 0.0;
+    float audio_offset_frames = 0.0f;
+    float audio_volume = 1.0f;
+
+    std::vector<ModelTransformState> models;
+    int active_model = -1;
+    std::shared_ptr<formats::VmdMotion> motion;
 };
 
 struct ClipboardKey {
@@ -92,6 +150,9 @@ struct StudioAppState {
     int selected_model_idx = 0;
     float model_scale = 1.0f;
     bool model_scale_dirty = false;
+    bool model_transform_dirty = false;
+    Vec3 model_offset{0.0f, 0.0f, 0.0f};
+    std::array<float, 4> model_rotation{0.0f, 0.0f, 0.0f, 1.0f};
     bool model_visible = true;
     bool model_delete_requested = false;
     QStringList model_bone_names;
@@ -125,7 +186,9 @@ struct StudioAppState {
     // Frames of the loaded VMD, shown on the timeline as a read-only reference.
     // The motion player still owns the animation; these entries never drive it.
     QMap<QString, QSet<unsigned int>> motion_keyframes;
+    QMap<QString, QMap<unsigned int, MotionKeyRef>> motion_key_refs;
     std::set<std::pair<QString, unsigned int>> selected_keyframes;
+    std::set<std::pair<QString, unsigned int>> selected_motion_keyframes;
     bool track_keys_dirty = true;
     std::uint64_t keyframe_revision = 0;
     QString jump_frame_input = "0";
@@ -136,8 +199,18 @@ struct StudioAppState {
     std::array<std::uint8_t, 4> default_interpolation{20, 20, 20, 20};
 
     static constexpr std::size_t kUndoLimit = 64;
-    std::vector<KeyframeSnapshot> undo_stack;
-    std::vector<KeyframeSnapshot> redo_stack;
+    std::vector<SceneSnapshot> undo_stack;
+    std::vector<SceneSnapshot> redo_stack;
+
+    // Installed by the viewport so the state can mirror live model transforms
+    // into a snapshot and push a restored snapshot back into the models.
+    std::function<void()> capture_scene;
+    std::function<void()> restore_scene;
+    std::function<std::optional<formats::VmdMotion>()> capture_motion;
+    std::function<void(const formats::VmdMotion&)> restore_motion;
+    bool motion_edit_pending = false;
+    std::vector<ModelTransformState> model_transforms;
+    int snapshot_active_model = -1;
 
     std::array<float, 3> light_color{0.6f, 0.6f, 0.6f};
     std::array<float, 3> light_direction{-0.5f, -1.0f, -0.5f};
@@ -226,10 +299,13 @@ struct StudioAppState {
     void step_frame(int delta);
     QString selected_track_name() const;
     void push_undo_snapshot();
+    void begin_motion_edit();
     bool can_undo() const { return !undo_stack.empty(); }
     bool can_redo() const { return !redo_stack.empty(); }
     void undo_keyframes();
     void redo_keyframes();
+    void discard_last_undo_snapshot();
+    SceneSnapshot capture_snapshot(bool capture_pending_motion);
 
     void register_keyframe(const QString& track, unsigned int frame, bool record_undo = true);
     void register_ik_keyframe(const QMap<QString, bool>& states, unsigned int frame);

@@ -21,6 +21,7 @@ class QMenu;
 class QPushButton;
 class QSlider;
 class QSpinBox;
+class QTimer;
 
 namespace hikari::studio {
 
@@ -87,8 +88,12 @@ private:
     void sync_bone_fields();
     void sync_morph_fields();
     void delete_selected_keyframes();
+    void bake_selected_motion_keys();
     void update_edit_actions();
     void update_viewport_title();
+    void record_scene_edit();
+    void apply_scene_values_to_fields();
+    void retranslate_interface();
 
     StudioAppState state_;
     D3DViewport* viewport_ = nullptr;
@@ -125,6 +130,9 @@ private:
     QSlider* audio_volume_ = nullptr;
     QCheckBox* model_visible_ = nullptr;
     QDoubleSpinBox* model_scale_ = nullptr;
+    std::array<QDoubleSpinBox*, 3> model_pos_{};
+    std::array<QDoubleSpinBox*, 3> model_rot_{};
+    QTimer* scene_edit_timer_ = nullptr;
     QCheckBox* bone_ik_ = nullptr;
     QPushButton* copy_button_ = nullptr;
     QPushButton* paste_button_ = nullptr;
@@ -134,6 +142,9 @@ private:
     QLabel* stats_label_ = nullptr;
     QLabel* info_label_ = nullptr;
     QString persistent_status_;
+    QString persistent_model_name_;
+    int persistent_vertices_ = 0;
+    int persistent_bones_ = 0;
     std::vector<ClipboardKey> clipboard_;
     unsigned int clipboard_anchor_ = 0;
     QString model_path_;

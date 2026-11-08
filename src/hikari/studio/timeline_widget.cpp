@@ -11,8 +11,8 @@
 #include <algorithm>
 #include <cmath>
 
-#include "hikari/studio/app_state.hpp"
 #include "hikari/studio/theme.hpp"
+#include "hikari/studio/localization.hpp"
 
 namespace hikari::studio {
 namespace {
@@ -34,6 +34,7 @@ const QColor kCyan(colors::primary);
 const QColor kKey(0x7e, 0x9d, 0xb4);
 const QColor kMotionKey(0x55, 0x6b, 0x7d);
 const QColor kKeySelected(colors::tertiary);
+const QColor kMotionSelected(colors::primary);
 const QColor kSelection(colors::primary_container);
 const QColor kPlayhead(colors::on_surface);
 const QColor kAudioWave(0x6f, 0x9f, 0xc9, 210);
@@ -45,6 +46,23 @@ int rows_top(const StudioAppState& state) {
 bool reserved_channel(const QString& name) {
     return name == QStringLiteral("view cnt") || name == QStringLiteral("Disp/IK/OP") ||
            name == QStringLiteral("Facial");
+}
+
+bool channel_track(const QString& name) {
+    return name == QStringLiteral("camera") || name == QStringLiteral("light") ||
+           name == QStringLiteral("shadow") || name == QStringLiteral("gravity") ||
+           name == QStringLiteral("accessory") || name == QStringLiteral("model scale") ||
+           name == QStringLiteral("view cnt") || name == QStringLiteral("Facial") ||
+           name == QStringLiteral("Disp/IK/OP");
+}
+
+QPolygonF diamond_at(const QPointF& center, float radius) {
+    QPolygonF diamond;
+    diamond << QPointF(center.x(), center.y() - radius)
+            << QPointF(center.x() + radius, center.y())
+            << QPointF(center.x(), center.y() + radius)
+            << QPointF(center.x() - radius, center.y());
+    return diamond;
 }
 } // namespace
 
@@ -250,7 +268,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         painter.setPen(kMuted);
         const QString name =
             state_.audio_name.isEmpty()
-                ? QStringLiteral("Audio")
+                ? localization::text(QStringLiteral("Audio"))
                 : QFontMetrics(row_font).elidedText(state_.audio_name, Qt::ElideRight,
                                                     kHeaderWidth - 24);
         painter.drawText(QRect(12, strip_top, kHeaderWidth - 20, strip_height),
@@ -304,8 +322,11 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         painter.drawLine(0, y + kRowHeight - 1, width(), y + kRowHeight - 1);
         painter.setFont(row_font);
         painter.setPen(selected ? kCyan : kSnow);
+        const QString source_label =
+            descriptor.kind == TimelineRowKind::Channel ? localization::text(descriptor.name)
+                                                        : descriptor.name;
         const QString label = QFontMetrics(row_font).elidedText(
-            descriptor.name, Qt::ElideRight, kHeaderWidth - 24);
+            source_label, Qt::ElideRight, kHeaderWidth - 24);
         painter.drawText(QRect(12, y, kHeaderWidth - 20, kRowHeight),
                          Qt::AlignVCenter | Qt::AlignLeft, label);
     }
@@ -336,23 +357,21 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
         const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
         const auto motion_keys = state_.motion_keyframes.find(descriptor.name);
         if (motion_keys != state_.motion_keyframes.end()) {
-            // Loaded VMD keys are a read-only reference; authored keyframes are
-            // drawn on top with the regular diamond.
             painter.setPen(Qt::NoPen);
-            painter.setBrush(kMotionKey);
             for (const unsigned int frame : motion_keys.value()) {
-                const int x =
-                    kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
+                const bool selected =
+                    state_.selected_motion_keyframes.count({descriptor.name, frame}) != 0;
+                int x = kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
+                if (selected && dragging_motion_) {
+                    x += static_cast<int>(motion_drag_delta_ * spacing);
+                }
                 if (x < kHeaderWidth || x > width()) {
                     continue;
                 }
                 const QPointF center(x, y + kRowHeight / 2.0);
-                QPolygonF marker;
-                marker << QPointF(center.x(), center.y() - 3.0)
-                       << QPointF(center.x() + 3.0, center.y())
-                       << QPointF(center.x(), center.y() + 3.0)
-                       << QPointF(center.x() - 3.0, center.y());
-                painter.drawPolygon(marker);
+                painter.setPen(selected ? QPen(kSnow, 1) : Qt::NoPen);
+                painter.setBrush(selected ? kMotionSelected : kMotionKey);
+                painter.drawPolygon(diamond_at(center, selected ? 5.0f : 3.0f));
             }
         }
         const auto track = state_.track_keyframes.find(descriptor.name);
@@ -369,17 +388,24 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             const QPointF center(x, y + kRowHeight / 2.0);
             const bool key_selected =
                 state_.selected_keyframes.count({descriptor.name, frame}) != 0;
-            QPolygonF diamond;
-            diamond << QPointF(center.x(), center.y() - 5.0)
-                    << QPointF(center.x() + 5.0, center.y())
-                    << QPointF(center.x(), center.y() + 5.0)
-                    << QPointF(center.x() - 5.0, center.y());
             painter.setPen(QPen(key_selected ? kSnow : kBase, 1));
             painter.setBrush(key_selected ? kKeySelected : kKey);
-            painter.drawPolygon(diamond);
+            painter.drawPolygon(diamond_at(center, 5.0f));
         }
     }
     painter.setClipping(false);
+
+    if (box_selecting_) {
+        const QRect selection = QRect(box_start_, box_current_).normalized() & grid_rect;
+        QColor fill = kCyan;
+        fill.setAlpha(42);
+        painter.fillRect(selection, fill);
+        QColor border = kCyan;
+        border.setAlpha(220);
+        painter.setPen(QPen(border, 1.0, Qt::DashLine));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRect(selection.adjusted(0, 0, -1, -1));
+    }
 
     const int playhead_x = kHeaderWidth + kGridPadding +
                            static_cast<int>(state_.current_frame * spacing) - offset;
@@ -398,6 +424,49 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     painter.drawLine(kHeaderWidth, 0, kHeaderWidth, height());
 }
 
+int TimelineWidget::frame_at(const QPoint& position) const {
+    const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
+    const float frame =
+        (static_cast<float>(position.x() - kHeaderWidth - kGridPadding) +
+         state_.timeline_scroll) /
+        spacing;
+    return static_cast<int>(std::lround(frame));
+}
+
+std::optional<TimelineKeyframeHit> TimelineWidget::motion_keyframe_at(
+    const QPoint& position) const {
+    const int top = rows_top(state_);
+    if (position.x() < kHeaderWidth || position.y() < top) {
+        return std::nullopt;
+    }
+    const int row = (position.y() - top) / kRowHeight;
+    const auto& row_list = rows();
+    if (row < 0 || row >= static_cast<int>(row_list.size())) {
+        return std::nullopt;
+    }
+    const int row_y = top + row * kRowHeight + kRowHeight / 2;
+    if (std::abs(position.y() - row_y) > 6) {
+        return std::nullopt;
+    }
+    const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
+    const auto motion = state_.motion_keyframes.find(descriptor.name);
+    if (motion == state_.motion_keyframes.end()) {
+        return std::nullopt;
+    }
+    const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
+    const int offset = static_cast<int>(state_.timeline_scroll);
+    for (const unsigned int frame : motion.value()) {
+        const int x = kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
+        if (x < kHeaderWidth || x > width()) {
+            continue;
+        }
+        if (std::abs(position.x() - x) <= 6) {
+            return TimelineKeyframeHit{descriptor.name, frame, row, true};
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<TimelineKeyframeHit> TimelineWidget::keyframe_at(const QPoint& position) const {
     const int top = rows_top(state_);
     if (position.x() < kHeaderWidth || position.y() < top) {
@@ -414,22 +483,172 @@ std::optional<TimelineKeyframeHit> TimelineWidget::keyframe_at(const QPoint& pos
     }
     const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
     const auto track = state_.track_keyframes.find(descriptor.name);
-    if (track == state_.track_keyframes.end()) {
-        return std::nullopt;
+    if (track != state_.track_keyframes.end()) {
+        const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
+        const int offset = static_cast<int>(state_.timeline_scroll);
+        for (const auto& entry : track->second) {
+            const unsigned int frame = entry.first;
+            const int x = kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
+            if (x < kHeaderWidth || x > width()) {
+                continue;
+            }
+            if (std::abs(position.x() - x) <= 6) {
+                return TimelineKeyframeHit{descriptor.name, frame, row, false};
+            }
+        }
     }
-    const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
-    const int offset = static_cast<int>(state_.timeline_scroll);
-    for (const auto& entry : track->second) {
-        const unsigned int frame = entry.first;
-        const int x = kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
-        if (x < kHeaderWidth || x > width()) {
+    return motion_keyframe_at(position);
+}
+
+void TimelineWidget::begin_key_drag(const QPoint& position) {
+    drag_keys_.clear();
+    drag_selection_before_ = state_.selected_keyframes;
+    for (const auto& key : state_.selected_keyframes) {
+        const auto track = state_.track_keyframes.find(key.first);
+        if (track == state_.track_keyframes.end()) {
             continue;
         }
-        if (std::abs(position.x() - x) <= 6) {
-            return TimelineKeyframeHit{descriptor.name, frame, row};
+        const auto entry = track->second.find(key.second);
+        if (entry == track->second.end()) {
+            continue;
+        }
+        drag_keys_.push_back({key.first, key.second, key.second, entry->second});
+    }
+    if (drag_keys_.empty()) {
+        return;
+    }
+    drag_origin_ = position;
+    drag_undo_pushed_ = false;
+    drag_moved_ = false;
+    drag_last_delta_ = 0;
+}
+
+void TimelineWidget::update_key_drag(const QPoint& position) {
+    if (drag_keys_.empty()) {
+        return;
+    }
+    const int delta = frame_at(position) - frame_at(drag_origin_);
+    if (delta == drag_last_delta_) {
+        return;
+    }
+    drag_last_delta_ = delta;
+    if (!drag_undo_pushed_) {
+        state_.push_undo_snapshot();
+        drag_undo_pushed_ = true;
+    }
+    // Erase the previous positions first so a key can move onto a frame that
+    // another selected key is leaving in the same step.
+    for (const DragKey& key : drag_keys_) {
+        const auto track = state_.track_keyframes.find(key.track);
+        if (track != state_.track_keyframes.end()) {
+            track->second.erase(key.current_frame);
         }
     }
-    return std::nullopt;
+    std::set<std::pair<QString, unsigned int>> selection;
+    for (DragKey& key : drag_keys_) {
+        const int frame = std::clamp(static_cast<int>(key.original_frame) + delta, 0,
+                                     std::max(0, state_.max_timeline_frame));
+        key.current_frame = static_cast<unsigned int>(frame);
+        state_.track_keyframes[key.track][key.current_frame] = key.key;
+        selection.insert({key.track, key.current_frame});
+    }
+    state_.selected_keyframes = std::move(selection);
+    state_.track_keys_dirty = true;
+    drag_moved_ = drag_moved_ || delta != 0;
+    update();
+}
+
+void TimelineWidget::finish_key_drag() {
+    if (drag_moved_) {
+        ++state_.keyframe_revision;
+        state_.set_status(QStringLiteral("Moved %1 keyframe(s)")
+                              .arg(static_cast<int>(drag_keys_.size())));
+    }
+    drag_keys_.clear();
+    drag_undo_pushed_ = false;
+    drag_moved_ = false;
+    drag_last_delta_ = 0;
+}
+
+void TimelineWidget::cancel_interaction() {
+    if (drag_undo_pushed_) {
+        state_.discard_last_undo_snapshot();
+        for (const DragKey& key : drag_keys_) {
+            const auto track = state_.track_keyframes.find(key.track);
+            if (track != state_.track_keyframes.end()) {
+                track->second.erase(key.current_frame);
+            }
+        }
+        for (const DragKey& key : drag_keys_) {
+            state_.track_keyframes[key.track][key.original_frame] = key.key;
+        }
+        state_.selected_keyframes = drag_selection_before_;
+        state_.track_keys_dirty = true;
+        ++state_.keyframe_revision;
+    } else if (!drag_keys_.empty()) {
+        state_.selected_keyframes = drag_selection_before_;
+    }
+    drag_keys_.clear();
+    drag_undo_pushed_ = false;
+    drag_moved_ = false;
+    drag_last_delta_ = 0;
+    dragging_motion_ = false;
+    motion_drag_delta_ = 0;
+    box_selecting_ = false;
+    update();
+}
+
+void TimelineWidget::apply_box_selection(const QRect& rect, bool additive) {
+    if (!additive) {
+        state_.selected_keyframes.clear();
+        state_.selected_motion_keyframes.clear();
+    }
+    const int top = rows_top(state_);
+    const auto& row_list = rows();
+    for (int row = 0; row < static_cast<int>(row_list.size()); ++row) {
+        const int y = top + row * kRowHeight;
+        if (y + kRowHeight < rect.top() || y > rect.bottom()) {
+            continue;
+        }
+        const TimelineRow& descriptor = row_list[static_cast<std::size_t>(row)];
+        const auto hit_x = [&](unsigned int frame) {
+            const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
+            const int offset = static_cast<int>(state_.timeline_scroll);
+            const int x =
+                kHeaderWidth + kGridPadding + static_cast<int>(frame * spacing) - offset;
+            return rect.contains(x, y + kRowHeight / 2);
+        };
+        if (const auto track = state_.track_keyframes.find(descriptor.name);
+            track != state_.track_keyframes.end()) {
+            for (const auto& entry : track->second) {
+                if (hit_x(entry.first)) {
+                    state_.selected_keyframes.insert({descriptor.name, entry.first});
+                }
+            }
+        }
+        if (const auto motion = state_.motion_keyframes.find(descriptor.name);
+            motion != state_.motion_keyframes.end()) {
+            for (const unsigned int frame : motion.value()) {
+                if (hit_x(frame)) {
+                    state_.selected_motion_keyframes.insert({descriptor.name, frame});
+                }
+            }
+        }
+    }
+    const std::size_t total = state_.selected_keyframes.size() +
+                              state_.selected_motion_keyframes.size();
+    state_.set_status(QStringLiteral("Selected %1 keyframe(s)").arg(static_cast<int>(total)));
+    update();
+}
+
+void TimelineWidget::update_hover_cursor(const QPoint& position) {
+    if (keyframe_at(position)) {
+        setCursor(Qt::SizeHorCursor);
+    } else if (position.x() > kHeaderWidth && position.y() > rows_top(state_)) {
+        setCursor(Qt::CrossCursor);
+    } else {
+        unsetCursor();
+    }
 }
 
 void TimelineWidget::mousePressEvent(QMouseEvent* event) {
@@ -438,6 +657,9 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
     }
     setFocus();
     const QPoint position = event->pos();
+    const bool ctrl = (event->modifiers() & Qt::ControlModifier) != 0;
+    const bool shift = (event->modifiers() & Qt::ShiftModifier) != 0;
+
     if (position.x() < kHeaderWidth) {
         if (position.y() >= rows_top(state_)) {
             const int row = (position.y() - rows_top(state_)) / kRowHeight;
@@ -451,7 +673,8 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
                     emit boneSelected(descriptor.index);
                     update();
                 } else if (descriptor.kind == TimelineRowKind::Morph) {
-                    state_.set_status(QStringLiteral("Selected morph track: %1").arg(descriptor.name));
+                    state_.set_status(
+                        QStringLiteral("Selected morph track: %1").arg(descriptor.name));
                     update();
                 }
             }
@@ -460,18 +683,58 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
         return;
     }
 
+    if (position.y() < rows_top(state_)) {
+        // The ruler and audio strip are the scrub zone and never move keys.
+        state_.selected_keyframes.clear();
+        state_.selected_motion_keyframes.clear();
+        dragging_ = true;
+        scrub_to(position);
+        update();
+        event->accept();
+        return;
+    }
+
     if (const auto hit = keyframe_at(position)) {
         const auto key = std::make_pair(hit->track, hit->frame);
-        if (event->modifiers() & Qt::ControlModifier) {
-            const auto existing = state_.selected_keyframes.find(key);
-            if (existing != state_.selected_keyframes.end()) {
-                state_.selected_keyframes.erase(existing);
+        if (hit->motion) {
+            if (ctrl) {
+                const auto existing = state_.selected_motion_keyframes.find(key);
+                if (existing != state_.selected_motion_keyframes.end()) {
+                    state_.selected_motion_keyframes.erase(existing);
+                } else {
+                    state_.selected_motion_keyframes.insert(key);
+                }
             } else {
-                state_.selected_keyframes.insert(key);
+                if (!shift && state_.selected_motion_keyframes.count(key) == 0) {
+                    state_.selected_motion_keyframes.clear();
+                    state_.selected_keyframes.clear();
+                }
+                state_.selected_motion_keyframes.insert(key);
+            }
+            if (!ctrl && state_.selected_motion_keyframes.count(key) != 0) {
+                dragging_motion_ = true;
+                motion_drag_anchor_frame_ = static_cast<int>(hit->frame);
+                motion_drag_delta_ = 0;
+                drag_origin_ = position;
             }
         } else {
-            state_.selected_keyframes.clear();
-            state_.selected_keyframes.insert(key);
+            if (ctrl) {
+                const auto existing = state_.selected_keyframes.find(key);
+                if (existing != state_.selected_keyframes.end()) {
+                    state_.selected_keyframes.erase(existing);
+                } else {
+                    state_.selected_keyframes.insert(key);
+                }
+            } else {
+                if (!shift && state_.selected_keyframes.count(key) == 0) {
+                    state_.selected_keyframes.clear();
+                    state_.selected_motion_keyframes.clear();
+                }
+                state_.selected_keyframes.insert(key);
+            }
+            if (!ctrl && state_.selected_keyframes.count(key) != 0) {
+                begin_key_drag(position);
+            }
         }
         state_.current_frame = static_cast<float>(hit->frame);
         state_.jump_frame_input = QString::number(hit->frame);
@@ -484,41 +747,86 @@ void TimelineWidget::mousePressEvent(QMouseEvent* event) {
                 emit boneSelected(descriptor.index);
             }
         }
-        state_.set_status(QStringLiteral("Selected keyframe %1 at frame %2")
-                              .arg(hit->track)
+        state_.set_status(QStringLiteral("Selected %1 keyframe %2 at frame %3")
+                              .arg(hit->motion ? QStringLiteral("VMD")
+                                               : localization::text(QStringLiteral("authored")))
+                              .arg(channel_track(hit->track)
+                                       ? localization::text(hit->track)
+                                       : hit->track)
                               .arg(hit->frame));
-        dragging_ = false;
         update();
         event->accept();
         return;
     }
 
-    state_.selected_keyframes.clear();
-    dragging_ = true;
-    scrub_to(position);
+    if (!ctrl && !shift) {
+        state_.selected_keyframes.clear();
+        state_.selected_motion_keyframes.clear();
+    }
+    box_selecting_ = true;
+    box_additive_ = ctrl || shift;
+    box_start_ = position;
+    box_current_ = position;
     update();
     event->accept();
 }
 
 void TimelineWidget::mouseReleaseEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton) {
-        dragging_ = false;
-    }
-}
-
-void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
-    if (!dragging_) {
+    if (event->button() != Qt::LeftButton) {
         return;
     }
-    scrub_to(event->pos());
+    if (dragging_) {
+        dragging_ = false;
+    } else if (dragging_motion_) {
+        const int delta = motion_drag_delta_;
+        dragging_motion_ = false;
+        motion_drag_delta_ = 0;
+        if (delta != 0) {
+            emit motionKeysMoveRequested(delta);
+        }
+    } else if (!drag_keys_.empty()) {
+        finish_key_drag();
+    } else if (box_selecting_) {
+        const QRect rect = QRect(box_start_, box_current_).normalized();
+        box_selecting_ = false;
+        apply_box_selection(rect, box_additive_);
+    }
+    update_hover_cursor(event->pos());
     update();
 }
 
+void TimelineWidget::mouseMoveEvent(QMouseEvent* event) {
+    const QPoint position = event->pos();
+    if (dragging_) {
+        scrub_to(position);
+        update();
+        return;
+    }
+    if (!drag_keys_.empty()) {
+        update_key_drag(position);
+        return;
+    }
+    if (dragging_motion_) {
+        motion_drag_delta_ = frame_at(position) - frame_at(drag_origin_);
+        state_.set_status(QStringLiteral("Moving %1 VMD keyframe(s) by %2 frame(s)")
+                              .arg(static_cast<int>(state_.selected_motion_keyframes.size()))
+                              .arg(motion_drag_delta_));
+        update();
+        return;
+    }
+    if (box_selecting_) {
+        box_current_ = position;
+        update();
+        return;
+    }
+    update_hover_cursor(position);
+}
+
 void TimelineWidget::scrub_to(const QPoint& position) {
-    const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
     if (position.x() < kHeaderWidth) {
         return;
     }
+    const float spacing = kFrameSpacing * std::max(state_.timeline_zoom, 0.2f);
     const float frame = (static_cast<float>(position.x() - kHeaderWidth - kGridPadding) +
                          state_.timeline_scroll) /
                         spacing;
@@ -562,6 +870,11 @@ void TimelineWidget::wheelEvent(QWheelEvent* event) {
 }
 
 void TimelineWidget::keyPressEvent(QKeyEvent* event) {
+    if (event->key() == Qt::Key_Escape) {
+        cancel_interaction();
+        event->accept();
+        return;
+    }
     if (event->matches(QKeySequence::Copy)) {
         emit copyRequested();
         event->accept();

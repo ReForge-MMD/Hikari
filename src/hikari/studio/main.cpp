@@ -14,6 +14,7 @@
 #include <windows.h>
 #endif
 
+#include "hikari/studio/localization.hpp"
 #include "hikari/studio/main_window.hpp"
 #include "hikari/studio/splash_screen.hpp"
 #include "hikari/studio/theme.hpp"
@@ -41,9 +42,13 @@ int main(int argc, char** argv) {
         audio_path = arguments[3];
     }
 
+    hikari::studio::localization::load_language();
     hikari::studio::SplashScreen splash;
-    splash.set_status(model_path.isEmpty() ? QStringLiteral("Preparing the workspace")
-                                           : QStringLiteral("Loading the startup scene"));
+    splash.set_status(model_path.isEmpty()
+                          ? hikari::studio::localization::message(
+                                QStringLiteral("Preparing the workspace"))
+                          : hikari::studio::localization::message(
+                                QStringLiteral("Loading the startup scene")));
     splash.show();
     application.processEvents();
 

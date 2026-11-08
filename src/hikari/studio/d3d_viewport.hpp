@@ -8,6 +8,8 @@
 
 #include <memory>
 #include <optional>
+#include <set>
+#include <utility>
 #include <vector>
 
 #include "hikari/animation/timeline.hpp"
@@ -51,6 +53,15 @@ public:
     void set_active_model(int index);
     void set_model_visible(int index, bool visible);
     void set_model_scale(int index, float scale);
+    void set_model_position(int index, const std::array<float, 3>& position);
+    void set_model_rotation(int index, const Quat& rotation);
+    void set_model_transform(int index, const std::array<float, 3>& position,
+                             const Quat& rotation, float scale);
+    void bake_motion_keys(const std::set<std::pair<QString, unsigned int>>& keys);
+    void delete_motion_keys(const std::set<std::pair<QString, unsigned int>>& keys);
+    void move_motion_keys(const std::set<std::pair<QString, unsigned int>>& keys, int delta);
+    int culled_models() const { return culled_models_; }
+    int culled_subsets() const { return culled_subsets_; }
     void request_physics_reset();
     bool capture_image(const QString& path);
     bool render_frames(const QString& directory, int start, int end, int fps);
@@ -148,6 +159,15 @@ private:
     void apply_screen_size();
     void place_gizmo();
     bool selected_bone_transform(std::size_t& index) const;
+    void record_camera_edit();
+    void install_scene_callbacks();
+    void sync_model_transforms();
+    void restore_model_transforms();
+    void rebuild_motion_key_refs();
+    void set_motion_data(formats::VmdMotion motion);
+    std::optional<formats::VmdMotion> copy_motion_data() const;
+    std::optional<TrackKeyframe> bake_motion_key(const QString& track, unsigned int frame);
+    void compute_subset_bounds(ModelInstance& model);
 
     StudioAppState& state_;
     std::unique_ptr<core::D3D11Context> context_;
@@ -161,7 +181,11 @@ private:
     std::optional<formats::VmdMotion> motion_data_;
     std::vector<Mat4> render_palette_;
     std::unique_ptr<audio::AudioPlayer> audio_player_;
+    QString loaded_audio_path_;
     bool audio_playing_ = false;
+    int culled_models_ = 0;
+    int culled_subsets_ = 0;
+    int cull_log_counter_ = 0;
 
     QTimer* timer_ = nullptr;
     QElapsedTimer frame_timer_;
@@ -176,6 +200,7 @@ private:
     int applied_screen_height_ = -1;
 
     QPoint last_mouse_;
+    QElapsedTimer camera_edit_timer_;
     bool left_down_ = false;
     bool right_down_ = false;
     bool middle_down_ = false;
