@@ -21,11 +21,13 @@ target_link_libraries(hikari_tests
 
 if(HIKARI_BUILD_STUDIO)
   target_sources(hikari_tests PRIVATE
+    ../src/hikari/studio/app_settings.cpp
     ../src/hikari/studio/app_state.cpp
     ../src/hikari/studio/localization.cpp
     ../src/hikari/studio/project_io.cpp
     test_frustum.cpp
     test_project.cpp
+    test_settings.cpp
     test_state.cpp
     test_video.cpp
   )

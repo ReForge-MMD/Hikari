@@ -2,6 +2,8 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 add_executable(hikari_studio WIN32
+  app_settings.cpp
+  app_settings.hpp
   app_state.cpp
   app_state.hpp
   curve_editor.cpp

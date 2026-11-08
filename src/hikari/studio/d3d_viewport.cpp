@@ -2049,15 +2049,26 @@ void D3DViewport::reset_camera() {
 }
 
 bool D3DViewport::capture_image(const QString& path) {
-    if (!context_) {
+    if (!context_ || !renderer_) {
         return false;
     }
+    const bool saved_exporting = exporting_;
     try {
+        // Re-render without the editor-only camera marker before reading the
+        // scene target, then restore the interactive view.
+        exporting_ = true;
+        update_camera();
+        render_scene();
         const auto capture = context_->capture_scene();
+        exporting_ = saved_exporting;
+        update_camera();
+        render_scene();
+        context_->present(0);
         core::save_bmp(to_wstring(path), capture.width, capture.height, capture.rgba);
         emit statusMessage(QStringLiteral("Screenshot saved to: %1").arg(path));
         return true;
     } catch (const std::exception& error) {
+        exporting_ = saved_exporting;
         emit statusMessage(QStringLiteral("Capture failed: %1").arg(QString::fromUtf8(error.what())));
         return false;
     }
@@ -3627,7 +3638,8 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
     // the marker is placed just past the near plane and drawn as a pixel-sized
     // diamond with crosshair ticks. At zero or negative distance the eye is at
     // or past the pivot, where the marker would sit on top of the model.
-    if ((state_.mode == EditorMode::Camera || state_.camera_follow) &&
+    // Exported frames must not contain the editor-only marker.
+    if (!exporting_ && (state_.mode == EditorMode::Camera || state_.camera_follow) &&
         state_.camera_distance > 0.0f) {
         const Vec3 forward = (camera_.target - camera_.position).normalize();
         const Vec3 center =

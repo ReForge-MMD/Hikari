@@ -23,7 +23,6 @@
 #include <QIcon>
 #include <QInputDialog>
 #include <QJsonArray>
-#include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QKeySequence>
@@ -55,6 +54,7 @@
 #include <exception>
 #include <numeric>
 
+#include "hikari/studio/app_settings.hpp"
 #include "hikari/studio/curve_editor.hpp"
 #include "hikari/studio/d3d_viewport.hpp"
 #include "hikari/studio/localization.hpp"
@@ -168,19 +168,13 @@ void camera_preset_from_json(const QJsonObject& object, StudioAppState& state) {
         vec3_from_json(object.value(QStringLiteral("follow_offset")));
 }
 
-QJsonObject load_camera_presets() {
-    QSettings settings;
-    const QByteArray bytes = settings.value(QStringLiteral("cameraPresets")).toByteArray();
-    if (bytes.isEmpty()) {
-        return {};
-    }
-    return QJsonDocument::fromJson(bytes).object();
+QJsonObject load_camera_presets(const AppSettings& settings) {
+    return settings.camera_presets();
 }
 
-void store_camera_presets(const QJsonObject& presets) {
-    QSettings settings;
-    settings.setValue(QStringLiteral("cameraPresets"),
-                      QJsonDocument(presets).toJson(QJsonDocument::Compact));
+void store_camera_presets(AppSettings& settings, const QJsonObject& presets) {
+    settings.set_camera_presets(presets);
+    settings.save();
 }
 
 QCheckBox* make_check(const QString& text, bool checked) {
@@ -273,6 +267,8 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
       motion_path_(std::move(motion_path)),
       audio_path_(std::move(audio_path)) {
     localization::load_language();
+    app_settings_.load();
+    app_settings_.apply_to(state_);
     setWindowTitle(QStringLiteral("Hikari Studio"));
     resize(1440, 900);
     setStyleSheet(NordicTheme::style_sheet());
@@ -1139,6 +1135,8 @@ void MainWindow::save_panel_layout() {
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    app_settings_.capture_from(state_);
+    app_settings_.save();
     save_panel_layout();
     QMainWindow::closeEvent(event);
 }
@@ -1843,7 +1841,7 @@ QWidget* MainWindow::build_camera_tab() {
         if (name.isEmpty()) {
             return;
         }
-        const QJsonObject presets = load_camera_presets();
+        const QJsonObject presets = load_camera_presets(app_settings_);
         if (!presets.contains(name)) {
             return;
         }
@@ -1865,9 +1863,9 @@ QWidget* MainWindow::build_camera_tab() {
         if (!ok || name.isEmpty()) {
             return;
         }
-        QJsonObject presets = load_camera_presets();
+        QJsonObject presets = load_camera_presets(app_settings_);
         presets[name] = camera_preset_to_json(state_);
-        store_camera_presets(presets);
+        store_camera_presets(app_settings_, presets);
         refresh_camera_presets();
         camera_preset_combo_->setCurrentText(name);
     });
@@ -1877,9 +1875,9 @@ QWidget* MainWindow::build_camera_tab() {
         if (name.isEmpty()) {
             return;
         }
-        QJsonObject presets = load_camera_presets();
+        QJsonObject presets = load_camera_presets(app_settings_);
         presets.remove(name);
-        store_camera_presets(presets);
+        store_camera_presets(app_settings_, presets);
         refresh_camera_presets();
     });
     connect(camera_preset_combo_, &QComboBox::activated, this,
@@ -1902,7 +1900,7 @@ void MainWindow::refresh_camera_presets() {
         return;
     }
     const QString current = camera_preset_combo_->currentText();
-    const QJsonObject presets = load_camera_presets();
+    const QJsonObject presets = load_camera_presets(app_settings_);
     camera_preset_combo_->blockSignals(true);
     camera_preset_combo_->clear();
     camera_preset_combo_->addItems(presets.keys());
@@ -3254,18 +3252,21 @@ void MainWindow::show_export_video_dialog() {
                                        .filePath(base + QLatin1Char('.') +
                                                  extension_for(format->currentData().toInt())));
             });
-    connect(browse, &QPushButton::clicked, &dialog, [this, path_edit, format, extension_for] {
-        QString path = QFileDialog::getSaveFileName(
-            this, localization::text(QStringLiteral("Export Video")), path_edit->text(),
-            localization::text(QStringLiteral("Video files (*.mp4 *.mov *.mkv *.ts *.avi)")));
-        if (path.isEmpty()) {
-            return;
-        }
-        if (QFileInfo(path).suffix().isEmpty()) {
-            path += QLatin1Char('.') + extension_for(format->currentData().toInt());
-        }
-        path_edit->setText(path);
-    });
+    connect(browse, &QPushButton::clicked, &dialog,
+            [&dialog, path_edit, format, extension_for] {
+                QString path = QFileDialog::getSaveFileName(
+                    &dialog, localization::text(QStringLiteral("Export Video")),
+                    path_edit->text(),
+                    localization::text(
+                        QStringLiteral("Video files (*.mp4 *.mov *.mkv *.ts *.avi)")));
+                if (path.isEmpty()) {
+                    return;
+                }
+                if (QFileInfo(path).suffix().isEmpty()) {
+                    path += QLatin1Char('.') + extension_for(format->currentData().toInt());
+                }
+                path_edit->setText(path);
+            });
 
     VideoExportOptions options;
     bool accepted = false;

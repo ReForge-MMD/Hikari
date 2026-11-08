@@ -5,6 +5,7 @@
 #include <array>
 #include <vector>
 
+#include "hikari/studio/app_settings.hpp"
 #include "hikari/studio/app_state.hpp"
 
 class QAction;
@@ -97,6 +98,7 @@ private:
     void retranslate_interface();
 
     StudioAppState state_;
+    AppSettings app_settings_;
     D3DViewport* viewport_ = nullptr;
     ViewportHeader* header_ = nullptr;
     ViewportFooter* footer_ = nullptr;
