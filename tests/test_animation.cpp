@@ -298,3 +298,94 @@ TEST_CASE("Bezier unpack reads the rotation channel", "[animation]") {
     const auto channel = hikari::animation::unpack_bone_bezier(buffer, 3);
     REQUIRE(channel == std::array<std::uint8_t, 4>{10, 20, 30, 40});
 }
+
+TEST_CASE("Merging a camera motion keeps the model tracks", "[animation]") {
+    hikari::formats::VmdMotion model;
+    model.model_name = "model";
+    hikari::formats::VmdBoneFrame bone;
+    bone.name = "center";
+    bone.frame = 0;
+    model.bone_frames.push_back(bone);
+    hikari::formats::VmdMorphFrame morph;
+    morph.name = "smile";
+    morph.frame = 0;
+    morph.weight = 1.0f;
+    model.morph_frames.push_back(morph);
+    hikari::formats::VmdIkFrame ik;
+    ik.frame = 0;
+    model.ik_frames.push_back(ik);
+
+    hikari::formats::VmdMotion camera;
+    hikari::formats::VmdCameraFrame camera_key;
+    camera_key.frame = 10;
+    camera_key.distance = 45.0f;
+    camera.camera_frames.push_back(camera_key);
+
+    const auto merged = hikari::animation::merge_motion_channels(camera, model);
+    REQUIRE(merged.camera_frames.size() == 1);
+    REQUIRE(merged.bone_frames.size() == 1);
+    REQUIRE(merged.morph_frames.size() == 1);
+    REQUIRE(merged.ik_frames.size() == 1);
+    REQUIRE(merged.model_name == "model");
+    REQUIRE(hikari::animation::motion_channels(merged).scene);
+    REQUIRE(hikari::animation::motion_channels(merged).model);
+}
+
+TEST_CASE("Merging a model motion keeps the scene tracks", "[animation]") {
+    hikari::formats::VmdMotion scene;
+    hikari::formats::VmdCameraFrame camera_key;
+    camera_key.frame = 20;
+    scene.camera_frames.push_back(camera_key);
+    hikari::formats::VmdLightFrame light_key;
+    light_key.frame = 20;
+    scene.light_frames.push_back(light_key);
+    hikari::formats::VmdShadowFrame shadow_key;
+    shadow_key.frame = 20;
+    scene.shadow_frames.push_back(shadow_key);
+
+    hikari::formats::VmdMotion model;
+    model.model_name = "new model";
+    hikari::formats::VmdBoneFrame bone;
+    bone.name = "center";
+    bone.frame = 30;
+    model.bone_frames.push_back(bone);
+
+    const auto merged = hikari::animation::merge_motion_channels(model, scene);
+    REQUIRE(merged.camera_frames.size() == 1);
+    REQUIRE(merged.light_frames.size() == 1);
+    REQUIRE(merged.shadow_frames.size() == 1);
+    REQUIRE(merged.bone_frames.size() == 1);
+    REQUIRE(merged.morph_frames.empty());
+    REQUIRE(merged.ik_frames.empty());
+    REQUIRE(merged.model_name == "new model");
+}
+
+TEST_CASE("Merging replaces only the scene channels present in the file", "[animation]") {
+    hikari::formats::VmdMotion existing;
+    hikari::formats::VmdCameraFrame old_camera;
+    old_camera.frame = 1;
+    old_camera.distance = 10.0f;
+    existing.camera_frames.push_back(old_camera);
+    hikari::formats::VmdLightFrame light_key;
+    light_key.frame = 1;
+    light_key.color = {0.1f, 0.2f, 0.3f};
+    existing.light_frames.push_back(light_key);
+    hikari::formats::VmdShadowFrame shadow_key;
+    shadow_key.frame = 1;
+    shadow_key.distance = 100.0f;
+    existing.shadow_frames.push_back(shadow_key);
+
+    hikari::formats::VmdMotion incoming;
+    hikari::formats::VmdCameraFrame new_camera;
+    new_camera.frame = 2;
+    new_camera.distance = 20.0f;
+    incoming.camera_frames.push_back(new_camera);
+
+    const auto merged = hikari::animation::merge_motion_channels(incoming, existing);
+    REQUIRE(merged.camera_frames.size() == 1);
+    REQUIRE(merged.camera_frames.front().distance == Catch::Approx(20.0f));
+    REQUIRE(merged.light_frames.size() == 1);
+    REQUIRE(merged.light_frames.front().color[0] == Catch::Approx(0.1f));
+    REQUIRE(merged.shadow_frames.size() == 1);
+    REQUIRE(merged.shadow_frames.front().distance == Catch::Approx(100.0f));
+}

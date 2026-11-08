@@ -375,6 +375,24 @@ void D3DViewport::set_motion_data(formats::VmdMotion motion) {
     ++state_.keyframe_revision;
 }
 
+void D3DViewport::drop_model_motion() {
+    if (!motion_data_) {
+        motion_player_.reset();
+        return;
+    }
+    motion_data_->bone_frames.clear();
+    motion_data_->morph_frames.clear();
+    motion_data_->ik_frames.clear();
+    motion_data_->model_name.clear();
+    if (motion_data_->camera_frames.empty() && motion_data_->light_frames.empty() &&
+        motion_data_->shadow_frames.empty()) {
+        motion_data_.reset();
+        motion_player_.reset();
+        return;
+    }
+    motion_player_.emplace(*motion_data_);
+}
+
 bool D3DViewport::initialize() {
     if (initialized_) {
         return true;
@@ -552,8 +570,7 @@ bool D3DViewport::load_model(const QString& path) {
 
         models_.push_back(std::move(instance));
         active_model_ = static_cast<int>(models_.size()) - 1;
-        motion_player_.reset();
-        motion_data_.reset();
+        drop_model_motion();
         rebuild_motion_keyframes();
         last_editor_frame_ = -1.0f;
         sync_active_model_state();
@@ -813,8 +830,7 @@ void D3DViewport::remove_active_model() {
     } else {
         active_model_ = std::min(active_model_, static_cast<int>(models_.size()) - 1);
     }
-    motion_player_.reset();
-    motion_data_.reset();
+    drop_model_motion();
     rebuild_motion_keyframes();
     last_editor_frame_ = -1.0f;
     sync_active_model_state();
@@ -1110,21 +1126,42 @@ bool D3DViewport::save_motion(const QString& path) {
 }
 
 bool D3DViewport::apply_parsed_motion(const formats::VmdMotion& motion, const QString& label) {
-    // A loaded motion owns the scene animation; authored scene tracks are cleared so
-    // VMD camera/light/shadow can drive the viewport. Any keys registered afterwards
-    // keep priority over the VMD data.
-    for (const QString& track :
-         {QStringLiteral("camera"), QStringLiteral("light"), QStringLiteral("shadow"),
-          QStringLiteral("gravity"), QStringLiteral("accessory")}) {
-        state_.track_keyframes.erase(track);
+    const animation::MotionChannelPresence presence = animation::motion_channels(motion);
+    if (!presence.scene && !presence.model) {
+        emit statusMessage(QStringLiteral("Motion has no keyframes: %1").arg(label));
+        return false;
     }
+
+    // Camera, light and shadow are a scene-level document, while bone, morph
+    // and IK tracks belong to the model motion. Loading one must not replace
+    // the other, so only the channels present in the file are merged.
+    const formats::VmdMotion existing = motion_data_ ? *motion_data_ : formats::VmdMotion{};
+    formats::VmdMotion merged = animation::merge_motion_channels(motion, existing);
+    if (!motion.camera_frames.empty()) {
+        state_.track_keyframes.erase(QStringLiteral("camera"));
+    }
+    if (!motion.light_frames.empty()) {
+        state_.track_keyframes.erase(QStringLiteral("light"));
+    }
+    if (!motion.shadow_frames.empty()) {
+        state_.track_keyframes.erase(QStringLiteral("shadow"));
+    }
+
     state_.selected_keyframes.clear();
     state_.undo_stack.clear();
     state_.redo_stack.clear();
     ++state_.keyframe_revision;
-    motion_player_.emplace(motion);
-    motion_data_ = motion;
+    motion_player_.emplace(merged);
+    motion_data_ = std::move(merged);
     rebuild_motion_keyframes();
+    std::set<std::pair<QString, unsigned int>> filtered_selection;
+    for (const auto& key : state_.selected_motion_keyframes) {
+        const auto track = state_.motion_keyframes.find(key.first);
+        if (track != state_.motion_keyframes.end() && track.value().contains(key.second)) {
+            filtered_selection.insert(key);
+        }
+    }
+    state_.selected_motion_keyframes = std::move(filtered_selection);
     state_.max_timeline_frame = static_cast<int>(motion_player_->max_frame);
     state_.play_range = {0, state_.max_timeline_frame};
     last_editor_frame_ = -1.0f;
@@ -1133,7 +1170,13 @@ bool D3DViewport::apply_parsed_motion(const formats::VmdMotion& motion, const QS
     if (ModelInstance* model = active_model(); model != nullptr && model->physics_rig) {
         model->physics_rig->request_reset();
     }
-    emit statusMessage(QStringLiteral("Loaded motion: %1").arg(label));
+    if (presence.scene && presence.model) {
+        emit statusMessage(QStringLiteral("Loaded motion: %1").arg(label));
+    } else if (presence.scene) {
+        emit statusMessage(QStringLiteral("Loaded camera motion: %1").arg(label));
+    } else {
+        emit statusMessage(QStringLiteral("Loaded model motion: %1").arg(label));
+    }
     return true;
 }
 

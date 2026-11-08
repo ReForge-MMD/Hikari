@@ -155,6 +155,7 @@ private:
     bool camera_follow_state(Vec3& bone_position, Quat& rotation, float& scale) const;
     Quat camera_orientation() const;
     void rebuild_motion_keyframes();
+    void drop_model_motion();
     void sync_audio_playback();
     void evaluate_frame(float frame);
     formats::VmdMotion build_authored_vmd() const;

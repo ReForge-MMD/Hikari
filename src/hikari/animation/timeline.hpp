@@ -38,6 +38,21 @@ struct SceneSample {
     std::optional<SceneShadowSample> shadow;
 };
 
+// Which independent documents a VMD carries. Camera/light/shadow form the
+// scene motion; bone/morph/IK form the model motion.
+struct MotionChannelPresence {
+    bool scene = false;
+    bool model = false;
+};
+
+MotionChannelPresence motion_channels(const formats::VmdMotion& motion);
+
+// Merges the channels present in incoming into existing. Scene channels are
+// replaced one by one, while a model motion replaces the whole bone/morph/IK
+// group so a file without morph keys does not keep stale morphs.
+formats::VmdMotion merge_motion_channels(const formats::VmdMotion& incoming,
+                                         const formats::VmdMotion& existing);
+
 class MotionPlayer {
 public:
     explicit MotionPlayer(const formats::VmdMotion& motion);

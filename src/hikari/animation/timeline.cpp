@@ -104,6 +104,36 @@ float segment_t(std::uint32_t a, std::uint32_t b, float frame) {
 
 } // namespace
 
+MotionChannelPresence motion_channels(const formats::VmdMotion& motion) {
+    MotionChannelPresence presence;
+    presence.scene = !motion.camera_frames.empty() || !motion.light_frames.empty() ||
+                     !motion.shadow_frames.empty();
+    presence.model = !motion.bone_frames.empty() || !motion.morph_frames.empty() ||
+                     !motion.ik_frames.empty();
+    return presence;
+}
+
+formats::VmdMotion merge_motion_channels(const formats::VmdMotion& incoming,
+                                         const formats::VmdMotion& existing) {
+    formats::VmdMotion merged = existing;
+    if (!incoming.camera_frames.empty()) {
+        merged.camera_frames = incoming.camera_frames;
+    }
+    if (!incoming.light_frames.empty()) {
+        merged.light_frames = incoming.light_frames;
+    }
+    if (!incoming.shadow_frames.empty()) {
+        merged.shadow_frames = incoming.shadow_frames;
+    }
+    if (motion_channels(incoming).model) {
+        merged.bone_frames = incoming.bone_frames;
+        merged.morph_frames = incoming.morph_frames;
+        merged.ik_frames = incoming.ik_frames;
+        merged.model_name = incoming.model_name;
+    }
+    return merged;
+}
+
 MotionPlayer::MotionPlayer(const formats::VmdMotion& motion) {
     for (const auto& frame : motion.bone_frames) {
         max_frame = std::max(max_frame, frame.frame);
