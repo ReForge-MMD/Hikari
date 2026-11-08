@@ -22,6 +22,9 @@ public:
     void load(AudioTrack track, std::string* error);
     void unload();
     bool has_track() const;
+    // Decoded samples stay available for offline export even when the audio
+    // device could not be opened.
+    const AudioTrack& track() const;
 
     void play(double seconds);
     void stop();

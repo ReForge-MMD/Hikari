@@ -27,8 +27,9 @@ if(HIKARI_BUILD_STUDIO)
     test_frustum.cpp
     test_project.cpp
     test_state.cpp
+    test_video.cpp
   )
-  target_link_libraries(hikari_tests PRIVATE Qt6::Widgets Qt6::Gui Qt6::Core)
+  target_link_libraries(hikari_tests PRIVATE hikari_video Qt6::Widgets Qt6::Gui Qt6::Core)
   add_custom_command(TARGET hikari_tests POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "$<TARGET_FILE:Qt6::Core>" "$<TARGET_FILE:Qt6::Gui>"

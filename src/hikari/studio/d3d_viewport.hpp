@@ -6,6 +6,7 @@
 #include <QStringList>
 #include <QWidget>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <set>
@@ -19,6 +20,7 @@
 #include "hikari/studio/app_state.hpp"
 #include "hikari/studio/model_instance.hpp"
 #include "hikari/studio/project_io.hpp"
+#include "hikari/video/video_encoder.hpp"
 
 class QTimer;
 
@@ -29,6 +31,17 @@ class AudioPlayer;
 namespace hikari::studio {
 
 class ViewGizmo;
+
+struct VideoExportOptions {
+    QString path;
+    video::VideoFormat format = video::VideoFormat::Mp4H264;
+    int start_frame = 0;
+    int end_frame = 0;
+    int fps = 30;
+    int bitrate_mbps = 8;
+    bool include_audio = true;
+    QSize render_size;
+};
 
 class D3DViewport : public QWidget {
     Q_OBJECT
@@ -65,6 +78,9 @@ public:
     void request_physics_reset();
     bool capture_image(const QString& path);
     bool render_frames(const QString& directory, int start, int end, int fps);
+    bool export_video(const VideoExportOptions& options,
+                      const std::function<bool(int, int)>& progress);
+    bool has_audio() const;
 
     void set_screen_size(int width, int height);
     QSize effective_screen_size() const;
@@ -131,6 +147,7 @@ private:
     void update_stats();
     void tick();
     void tick_impl();
+    void prepare_export_frame(float frame, int fps);
     bool physics_active() const;
     void render_scene();
     render::OverlayGeometry build_overlay_geometry() const;
@@ -206,6 +223,7 @@ private:
     bool middle_down_ = false;
     bool initialized_ = false;
     bool physics_was_active_ = false;
+    bool exporting_ = false;
     float last_editor_frame_ = -1.0f;
 };
 

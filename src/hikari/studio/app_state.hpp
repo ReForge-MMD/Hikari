@@ -286,6 +286,9 @@ struct StudioAppState {
     int video_render_start_frame = 0;
     int video_render_end_frame = 300;
     int video_render_fps = 30;
+    int video_export_format = 0;
+    int video_export_bitrate_mbps = 8;
+    bool video_export_include_audio = true;
 
     QString status_message;
     QElapsedTimer status_timer;

@@ -73,6 +73,7 @@ private:
     void show_about_dialog();
     void show_screen_size_dialog();
     void show_render_video_dialog();
+    void show_export_video_dialog();
     void choose_model();
     void choose_motion();
     void choose_motion_save();

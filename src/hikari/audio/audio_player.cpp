@@ -30,6 +30,7 @@ struct AudioPlayer::Impl {
     AudioTrack track;
     float volume = 1.0f;
     bool running = false;
+    bool playback_failed = false;
     bool com_initialized = false;
     double base_seconds = 0.0;
     std::chrono::steady_clock::time_point started_at{};
@@ -135,15 +136,17 @@ void AudioPlayer::load(AudioTrack track, std::string* error) {
     impl_->track = std::move(track);
     impl_->base_seconds = 0.0;
     impl_->running = false;
+    impl_->playback_failed = false;
     if (impl_->track.samples.empty()) {
         return;
     }
     if (impl_->xaudio2 == nullptr && !initialize(error)) {
-        impl_->track = AudioTrack{};
+        impl_->playback_failed = true;
         return;
     }
     if (!impl_->ensure_source(error)) {
-        impl_->track = AudioTrack{};
+        // Keep the decoded samples; offline export still needs them.
+        impl_->playback_failed = true;
     }
 }
 
@@ -156,12 +159,19 @@ void AudioPlayer::unload() {
     impl_->track = AudioTrack{};
     impl_->base_seconds = 0.0;
     impl_->running = false;
+    impl_->playback_failed = false;
 }
 
 bool AudioPlayer::has_track() const { return !impl_->track.samples.empty(); }
 
+const AudioTrack& AudioPlayer::track() const { return impl_->track; }
+
 void AudioPlayer::play(double seconds) {
-    if (!has_track() || !impl_->ensure_source(nullptr)) {
+    if (!has_track() || impl_->playback_failed) {
+        return;
+    }
+    if (!impl_->ensure_source(nullptr)) {
+        impl_->playback_failed = true;
         return;
     }
     impl_->source->Stop(0);

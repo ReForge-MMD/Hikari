@@ -6,6 +6,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -34,6 +35,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -50,6 +52,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <numeric>
 
 #include "hikari/studio/curve_editor.hpp"
@@ -590,6 +593,8 @@ void MainWindow::build_menus() {
                          [this] { choose_render_image(); });
     file_menu->addAction(QStringLiteral("Render Frame Sequence..."), this,
                          [this] { show_render_video_dialog(); });
+    file_menu->addAction(QStringLiteral("Export Video..."), this,
+                         [this] { show_export_video_dialog(); });
     file_menu->addAction(QStringLiteral("Set Working Directory..."), this, [this] {
         const QString directory =
             QFileDialog::getExistingDirectory(this,
@@ -3157,6 +3162,190 @@ void MainWindow::show_render_video_dialog() {
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
     localization::apply(&dialog);
     dialog.exec();
+}
+
+void MainWindow::show_export_video_dialog() {
+    QDialog dialog(this);
+    dialog.setWindowTitle(localization::text(QStringLiteral("Export Video")));
+    auto* layout = new QVBoxLayout(&dialog);
+
+    const auto& formats = video::video_formats();
+    const auto extension_for = [](int value) {
+        return QString::fromUtf8(
+            video::video_format_info(static_cast<video::VideoFormat>(value)).extension);
+    };
+
+    auto* format = new QComboBox();
+    for (const auto& info : formats) {
+        if (!video::video_format_available(info.format)) {
+            continue;
+        }
+        format->addItem(QString::fromUtf8(info.label), static_cast<int>(info.format));
+    }
+    if (format->count() == 0) {
+        QMessageBox::warning(
+            this, localization::text(QStringLiteral("Export Video")),
+            localization::text(
+                QStringLiteral("No video encoder is available on this system.")));
+        return;
+    }
+    int format_index = format->findData(state_.video_export_format);
+    if (format_index < 0) {
+        format_index = 0;
+    }
+    format->setCurrentIndex(format_index);
+
+    auto* path_row = new QHBoxLayout();
+    auto* path_edit = new QLineEdit();
+    path_edit->setText(QDir(state_.default_directory)
+                           .filePath(QStringLiteral("hikari_render.") +
+                                     extension_for(format->currentData().toInt())));
+    auto* browse = new QPushButton(localization::text(QStringLiteral("Browse...")));
+    path_row->addWidget(path_edit, 1);
+    path_row->addWidget(browse);
+    layout->addLayout(path_row);
+
+    auto* start = new QSpinBox();
+    start->setRange(0, 100000);
+    start->setValue(state_.video_render_start_frame);
+    auto* end = new QSpinBox();
+    end->setRange(0, 100000);
+    end->setValue(state_.video_render_end_frame);
+    auto* fps = new QComboBox();
+    for (const int value : {24, 30, 60}) {
+        fps->addItem(QStringLiteral("%1 FPS").arg(value), value);
+    }
+    fps->setCurrentIndex(fps->findData(state_.video_render_fps) < 0
+                             ? 1
+                             : fps->findData(state_.video_render_fps));
+    auto* bitrate = new QSpinBox();
+    bitrate->setRange(1, 50);
+    bitrate->setSuffix(QStringLiteral(" Mbps"));
+    bitrate->setValue(std::clamp(state_.video_export_bitrate_mbps, 1, 50));
+    auto* audio = new QCheckBox(localization::text(QStringLiteral("Include audio")));
+    audio->setChecked(state_.video_export_include_audio && viewport_->has_audio());
+    audio->setEnabled(viewport_->has_audio());
+
+    auto* grid = new QGridLayout();
+    add_row(grid, 0, QStringLiteral("Format"), format);
+    add_row(grid, 1, QStringLiteral("Start frame"), start);
+    add_row(grid, 2, QStringLiteral("End frame"), end);
+    add_row(grid, 3, QStringLiteral("FPS"), fps);
+    add_row(grid, 4, QStringLiteral("Bitrate"), bitrate);
+    layout->addLayout(grid);
+    layout->addWidget(audio);
+
+    const QSize size = viewport_->effective_screen_size();
+    layout->addWidget(make_hint(
+        QStringLiteral("Frames are rendered at the viewport render size: %1 x %2.")
+            .arg(size.width())
+            .arg(size.height())));
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(buttons);
+
+    connect(format, &QComboBox::currentIndexChanged, &dialog,
+            [path_edit, format, extension_for](int) {
+                const QFileInfo info(path_edit->text());
+                const QString base = info.completeBaseName().isEmpty()
+                                         ? QStringLiteral("hikari_render")
+                                         : info.completeBaseName();
+                path_edit->setText(QDir(info.absolutePath())
+                                       .filePath(base + QLatin1Char('.') +
+                                                 extension_for(format->currentData().toInt())));
+            });
+    connect(browse, &QPushButton::clicked, &dialog, [this, path_edit, format, extension_for] {
+        QString path = QFileDialog::getSaveFileName(
+            this, localization::text(QStringLiteral("Export Video")), path_edit->text(),
+            localization::text(QStringLiteral("Video files (*.mp4 *.mov *.mkv *.ts *.avi)")));
+        if (path.isEmpty()) {
+            return;
+        }
+        if (QFileInfo(path).suffix().isEmpty()) {
+            path += QLatin1Char('.') + extension_for(format->currentData().toInt());
+        }
+        path_edit->setText(path);
+    });
+
+    VideoExportOptions options;
+    bool accepted = false;
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
+        QString path = path_edit->text().trimmed();
+        if (path.isEmpty()) {
+            QMessageBox::warning(&dialog, localization::text(QStringLiteral("Export Video")),
+                                 localization::text(QStringLiteral("Choose an output file.")));
+            return;
+        }
+        if (QFileInfo(path).suffix().isEmpty()) {
+            path += QLatin1Char('.') + extension_for(format->currentData().toInt());
+            path_edit->setText(path);
+        }
+        if (end->value() < start->value()) {
+            QMessageBox::warning(&dialog, localization::text(QStringLiteral("Export Video")),
+                                 localization::text(
+                                     QStringLiteral("The end frame must not precede the start "
+                                                    "frame.")));
+            return;
+        }
+        const auto selected = static_cast<video::VideoFormat>(format->currentData().toInt());
+        if (!video::video_format_available(selected)) {
+            QMessageBox::warning(
+                &dialog, localization::text(QStringLiteral("Export Video")),
+                localization::text(QStringLiteral(
+                    "The selected encoder is not available on this system.")));
+            return;
+        }
+        state_.video_export_format = format->currentData().toInt();
+        state_.video_render_start_frame = start->value();
+        state_.video_render_end_frame = end->value();
+        state_.video_render_fps = fps->currentData().toInt();
+        state_.video_export_bitrate_mbps = bitrate->value();
+        state_.video_export_include_audio = audio->isChecked() && audio->isEnabled();
+        options.path = path;
+        options.format = selected;
+        options.start_frame = start->value();
+        options.end_frame = end->value();
+        options.fps = fps->currentData().toInt();
+        options.bitrate_mbps = bitrate->value();
+        options.include_audio = state_.video_export_include_audio;
+        options.render_size = viewport_->effective_screen_size();
+        accepted = true;
+        dialog.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    localization::apply(&dialog);
+    dialog.exec();
+    if (!accepted) {
+        return;
+    }
+
+    const int total = std::max(
+        1, static_cast<int>(std::llround(
+               static_cast<double>(options.end_frame - options.start_frame + 1) *
+               static_cast<double>(options.fps) / 30.0)));
+    QProgressDialog progress(localization::text(QStringLiteral("Exporting video...")),
+                             localization::text(QStringLiteral("Cancel")), 0, total, this);
+    progress.setWindowTitle(localization::text(QStringLiteral("Export Video")));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setValue(0);
+    progress.show();
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    try {
+        viewport_->export_video(options, [&progress](int current, int total_frames) {
+            progress.setMaximum(total_frames);
+            progress.setValue(current);
+            QCoreApplication::processEvents();
+            return !progress.wasCanceled();
+        });
+    } catch (const std::exception& error) {
+        state_.set_status(QStringLiteral("Video export failed: %1")
+                              .arg(QString::fromUtf8(error.what())));
+    }
+    QApplication::restoreOverrideCursor();
+    progress.close();
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event) {

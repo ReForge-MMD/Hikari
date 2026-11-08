@@ -956,6 +956,10 @@ void D3DViewport::unload_audio() {
     state_.audio_peaks.clear();
 }
 
+bool D3DViewport::has_audio() const {
+    return audio_player_ != nullptr && audio_player_->has_track();
+}
+
 formats::VmdMotion D3DViewport::build_authored_vmd() const {
     const ModelInstance* model = active_model();
     formats::VmdMotion motion;
@@ -2016,61 +2020,86 @@ bool D3DViewport::capture_image(const QString& path) {
     }
 }
 
+void D3DViewport::prepare_export_frame(float frame, int fps) {
+    ModelInstance* active = active_model();
+    state_.current_frame = frame;
+    if (!motion_player_ && active != nullptr) {
+        active->morphs.reset();
+    }
+    evaluate_frame(frame);
+
+    std::vector<animation::MorphResult> morph_results;
+    morph_results.reserve(models_.size());
+    for (auto& model : models_) {
+        if (model.get() == active) {
+            for (auto it = state_.morph_weights.begin(); it != state_.morph_weights.end(); ++it) {
+                model->morphs.set_weight(it.key().toStdString(), it.value());
+            }
+        }
+        morph_results.push_back(model->morphs.evaluate());
+        apply_bone_morphs(*model, morph_results.back());
+        if (model.get() == active) {
+            apply_editor_bone_override();
+        }
+    }
+    resolve_op_bindings();
+
+    const float dt = 1.0f / static_cast<float>(std::max(fps, 1));
+    const bool simulate = physics_active();
+    for (std::size_t i = 0; i < models_.size(); ++i) {
+        ModelInstance& model = *models_[i];
+        const animation::MorphResult& morph_result = morph_results[i];
+        if (model.physics_rig) {
+            model.physics_rig->set_gravity_vec(state_.gravity);
+            model.physics_rig->set_time_scale(state_.physics_speed);
+            model.physics_rig->set_ground_enabled(state_.ground_collision);
+            for (const auto& impulse : morph_result.impulses) {
+                model.physics_rig->apply_impulse(impulse.body_index, impulse.local,
+                                                 impulse.velocity, impulse.torque);
+            }
+            if (simulate) {
+                model.skeleton.apply_physics(*model.physics_rig, dt);
+                if (state_.jiggle_enabled && model.jiggle) {
+                    model.skeleton.apply_jiggle(*model.jiggle, dt, model.jiggle_settings);
+                }
+            }
+        }
+        apply_material_morphs(model, morph_result);
+        model.mesh.apply_morph_offsets(*context_, morph_result.position_offsets,
+                                       morph_result.uv_offsets);
+    }
+    update_camera();
+    render_scene();
+}
+
 bool D3DViewport::render_frames(const QString& directory, int start, int end, int fps) {
     if (!context_ || !renderer_) {
+        return false;
+    }
+    if (end < start) {
+        emit statusMessage(QStringLiteral("Invalid frame range: %1..%2").arg(start).arg(end));
         return false;
     }
     QDir().mkpath(directory);
     const float saved_frame = state_.current_frame;
     const bool saved_playing = state_.is_playing;
+    const bool saved_exporting = exporting_;
+    const bool timer_was_active = timer_->isActive();
     state_.is_playing = false;
-    ModelInstance* active = active_model();
+    exporting_ = true;
+    timer_->stop();
+    if (audio_player_) {
+        audio_player_->stop();
+        audio_playing_ = false;
+    }
     for (auto& model : models_) {
         if (model->physics_rig) {
             model->physics_rig->request_reset();
         }
     }
+    last_editor_frame_ = -1.0f;
     for (int frame = start; frame <= end; ++frame) {
-        state_.current_frame = static_cast<float>(frame);
-        if (!motion_player_ && active != nullptr) {
-            active->morphs.reset();
-        }
-        evaluate_frame(static_cast<float>(frame));
-        std::vector<animation::MorphResult> morph_results;
-        morph_results.reserve(models_.size());
-        for (auto& model : models_) {
-            if (model.get() == active) {
-                for (auto it = state_.morph_weights.begin();
-                     it != state_.morph_weights.end(); ++it) {
-                    model->morphs.set_weight(it.key().toStdString(), it.value());
-                }
-            }
-            morph_results.push_back(model->morphs.evaluate());
-            apply_bone_morphs(*model, morph_results.back());
-            if (model.get() == active) {
-                apply_editor_bone_override();
-            }
-        }
-        resolve_op_bindings();
-        for (std::size_t i = 0; i < models_.size(); ++i) {
-            ModelInstance& model = *models_[i];
-            const animation::MorphResult& morph_result = morph_results[i];
-            if (model.physics_rig) {
-                for (const auto& impulse : morph_result.impulses) {
-                    model.physics_rig->apply_impulse(impulse.body_index, impulse.local,
-                                                     impulse.velocity, impulse.torque);
-                }
-            }
-            if (physics_active() && model.physics_rig) {
-                model.skeleton.apply_physics(*model.physics_rig,
-                                             1.0f / static_cast<float>(std::max(fps, 1)));
-            }
-            apply_material_morphs(model, morph_result);
-            model.mesh.apply_morph_offsets(*context_, morph_result.position_offsets,
-                                           morph_result.uv_offsets);
-        }
-        update_camera();
-        render_scene();
+        prepare_export_frame(frame, fps);
         try {
             const auto capture = context_->capture_scene();
             const QString file = QDir(directory).filePath(
@@ -2078,10 +2107,15 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
             core::save_bmp(to_wstring(file), capture.width, capture.height, capture.rgba);
         } catch (...) {
         }
-        context_->present(1);
     }
+    exporting_ = saved_exporting;
     state_.current_frame = saved_frame;
     state_.is_playing = saved_playing;
+    if (timer_was_active) {
+        timer_->start();
+    }
+    evaluate_frame(saved_frame);
+    render_scene();
     emit statusMessage(QStringLiteral("Rendered frames %1..%2 to: %3")
                            .arg(start)
                            .arg(end)
@@ -2089,7 +2123,166 @@ bool D3DViewport::render_frames(const QString& directory, int start, int end, in
     return true;
 }
 
+bool D3DViewport::export_video(const VideoExportOptions& options,
+                               const std::function<bool(int, int)>& progress) {
+    if (!context_ || !renderer_) {
+        return false;
+    }
+    if (options.path.isEmpty() || options.end_frame < options.start_frame) {
+        emit statusMessage(QStringLiteral("Invalid video export range or path"));
+        return false;
+    }
+
+    const QSize requested =
+        options.render_size.isValid() ? options.render_size : effective_screen_size();
+    const int width = std::max(requested.width(), 16);
+    const int height = std::max(requested.height(), 16);
+    const int fps = std::max(options.fps, 1);
+
+    video::VideoEncoderSettings settings;
+    settings.format = options.format;
+    settings.width = width;
+    settings.height = height;
+    settings.fps = fps;
+    settings.video_bitrate = std::max(options.bitrate_mbps, 1) * 1'000'000;
+    settings.include_audio =
+        options.include_audio && audio_player_ != nullptr && audio_player_->has_track();
+
+    video::VideoEncoderThread encoder;
+    std::string error;
+    if (!encoder.open(options.path.toStdString(), settings, &error)) {
+        emit statusMessage(QStringLiteral("Video export failed: %1")
+                               .arg(QString::fromStdString(error)));
+        return false;
+    }
+
+    const int saved_width = state_.screen_size_width;
+    const int saved_height = state_.screen_size_height;
+    const float saved_frame = state_.current_frame;
+    const bool saved_playing = state_.is_playing;
+    const bool saved_exporting = exporting_;
+    const bool timer_was_active = timer_->isActive();
+    state_.is_playing = false;
+    state_.screen_size_width = width;
+    state_.screen_size_height = height;
+    apply_screen_size();
+    exporting_ = true;
+    timer_->stop();
+    if (audio_player_) {
+        audio_player_->stop();
+        audio_playing_ = false;
+    }
+    for (auto& model : models_) {
+        if (model->physics_rig) {
+            model->physics_rig->request_reset();
+        }
+    }
+
+    last_editor_frame_ = -1.0f;
+    const audio::AudioTrack* track = settings.include_audio ? &audio_player_->track() : nullptr;
+    const double sample_rate = static_cast<double>(audio::kOutputSampleRate);
+    const double offset_seconds = static_cast<double>(state_.audio_offset_frames) / 30.0;
+    constexpr double kTimelineFps = 30.0;
+    const double start_seconds =
+        static_cast<double>(options.start_frame) / kTimelineFps;
+    const double end_seconds =
+        static_cast<double>(options.end_frame + 1) / kTimelineFps;
+    const double volume = std::clamp(state_.audio_volume, 0.0f, 1.0f);
+    const int total = std::max(
+        1, static_cast<int>(std::llround((end_seconds - start_seconds) *
+                                         static_cast<double>(fps))));
+    std::vector<float> chunk;
+    bool ok = true;
+    bool cancelled = false;
+    for (int index = 0; index < total && ok; ++index) {
+        const double frame = static_cast<double>(options.start_frame) +
+                             static_cast<double>(index) * kTimelineFps /
+                                 static_cast<double>(fps);
+        try {
+            prepare_export_frame(static_cast<float>(frame), fps);
+            const auto capture = context_->capture_scene();
+            if (capture.width != static_cast<std::uint32_t>(width) ||
+                capture.height != static_cast<std::uint32_t>(height)) {
+                error = "rendered frame size does not match the requested video size";
+                ok = false;
+                break;
+            }
+            ok = encoder.write_video_frame(capture.rgba.data(), &error);
+        } catch (const std::exception& exception) {
+            error = exception.what();
+            ok = false;
+            break;
+        }
+        if (!ok) {
+            break;
+        }
+        if (track != nullptr) {
+            const double t0 =
+                start_seconds + static_cast<double>(index) / static_cast<double>(fps);
+            const double t1 =
+                start_seconds + static_cast<double>(index + 1) / static_cast<double>(fps);
+            const auto first = static_cast<std::int64_t>(
+                std::llround((t0 - offset_seconds) * sample_rate));
+            const auto last = static_cast<std::int64_t>(
+                std::llround((t1 - offset_seconds) * sample_rate));
+            const std::size_t count =
+                static_cast<std::size_t>(std::max<std::int64_t>(last - first, 0));
+            chunk.assign(count * static_cast<std::size_t>(audio::kOutputChannels), 0.0f);
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto source = first + static_cast<std::int64_t>(i);
+                if (source < 0 || source >= track->frame_count) {
+                    continue;
+                }
+                const auto sample_index =
+                    static_cast<std::size_t>(source) * audio::kOutputChannels;
+                chunk[i * audio::kOutputChannels + 0] =
+                    track->samples[sample_index + 0] * volume;
+                chunk[i * audio::kOutputChannels + 1] =
+                    track->samples[sample_index + 1] * volume;
+            }
+            ok = encoder.write_audio(chunk.data(), count, &error);
+        }
+        if (ok && progress && !progress(index + 1, total)) {
+            cancelled = true;
+            ok = false;
+        }
+    }
+
+    std::string finish_error;
+    if (!encoder.finish(&finish_error) && ok) {
+        error = finish_error;
+        ok = false;
+    }
+
+    exporting_ = saved_exporting;
+    state_.screen_size_width = saved_width;
+    state_.screen_size_height = saved_height;
+    state_.current_frame = saved_frame;
+    state_.is_playing = saved_playing;
+    apply_screen_size();
+    if (timer_was_active) {
+        timer_->start();
+    }
+    evaluate_frame(saved_frame);
+    render_scene();
+
+    if (cancelled) {
+        emit statusMessage(QStringLiteral("Video export cancelled"));
+        return false;
+    }
+    if (!ok) {
+        emit statusMessage(QStringLiteral("Video export failed: %1")
+                               .arg(QString::fromStdString(error)));
+        return false;
+    }
+    emit statusMessage(QStringLiteral("Exported video: %1").arg(options.path));
+    return true;
+}
+
 void D3DViewport::tick() {
+    if (exporting_) {
+        return;
+    }
     try {
         tick_impl();
     } catch (const std::exception& error) {
@@ -2338,7 +2531,7 @@ void D3DViewport::sync_audio_playback() {
         if (!audio_playing_ ||
             std::abs(audio_player_->position_seconds() - expected) > 0.2) {
             audio_player_->play(expected);
-            audio_playing_ = true;
+            audio_playing_ = audio_player_->playing();
         }
     } else if (audio_playing_) {
         audio_player_->stop();
@@ -2348,7 +2541,7 @@ void D3DViewport::sync_audio_playback() {
 
 bool D3DViewport::physics_active() const {
     return state_.physics_mode != PhysicsMode::Disabled &&
-           (!state_.playtime_only || state_.is_playing);
+           (exporting_ || !state_.playtime_only || state_.is_playing);
 }
 
 void D3DViewport::evaluate_frame(float frame) {
