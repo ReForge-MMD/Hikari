@@ -66,6 +66,9 @@ struct TrackKeyframe {
     // Camera follow-bone target carried by camera keys (MMD CameraKey pair).
     int parent_model = -1;
     int parent_bone = 0;
+    // Camera offset from the followed bone, expressed in the bone's local
+    // frame. MMD keeps the parent-relative camera position this way.
+    std::array<float, 3> follow_offset{0.0f, 0.0f, 0.0f};
 };
 
 using TrackKeyframeMap = std::map<QString, std::map<unsigned int, TrackKeyframe>>;
@@ -147,9 +150,11 @@ struct StudioAppState {
     float accessory_alpha = 1.0f;
     bool accessory_shadow = true;
 
-    float camera_distance = 50.0f;
+    // Studio camera distance: positive means the eye sits away from the focus,
+    // negative means it crossed the pivot. VMD stores the opposite sign.
+    float camera_distance = 45.0f;
     float camera_yaw = 0.0f;
-    float camera_pitch = 0.15f;
+    float camera_pitch = 0.0f;
     float camera_roll = 0.0f;
     std::array<float, 3> camera_pan{0.0f, 10.0f, 0.0f};
     float camera_fov_deg = 30.0f;
@@ -159,6 +164,11 @@ struct StudioAppState {
     bool camera_follow = false;
     int camera_parent_model = -1;
     int camera_parent_bone = 0;
+    std::array<float, 3> camera_follow_offset{0.0f, 0.0f, 0.0f};
+    // Near/far clipping. A larger near plane removes geometry around a POV
+    // camera, such as the head the camera sits inside.
+    float camera_near_clip = 0.1f;
+    float camera_far_clip = 1000.0f;
 
     PhysicsMode physics_mode = PhysicsMode::Anytime;
     bool playtime_only = false;

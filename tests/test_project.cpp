@@ -107,11 +107,14 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     project.camera_mode = false;
     project.scene.camera_pan = {1.0f, 2.0f, 3.0f};
     project.scene.camera_yaw = 0.3f;
-    project.scene.camera_distance = 25.0f;
+    project.scene.camera_distance = -45.0f;
     project.scene.camera_target = hikari::studio::CameraTarget::SelectedBone;
     project.scene.camera_follow = true;
     project.scene.camera_parent_model = 1;
     project.scene.camera_parent_bone = 7;
+    project.scene.camera_follow_offset = {1.0f, 2.0f, 3.0f};
+    project.scene.camera_near_clip = 0.5f;
+    project.scene.camera_far_clip = 5000.0f;
     project.scene.shadow_mode = hikari::studio::ShadowMode::Mode2;
     project.scene.gravity = {0.0f, -9.8f, 0.5f};
 
@@ -135,6 +138,7 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     key.ik_enabled.insert("左足ＩＫ", false);
     key.parent_model = 1;
     key.parent_bone = 7;
+    key.follow_offset = {4.0f, 5.0f, 6.0f};
     key.op_bindings.insert(hikari::studio::op_root_subject(),
                            hikari::studio::OpTarget{QStringLiteral("Second"),
                                                     QStringLiteral("センター")});
@@ -160,10 +164,14 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE(parsed->play_end == 100);
     REQUIRE_FALSE(parsed->camera_mode);
     REQUIRE(parsed->scene.camera_pan[1] == Catch::Approx(2.0f));
+    REQUIRE(parsed->scene.camera_distance == Catch::Approx(-45.0f));
     REQUIRE(parsed->scene.camera_target == hikari::studio::CameraTarget::SelectedBone);
     REQUIRE(parsed->scene.camera_follow);
     REQUIRE(parsed->scene.camera_parent_model == 1);
     REQUIRE(parsed->scene.camera_parent_bone == 7);
+    REQUIRE(parsed->scene.camera_follow_offset[2] == Catch::Approx(3.0f));
+    REQUIRE(parsed->scene.camera_near_clip == Catch::Approx(0.5f));
+    REQUIRE(parsed->scene.camera_far_clip == Catch::Approx(5000.0f));
     REQUIRE(parsed->scene.shadow_mode == hikari::studio::ShadowMode::Mode2);
     REQUIRE(parsed->models.size() == 2);
     REQUIRE(parsed->models[0].path == "models/first.pmx");
@@ -175,6 +183,7 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE(parsed->tracks[0].key.ik_enabled.value("左足ＩＫ", true) == false);
     REQUIRE(parsed->tracks[0].key.parent_model == 1);
     REQUIRE(parsed->tracks[0].key.parent_bone == 7);
+    REQUIRE(parsed->tracks[0].key.follow_offset[1] == Catch::Approx(5.0f));
     const auto op = parsed->tracks[0].key.op_bindings.value(
         hikari::studio::op_root_subject());
     REQUIRE(op.model == "Second");

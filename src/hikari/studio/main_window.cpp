@@ -1325,11 +1325,23 @@ QWidget* MainWindow::build_camera_tab() {
     auto* layout = new QVBoxLayout(page);
     layout->setContentsMargins(12, 12, 12, 12);
     layout->setSpacing(8);
-    auto* distance = make_spin(1.0, 500.0, 0.2, 2, state_.camera_distance);
+    auto* distance = make_spin(-5000.0, 5000.0, 0.2, 2, state_.camera_distance);
+    distance->setToolTip(
+        QStringLiteral("Camera distance. Positive moves the eye away from the focus, "
+                       "negative crosses the pivot; VMD files store the opposite sign."));
+    auto* near_clip = make_spin(0.01, 10000.0, 0.05, 2, state_.camera_near_clip);
+    near_clip->setToolTip(
+        QStringLiteral("Near clipping plane. Raise it to cut away geometry around a POV "
+                       "camera, for example the head it sits inside."));
+    auto* far_clip = make_spin(10.0, 100000.0, 100.0, 1, state_.camera_far_clip);
+    far_clip->setToolTip(QStringLiteral("Far clipping plane."));
+    camera_distance_ = distance;
+    camera_near_clip_ = near_clip;
+    camera_far_clip_ = far_clip;
     auto* fov = make_spin(10.0, 120.0, 0.5, 1, state_.camera_fov_deg);
     auto* yaw = make_spin(-180.0, 180.0, 1.0, 1,
                           state_.camera_yaw * 180.0 / 3.14159265358979323846);
-    auto* pitch = make_spin(-88.0, 88.0, 1.0, 1,
+    auto* pitch = make_spin(-90.0, 90.0, 1.0, 1,
                             state_.camera_pitch * 180.0 / 3.14159265358979323846);
     auto* roll = make_spin(-180.0, 180.0, 1.0, 1,
                            state_.camera_roll * 180.0 / 3.14159265358979323846);
@@ -1349,6 +1361,8 @@ QWidget* MainWindow::build_camera_tab() {
         QStringLiteral("Camera rotation pivot in model mode: free point, model center, "
                        "or the selected bone."));
     add_row(grid, 5, QStringLiteral("Target"), camera_target_);
+    add_row(grid, 6, QStringLiteral("Near clip"), near_clip);
+    add_row(grid, 7, QStringLiteral("Far clip"), far_clip);
     layout->addLayout(grid);
 
     camera_follow_ = make_check(QStringLiteral("Follow bone (Track)"), state_.camera_follow);
@@ -1366,6 +1380,20 @@ QWidget* MainWindow::build_camera_tab() {
     camera_parent_bone_ = new QComboBox();
     follow_bone_row->addWidget(camera_parent_bone_, 1);
     layout->addLayout(follow_bone_row);
+    auto* offset_row = new QHBoxLayout();
+    offset_row->addWidget(new QLabel(QStringLiteral("Offset")));
+    const char* offset_names = "XYZ";
+    for (int i = 0; i < 3; ++i) {
+        camera_follow_offset_[static_cast<std::size_t>(i)] =
+            make_spin(-1000.0, 1000.0, 0.1, 2,
+                      state_.camera_follow_offset[static_cast<std::size_t>(i)]);
+        camera_follow_offset_[static_cast<std::size_t>(i)]->setToolTip(
+            QStringLiteral("Camera offset in the followed bone's local frame."));
+        camera_follow_offset_[static_cast<std::size_t>(i)]->setPrefix(
+            QStringLiteral("%1 ").arg(QChar(offset_names[i])));
+        offset_row->addWidget(camera_follow_offset_[static_cast<std::size_t>(i)], 1);
+    }
+    layout->addLayout(offset_row);
 
     auto* row = new QHBoxLayout();
     auto* reset = new QPushButton(QStringLiteral("Reset Camera"));
@@ -1382,6 +1410,12 @@ QWidget* MainWindow::build_camera_tab() {
         if (distance->hasFocus()) {
             state_.mode = EditorMode::Camera;
         }
+    });
+    connect(near_clip, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        state_.camera_near_clip = static_cast<float>(value);
+    });
+    connect(far_clip, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        state_.camera_far_clip = static_cast<float>(value);
     });
     connect(fov, &QDoubleSpinBox::valueChanged, this, [this, fov](double value) {
         state_.camera_fov_deg = static_cast<float>(value);
@@ -1421,19 +1455,28 @@ QWidget* MainWindow::build_camera_tab() {
     connect(camera_parent_model_, &QComboBox::currentIndexChanged, this, [this](int) {
         state_.camera_parent_model = camera_parent_model_->currentData().toInt();
         state_.camera_parent_bone = 0;
+        state_.camera_follow_offset = {0.0f, 0.0f, 0.0f};
         refresh_camera_follow_combos();
     });
     connect(camera_parent_bone_, &QComboBox::currentIndexChanged, this, [this](int) {
         state_.camera_parent_bone = camera_parent_bone_->currentData().toInt();
+        state_.camera_follow_offset = {0.0f, 0.0f, 0.0f};
     });
+    for (int i = 0; i < 3; ++i) {
+        connect(camera_follow_offset_[static_cast<std::size_t>(i)],
+                &QDoubleSpinBox::valueChanged, this, [this, i](double value) {
+                    state_.camera_follow_offset[static_cast<std::size_t>(i)] =
+                        static_cast<float>(value);
+                });
+    }
     refresh_camera_follow_combos();
     connect(reset, &QPushButton::clicked, this, [this, distance, fov, yaw, pitch, roll] {
         viewport_->reset_camera();
         state_.mode = EditorMode::Camera;
-        distance->setValue(50.0);
+        distance->setValue(45.0);
         fov->setValue(30.0);
         yaw->setValue(0.0);
-        pitch->setValue(8.6);
+        pitch->setValue(0.0);
         roll->setValue(0.0);
         update_viewport_title();
         footer_->sync();
@@ -1949,6 +1992,17 @@ void MainWindow::sync_bone_fields() {
         camera_follow_->setChecked(state_.camera_follow);
         camera_follow_->blockSignals(false);
     }
+    const auto sync_camera_spin = [](QDoubleSpinBox* spin, float value) {
+        if (spin == nullptr || spin->hasFocus()) {
+            return;
+        }
+        spin->blockSignals(true);
+        spin->setValue(value);
+        spin->blockSignals(false);
+    };
+    sync_camera_spin(camera_distance_, state_.camera_distance);
+    sync_camera_spin(camera_near_clip_, state_.camera_near_clip);
+    sync_camera_spin(camera_far_clip_, state_.camera_far_clip);
     if (camera_parent_model_ != nullptr && !camera_parent_model_->hasFocus()) {
         const int want = state_.camera_parent_model < 0 ? 0 : state_.camera_parent_model + 1;
         if (camera_parent_model_->currentIndex() != want) {
@@ -1965,6 +2019,14 @@ void MainWindow::sync_bone_fields() {
             camera_parent_bone_->blockSignals(true);
             camera_parent_bone_->setCurrentIndex(want);
             camera_parent_bone_->blockSignals(false);
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        auto* spin = camera_follow_offset_[static_cast<std::size_t>(i)];
+        if (spin != nullptr && !spin->hasFocus()) {
+            spin->blockSignals(true);
+            spin->setValue(state_.camera_follow_offset[static_cast<std::size_t>(i)]);
+            spin->blockSignals(false);
         }
     }
     if (model_scale_ != nullptr && !model_scale_->hasFocus()) {
@@ -2228,7 +2290,8 @@ void MainWindow::show_op_dialog() {
             for (const QString& bone : viewport_->op_target_bone_names(model_index())) {
                 target_bone->addItem(bone, bone);
             }
-            const int index = target_bone->findData(keep);
+            const int index = target_bone->findData(
+                viewport_->op_display_bone_name(model_index(), keep));
             if (index >= 0) {
                 target_bone->setCurrentIndex(index);
             }

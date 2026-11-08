@@ -429,7 +429,7 @@ ViewportFooter::ViewportFooter(StudioAppState& state, QWidget* parent)
     }
     layout->addWidget(make_divider());
     layout->addWidget(make_caption(QStringLiteral("Dist")));
-    distance_ = make_field(0.0, 5000.0, 0.5, 2);
+    distance_ = make_field(-5000.0, 5000.0, 0.5, 2);
     distance_->setSpecialValueText(QStringLiteral("-"));
     distance_->setToolTip(QStringLiteral("Camera distance"));
     layout->addWidget(distance_);

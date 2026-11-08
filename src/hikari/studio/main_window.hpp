@@ -105,9 +105,13 @@ private:
     QActionGroup* physics_speed_group_ = nullptr;
     QComboBox* model_combo_ = nullptr;
     QComboBox* camera_target_ = nullptr;
+    QDoubleSpinBox* camera_distance_ = nullptr;
+    QDoubleSpinBox* camera_near_clip_ = nullptr;
+    QDoubleSpinBox* camera_far_clip_ = nullptr;
     QCheckBox* camera_follow_ = nullptr;
     QComboBox* camera_parent_model_ = nullptr;
     QComboBox* camera_parent_bone_ = nullptr;
+    std::array<QDoubleSpinBox*, 3> camera_follow_offset_{};
     QCheckBox* model_visible_ = nullptr;
     QDoubleSpinBox* model_scale_ = nullptr;
     QCheckBox* bone_ik_ = nullptr;

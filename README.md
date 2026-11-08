@@ -77,8 +77,12 @@ gravity, so hair and cloth react faster without extra sag.
 The bone panel's `OP Register` dialog reproduces MMD outside-parent
 registration: a control/IK bone or the whole model can follow a bone of any
 loaded model, with per-model display-key windows and the frame-register bake.
-The camera panel's `Follow bone (Track)` mode rides a chosen model bone and
-stores the parent pair in camera keyframes.
+Bone lists prefer the PMX English names and fall back to the local names when
+no English name exists. The camera panel's `Follow bone (Track)` mode rides a
+chosen model bone, stores the parent pair and a bone-local camera offset in
+camera keyframes, and the viewport marks the camera placement in camera mode.
+Distance is signed, so the eye can cross the pivot, and adjustable near/far
+clipping removes geometry around a point-of-view camera.
 
 The editor provides model, bone, facial, camera, light, shadow, accessory, view,
 playback and interpolation panels. Each panel is a dock that can be moved, tabbed,

@@ -62,6 +62,7 @@ public:
     QStringList op_subject_names() const;
     QStringList op_target_bone_names(int model_index) const;
     QList<int> op_target_bone_indices(int model_index) const;
+    QString op_display_bone_name(int model_index, const QString& name) const;
     struct OpPreview {
         bool valid = false;
         std::array<float, 3> position{0.0f, 0.0f, 0.0f};
@@ -117,6 +118,8 @@ private:
     void render_scene();
     render::OverlayGeometry build_overlay_geometry() const;
     void update_camera();
+    bool camera_follow_state(Vec3& bone_position, Quat& rotation, float& scale) const;
+    Quat camera_orientation() const;
     void evaluate_frame(float frame);
     formats::VmdMotion build_authored_vmd() const;
     HikariMotion build_hikari_motion() const;

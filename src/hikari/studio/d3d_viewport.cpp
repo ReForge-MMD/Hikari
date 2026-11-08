@@ -27,6 +27,10 @@ QString to_qstring(const std::string& value) {
     return QString::fromUtf8(value.data(), static_cast<int>(value.size()));
 }
 
+QString bone_label(const std::string& local, const std::string& english) {
+    return english.empty() ? to_qstring(local) : to_qstring(english);
+}
+
 std::optional<Vec3> project_to_screen(const Vec3& point, const Mat4& view_projection,
                                       const QRect& rect) {
     const float x = point.x * view_projection.m[0][0] + point.y * view_projection.m[1][0] +
@@ -682,7 +686,9 @@ formats::VmdMotion D3DViewport::build_authored_vmd() const {
             for (const auto& [frame, key] : keys) {
                 formats::VmdCameraFrame camera;
                 camera.frame = frame;
-                camera.distance = key.distance;
+                // The studio keeps a positive distance for an eye that sits away
+                // from the focus; VMD expects MMD's negative eye offset.
+                camera.distance = -key.distance;
                 camera.position = key.position;
                 camera.rotation = {key.angles[1], key.angles[0], key.angles[2]};
                 camera.interpolation.fill(20);
@@ -901,6 +907,9 @@ bool D3DViewport::save_project(const QString& path) {
     project.scene.camera_follow = state_.camera_follow;
     project.scene.camera_parent_model = state_.camera_parent_model;
     project.scene.camera_parent_bone = state_.camera_parent_bone;
+    project.scene.camera_follow_offset = state_.camera_follow_offset;
+    project.scene.camera_near_clip = state_.camera_near_clip;
+    project.scene.camera_far_clip = state_.camera_far_clip;
     project.scene.light_color = state_.light_color;
     project.scene.light_direction = state_.light_direction;
     project.scene.shadow_mode = state_.shadow_mode;
@@ -1006,6 +1015,9 @@ bool D3DViewport::load_project(const QString& path) {
     state_.camera_parent_model = std::clamp(project->scene.camera_parent_model, -1,
                                             static_cast<int>(models_.size()) - 1);
     state_.camera_parent_bone = std::max(project->scene.camera_parent_bone, 0);
+    state_.camera_follow_offset = project->scene.camera_follow_offset;
+    state_.camera_near_clip = std::max(project->scene.camera_near_clip, 0.01f);
+    state_.camera_far_clip = std::max(project->scene.camera_far_clip, 1.0f);
     state_.light_color = project->scene.light_color;
     state_.light_direction = project->scene.light_direction;
     state_.shadow_mode = project->scene.shadow_mode;
@@ -1128,7 +1140,7 @@ void D3DViewport::rotate_selection(int axis, float degrees) {
     if (state_.mode == EditorMode::Camera || model == nullptr ||
         !selected_bone_transform(index)) {
         if (axis == 0) {
-            state_.camera_pitch = std::clamp(state_.camera_pitch + radians, -1.55f, 1.55f);
+            state_.camera_pitch += radians;
         } else if (axis == 1) {
             state_.camera_yaw += radians;
         } else {
@@ -1167,13 +1179,10 @@ void D3DViewport::translate_selection(int axis, float amount) {
     std::size_t index = 0;
     if (state_.mode == EditorMode::Camera || model == nullptr ||
         !selected_bone_transform(index)) {
-        const float cy = std::cos(state_.camera_yaw);
-        const float sy = std::sin(state_.camera_yaw);
-        const float cp = std::cos(state_.camera_pitch);
-        const float sp = std::sin(state_.camera_pitch);
-        const Vec3 right(cy, 0.0f, sy);
-        const Vec3 up(-sp * sy, cp, sp * cy);
-        const Vec3 forward(-cp * sy, -sp, cp * cy);
+        const Quat orientation = camera_orientation();
+        const Vec3 right = orientation.rotate_vec3(Vec3::axis_x());
+        const Vec3 up = orientation.rotate_vec3(Vec3::axis_y());
+        const Vec3 forward = orientation.rotate_vec3(Vec3::axis_z());
         const Vec3 delta = axis == 0 ? right * amount
                            : axis == 1 ? up * amount
                                        : forward * amount;
@@ -1270,22 +1279,20 @@ ModelInstance* D3DViewport::model_by_name(const QString& name) {
 
 namespace {
 
-Mat4 model_scene_matrix(const ModelInstance& model) {
-    const float scale = std::max(model.scale, 1.0e-4f);
-    return Mat4::from_scale(Vec3(scale, scale, scale)) * Mat4::from_translation(model.offset);
-}
-
-Mat4 model_scene_inverse(const ModelInstance& model) {
-    const float scale = std::max(model.scale, 1.0e-4f);
-    Mat4 inverse = Mat4::identity();
-    const float inv = 1.0f / scale;
-    inverse.m[0][0] = inv;
-    inverse.m[1][1] = inv;
-    inverse.m[2][2] = inv;
-    inverse.m[3][0] = -model.offset.x * inv;
-    inverse.m[3][1] = -model.offset.y * inv;
-    inverse.m[3][2] = -model.offset.z * inv;
-    return inverse;
+// Target bone frame in the subject model's units. The target's scene position
+// is converted into subject units, but only rotation and translation are kept:
+// the subject's own scale must still apply to its geometry. Folding the scale
+// ratio into this matrix would render the attached model at the target's scale.
+Mat4 op_target_frame(const ModelInstance& subject, const ModelInstance& target,
+                     std::size_t target_bone) {
+    const float subject_scale = std::max(subject.scale, 1.0e-4f);
+    const Vec3 target_scene =
+        target.skeleton.world_matrices[target_bone].translation() * target.scale +
+        target.offset;
+    const Vec3 target_local = (target_scene - subject.offset) / subject_scale;
+    const Quat target_rotation =
+        target.skeleton.world_matrices[target_bone].rotation();
+    return Mat4::from_translation(target_local) * Mat4::from_quat(target_rotation);
 }
 
 std::optional<std::size_t> op_attachment_index(const animation::Skeleton& skeleton,
@@ -1312,8 +1319,10 @@ QMap<QString, OpTarget> D3DViewport::op_states() const {
     const auto& skeleton = model->skeleton;
     for (const auto& attachment : skeleton.attachments) {
         const QString subject =
-            attachment.is_root ? op_root_subject()
-                               : to_qstring(skeleton.bones[attachment.bone_index].name);
+            attachment.is_root
+                ? op_root_subject()
+                : bone_label(skeleton.bones[attachment.bone_index].name,
+                             skeleton.bones[attachment.bone_index].name_en);
         OpTarget target;
         if (attachment.target_model == -2) {
             target.model = op_ground_target();
@@ -1323,8 +1332,8 @@ QMap<QString, OpTarget> D3DViewport::op_states() const {
                 attachment.target_model)];
             target.model = target_model.name;
             if (attachment.target_bone < target_model.skeleton.bones.size()) {
-                target.bone =
-                    to_qstring(target_model.skeleton.bones[attachment.target_bone].name);
+                const auto& bone = target_model.skeleton.bones[attachment.target_bone];
+                target.bone = bone_label(bone.name, bone.name_en);
             }
         }
         states.insert(subject, target);
@@ -1340,9 +1349,12 @@ QStringList D3DViewport::op_subject_names() const {
     }
     const auto& skeleton = model->skeleton;
     for (const auto& attachment : skeleton.attachments) {
-        names.push_back(attachment.is_root
-                            ? op_root_subject()
-                            : to_qstring(skeleton.bones[attachment.bone_index].name));
+        if (attachment.is_root) {
+            names.push_back(op_root_subject());
+        } else {
+            const auto& bone = skeleton.bones[attachment.bone_index];
+            names.push_back(bone_label(bone.name, bone.name_en));
+        }
     }
     return names;
 }
@@ -1357,10 +1369,22 @@ QStringList D3DViewport::op_target_bone_names(int model_index) const {
         const bool tip = (bone.flags & 0x0008) == 0;
         const bool fixed_axis = (bone.flags & 0x0400) != 0;
         if (!tip || fixed_axis) {
-            names.push_back(to_qstring(bone.name));
+            names.push_back(bone_label(bone.name, bone.name_en));
         }
     }
     return names;
+}
+
+QString D3DViewport::op_display_bone_name(int model_index, const QString& name) const {
+    if (model_index < 0 || model_index >= static_cast<int>(models_.size())) {
+        return name;
+    }
+    const auto& skeleton = models_[static_cast<std::size_t>(model_index)]->skeleton;
+    if (const auto index = skeleton.find_bone_index(name.toStdString())) {
+        const auto& bone = skeleton.bones[*index];
+        return bone_label(bone.name, bone.name_en);
+    }
+    return name;
 }
 
 QList<int> D3DViewport::op_target_bone_indices(int model_index) const {
@@ -1411,8 +1435,7 @@ D3DViewport::OpPreview D3DViewport::op_preview(const QString& subject,
     if (bone_index >= model->skeleton.world_matrices.size()) {
         return preview;
     }
-    const Mat4 target_matrix = target->skeleton.world_matrices[*target_bone_index] *
-                               model_scene_matrix(*target) * model_scene_inverse(*model);
+    const Mat4 target_matrix = op_target_frame(*model, *target, *target_bone_index);
     const Mat4 palette =
         Mat4::from_translation(-model->skeleton.bones[bone_index].initial_position) *
         model->skeleton.world_matrices[bone_index];
@@ -1542,8 +1565,7 @@ void D3DViewport::op_frame_register(const QString& subject, const QString& targe
     attachment.target_bone = *target_bone_index;
     const Vec3 rest = attachment.is_root ? Vec3::zero()
                                          : model->skeleton.bones[bone_index].initial_position;
-    const Mat4 target_matrix = target->skeleton.world_matrices[*target_bone_index] *
-                               model_scene_matrix(*target) * model_scene_inverse(*model);
+    const Mat4 target_matrix = op_target_frame(*model, *target, *target_bone_index);
     const Mat4 palette =
         Mat4::from_translation(-rest) * model->skeleton.world_matrices[bone_index];
     const Mat4 local = palette * target_matrix.inverse_transform();
@@ -1556,12 +1578,13 @@ void D3DViewport::op_frame_register(const QString& subject, const QString& targe
 
 void D3DViewport::reset_camera() {
     state_.camera_yaw = 0.0f;
-    state_.camera_pitch = 0.15f;
+    state_.camera_pitch = 0.0f;
     state_.camera_roll = 0.0f;
     state_.camera_target = CameraTarget::Free;
+    state_.camera_follow_offset = {0.0f, 0.0f, 0.0f};
     const ModelInstance* model = active_model();
     if (model == nullptr) {
-        state_.camera_distance = 50.0f;
+        state_.camera_distance = 45.0f;
         state_.camera_pan = {0.0f, 10.0f, 0.0f};
         return;
     }
@@ -1571,6 +1594,7 @@ void D3DViewport::reset_camera() {
         std::max((model->bounds_max.y - model->bounds_min.y) * model->scale, 1.0f);
     const float radius = std::max(model->shadow_radius * model->scale, 1.0f);
     state_.camera_pan = center.to_array();
+    // Positive studio distance means the eye is away from the focus.
     state_.camera_distance = std::max({height * 1.6f, radius * 3.0f, 10.0f});
 }
 
@@ -1799,77 +1823,98 @@ void D3DViewport::tick_impl() {
 void D3DViewport::update_camera() {
     camera_.fov_y = state_.camera_fov_deg * 3.14159265358979323846f / 180.0f;
     camera_.orthographic = state_.camera_orthographic;
-    camera_.ortho_height = 2.0f * state_.camera_distance * std::tan(camera_.fov_y * 0.5f);
+    camera_.near_z = std::clamp(state_.camera_near_clip, 0.01f,
+                                std::max(state_.camera_far_clip * 0.5f, 0.02f));
+    camera_.far_z = std::max(state_.camera_far_clip, camera_.near_z + 0.5f);
     const QSize render_size = effective_screen_size();
     camera_.aspect = static_cast<float>(render_size.width()) /
                      static_cast<float>(std::max(render_size.height(), 1));
-    const float cy = std::cos(state_.camera_yaw);
-    const float sy = std::sin(state_.camera_yaw);
-    const float cp = std::cos(state_.camera_pitch);
-    const float sp = std::sin(state_.camera_pitch);
-    Vec3 eye_offset(state_.camera_distance * cp * sy,
-                    state_.camera_distance * sp,
-                    -state_.camera_distance * cp * cy);
-    Vec3 pan = Vec3::from_array(state_.camera_pan);
+    Vec3 focus = Vec3::from_array(state_.camera_pan);
     if (state_.mode == EditorMode::Model && state_.camera_target != CameraTarget::Free) {
         if (const ModelInstance* model = active_model()) {
             bool resolved = false;
             if (state_.camera_target == CameraTarget::Model) {
-                pan = (model->bounds_min + model->bounds_max) * 0.5f * model->scale +
-                      model->offset;
+                focus = (model->bounds_min + model->bounds_max) * 0.5f * model->scale +
+                        model->offset;
                 resolved = true;
             } else if (state_.camera_target == CameraTarget::SelectedBone &&
                        state_.selected_bone_idx) {
                 const std::size_t index =
                     static_cast<std::size_t>(*state_.selected_bone_idx);
                 if (index < model->skeleton.world_positions.size()) {
-                    pan = model->skeleton.world_positions[index] * model->scale + model->offset;
+                    focus = model->skeleton.world_positions[index] * model->scale + model->offset;
                     resolved = true;
                 }
             }
             if (resolved) {
-                state_.camera_pan = pan.to_array();
+                state_.camera_pan = focus.to_array();
             }
         }
     }
-    // Follow bone (MMD "Track"): the pivot becomes the bone's world position
-    // and the whole camera basis inherits the bone's world rotation.
-    bool following = false;
-    Quat follow_rotation = Quat::identity();
-    const bool follow_enabled =
+
+    // Follow bone (MMD "Track"): the pivot is the bone's world position and the
+    // studio keeps an extra focus offset in the bone's local frame.
+    Vec3 follow_bone;
+    Quat follow_rotation;
+    float follow_scale = 1.0f;
+    const bool following = camera_follow_state(follow_bone, follow_rotation, follow_scale);
+    if (following) {
+        const Vec3 local_offset = Vec3::from_array(state_.camera_follow_offset);
+        focus = follow_bone + follow_rotation.rotate_vec3(local_offset * follow_scale);
+        state_.camera_pan = focus.to_array();
+    }
+
+    // MMD rotates the scene by Ry(yaw) * Rx(pitch) * Rz(roll) around the focus
+    // and looks down +Z from a fixed eye, so the eye's Z is the signed camera
+    // distance. place_mmd() is the equivalent world camera: both the eye offset
+    // and the basis come from the inverse of that rotation.
+    const Quat orientation = camera_orientation();
+    const float distance_scale = following ? follow_scale : 1.0f;
+    // Studio convention: positive distance means the eye is farther from the
+    // focus, negative means it crossed to the other side. The MMD eye sits on
+    // the negative local Z axis, so the sign flips here.
+    camera_.place_mmd(focus, orientation, -state_.camera_distance * distance_scale);
+    camera_.ortho_height = render::Camera::mmd_ortho_height(state_.camera_distance,
+                                                            camera_.aspect, distance_scale);
+}
+
+bool D3DViewport::camera_follow_state(Vec3& bone_position, Quat& rotation,
+                                      float& scale) const {
+    const bool enabled =
         state_.camera_follow && state_.camera_parent_model >= 0 &&
         (state_.mode == EditorMode::Camera || state_.is_playing ||
          active_model_ == state_.camera_parent_model);
-    if (follow_enabled &&
-        state_.camera_parent_model < static_cast<int>(models_.size())) {
-        const ModelInstance& parent =
-            *models_[static_cast<std::size_t>(state_.camera_parent_model)];
-        const int bone_index = state_.camera_parent_bone;
-        if (bone_index >= 0 &&
-            static_cast<std::size_t>(bone_index) < parent.skeleton.world_positions.size()) {
-            const std::size_t index = static_cast<std::size_t>(bone_index);
-            pan = parent.skeleton.world_positions[index] * parent.scale + parent.offset;
-            follow_rotation = parent.skeleton.world_rotations[index];
-            following = true;
-            state_.camera_pan = pan.to_array();
-        }
+    if (!enabled || state_.camera_parent_model >= static_cast<int>(models_.size())) {
+        return false;
     }
-
-    const Vec3 base_forward = (-eye_offset).normalize();
-    const Vec3 world_up(0.0f, 1.0f, 0.0f);
-    Vec3 right = world_up.cross(base_forward);
-    right = right.length() > 1.0e-4f ? right.normalize() : Vec3(1.0f, 0.0f, 0.0f);
-    const Vec3 base_up = base_forward.cross(right).normalize();
-    Vec3 up =
-        (base_up * std::cos(state_.camera_roll) + right * std::sin(state_.camera_roll)).normalize();
-    if (following) {
-        eye_offset = follow_rotation.rotate_vec3(eye_offset);
-        up = follow_rotation.rotate_vec3(up);
+    const ModelInstance& parent =
+        *models_[static_cast<std::size_t>(state_.camera_parent_model)];
+    const int bone_index = state_.camera_parent_bone;
+    if (bone_index < 0 ||
+        static_cast<std::size_t>(bone_index) >= parent.skeleton.world_rotations.size() ||
+        static_cast<std::size_t>(bone_index) >= parent.skeleton.world_positions.size()) {
+        return false;
     }
+    const auto index = static_cast<std::size_t>(bone_index);
+    bone_position = parent.skeleton.world_positions[index] * parent.scale + parent.offset;
+    rotation = parent.skeleton.world_rotations[index];
+    scale = std::max(parent.scale, 1.0e-4f);
+    return true;
+}
 
-    camera_.position = pan + eye_offset;
-    camera_.target = pan;
-    camera_.up = up.normalize();
+Quat D3DViewport::camera_orientation() const {
+    Quat orientation =
+        render::mmd_camera_orientation(state_.camera_yaw, state_.camera_pitch,
+                                       state_.camera_roll);
+    Vec3 bone_position;
+    Quat bone_rotation;
+    float scale = 1.0f;
+    if (!camera_follow_state(bone_position, bone_rotation, scale)) {
+        return orientation;
+    }
+    // The reference attaches the camera to the bone by composing the bone
+    // rotation outside the camera rotation.
+    return (bone_rotation * orientation).normalize();
 }
 
 bool D3DViewport::physics_active() const {
@@ -1908,7 +1953,9 @@ void D3DViewport::evaluate_frame(float frame) {
                 state_.camera_yaw = sample->camera->rotation[1];
                 state_.camera_pitch = sample->camera->rotation[0];
                 state_.camera_roll = sample->camera->rotation[2];
-                state_.camera_distance = sample->camera->distance;
+                // VMD stores MMD's negative eye offset; the studio distance is
+                // positive when the eye is away from the focus.
+                state_.camera_distance = -sample->camera->distance;
                 state_.camera_fov_deg = sample->camera->fov;
                 state_.camera_orthographic = !sample->camera->perspective;
             }
@@ -2009,36 +2056,45 @@ QMap<QString, D3DViewport::OpWindow> D3DViewport::op_windows(float timeline_fram
             std::distance(track->second.begin(), std::prev(next)));
     }
 
-    const auto pair_for = [&](const TrackKeyframe& key, const QString& subject) {
+    const auto pair_for = [&](const TrackKeyframe& key, const QString& subject,
+                              const QString& fallback) {
+        const auto lookup = [&subject, &fallback](const QMap<QString, OpTarget>& entries) {
+            auto entry = entries.find(subject);
+            if (entry == entries.end() && !fallback.isEmpty()) {
+                entry = entries.find(fallback);
+            }
+            return entry != entries.end()
+                       ? entry->model + QLatin1Char('\n') + entry->bone
+                       : QString();
+        };
         if (!key.model_op.isEmpty()) {
             const auto per_model = key.model_op.find(model->name);
-            if (per_model == key.model_op.end()) {
-                return QString();
-            }
-            const auto entry = per_model->find(subject);
-            return entry != per_model->end() ? entry->model + QLatin1Char('\n') + entry->bone
-                                             : QString();
+            return per_model == key.model_op.end() ? QString() : lookup(*per_model);
         }
-        const auto legacy = key.op_bindings.find(subject);
-        return legacy != key.op_bindings.end()
-                   ? legacy->model + QLatin1Char('\n') + legacy->bone
-                   : QString();
+        return lookup(key.op_bindings);
     };
 
     for (const auto& attachment : model->skeleton.attachments) {
-        const QString subject = attachment.is_root
-                                    ? op_root_subject()
-                                    : to_qstring(model->skeleton.bones[attachment.bone_index].name);
-        const QString active_pair = pair_for(*keys[current].second, subject);
+        const QString subject =
+            attachment.is_root
+                ? op_root_subject()
+                : bone_label(model->skeleton.bones[attachment.bone_index].name,
+                             model->skeleton.bones[attachment.bone_index].name_en);
+        const QString fallback =
+            attachment.is_root
+                ? QString()
+                : to_qstring(model->skeleton.bones[attachment.bone_index].name);
+        const QString active_pair = pair_for(*keys[current].second, subject, fallback);
         OpWindow window;
         std::size_t index = current;
-        while (index > 0 && pair_for(*keys[index - 1].second, subject) == active_pair) {
+        while (index > 0 &&
+               pair_for(*keys[index - 1].second, subject, fallback) == active_pair) {
             --index;
         }
         window.start = index == 0 ? 0 : keys[index].first;
         index = current;
         while (index + 1 < keys.size() &&
-               pair_for(*keys[index + 1].second, subject) == active_pair) {
+               pair_for(*keys[index + 1].second, subject, fallback) == active_pair) {
             ++index;
         }
         window.end = index + 1 < keys.size() ? keys[index + 1].first : 0;
@@ -2108,8 +2164,7 @@ void D3DViewport::resolve_op_bindings() {
                     continue;
                 }
                 const Mat4 target_matrix =
-                    target.skeleton.world_matrices[attachment.target_bone] *
-                    model_scene_matrix(target) * model_scene_inverse(subject);
+                    op_target_frame(subject, target, attachment.target_bone);
                 if (attachment.is_root) {
                     skeleton.root_external_active = true;
                     skeleton.root_external_matrix = target_matrix;
@@ -2194,6 +2249,7 @@ void D3DViewport::apply_editor_tracks(ModelInstance* model, float frame,
                 // interpolating it.
                 state_.camera_parent_model = first->parent_model;
                 state_.camera_parent_bone = first->parent_bone;
+                state_.camera_follow_offset = first->follow_offset;
             } else if (track == QStringLiteral("light")) {
                 state_.light_color = mix3(first->position, second->position);
                 state_.light_direction = mix3(first->angles, second->angles);
@@ -2452,10 +2508,6 @@ void D3DViewport::render_scene() {
 render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
     render::OverlayGeometry geometry;
     const ModelInstance* active = active_model();
-    // Skeleton and physics handles belong to model editing; camera mode is clean.
-    if (active == nullptr || state_.mode == EditorMode::Camera) {
-        return geometry;
-    }
     const QSize viewport = effective_screen_size();
     const float viewport_height = std::max(1.0f, static_cast<float>(viewport.height()));
     const Mat4 view = camera_.view_matrix();
@@ -2540,6 +2592,29 @@ render::OverlayGeometry D3DViewport::build_overlay_geometry() const {
         triangle(tip, tip - direction * head + side * (head * 0.6f),
                  tip - direction * head - side * (head * 0.6f), color);
     };
+
+    // Camera placement marker. The eye sits at the centre of its own view, so
+    // the marker is placed just past the near plane and drawn as a pixel-sized
+    // diamond with crosshair ticks.
+    if (state_.mode == EditorMode::Camera || state_.camera_follow) {
+        const Vec3 forward = (camera_.target - camera_.position).normalize();
+        const Vec3 center =
+            camera_.position + forward * std::max(camera_.near_z * 1.5f, 0.05f);
+        const std::array<float, 4> color{0.98f, 0.68f, 0.16f, 0.95f};
+        diamond(center, 4.5f, color);
+        const float step = world_per_pixel(center);
+        const float tick = 13.0f * step;
+        const float gap = 6.0f * step;
+        line(center - view_right * tick, center - view_right * gap, color);
+        line(center + view_right * gap, center + view_right * tick, color);
+        line(center - view_up * tick, center - view_up * gap, color);
+        line(center + view_up * gap, center + view_up * tick, color);
+    }
+
+    // Skeleton and physics handles belong to model editing.
+    if (active == nullptr || state_.mode == EditorMode::Camera) {
+        return geometry;
+    }
 
     const auto append_bones = [&](const ModelInstance& bone_model, bool is_active_model) {
         const Vec3 offset = bone_model.offset;
@@ -2755,35 +2830,45 @@ void D3DViewport::mouseMoveEvent(QMouseEvent* event) {
     const QPoint delta = event->pos() - last_mouse_;
     last_mouse_ = event->pos();
     if (right_down_) {
-        state_.camera_yaw += static_cast<float>(delta.x()) * 0.005f;
-        state_.camera_pitch =
-            std::clamp(state_.camera_pitch + static_cast<float>(delta.y()) * 0.005f, -1.55f, 1.55f);
+        // MMD right-drag: orbit with 0.01 rad per pixel and no pitch clamp.
+        state_.camera_yaw -= static_cast<float>(delta.x()) * 0.01f;
+        state_.camera_pitch -= static_cast<float>(delta.y()) * 0.01f;
     } else if (middle_down_) {
         if (state_.mode == EditorMode::Model && state_.camera_target != CameraTarget::Free) {
             event->accept();
             return;
         }
-        const float cy = std::cos(state_.camera_yaw);
-        const float sy = std::sin(state_.camera_yaw);
-        const float cp = std::cos(state_.camera_pitch);
-        const float sp = std::sin(state_.camera_pitch);
-        const Vec3 right(cy, 0.0f, sy);
-        const Vec3 up(-sp * sy, cp, sp * cy);
-        const float pan_speed = std::clamp(state_.camera_distance * 0.0012f, 0.005f, 1.0f);
+        const Quat orientation = camera_orientation();
+        const Vec3 right = orientation.rotate_vec3(Vec3::axis_x());
+        const Vec3 up = orientation.rotate_vec3(Vec3::axis_y());
+        const float pan_speed = (event->modifiers() & Qt::ShiftModifier) ? 0.5f
+                                : (event->modifiers() & Qt::ControlModifier) ? 0.005f
+                                                                            : 0.05f;
         const Vec3 move = right * (-static_cast<float>(delta.x()) * pan_speed) +
                           up * (static_cast<float>(delta.y()) * pan_speed);
-        state_.camera_pan[0] += move.x;
-        state_.camera_pan[1] += move.y;
-        state_.camera_pan[2] += move.z;
+        Vec3 bone_position;
+        Quat bone_rotation;
+        float follow_scale = 1.0f;
+        if (camera_follow_state(bone_position, bone_rotation, follow_scale)) {
+            const Vec3 local = bone_rotation.inverse().rotate_vec3(move);
+            state_.camera_follow_offset[0] += local.x;
+            state_.camera_follow_offset[1] += local.y;
+            state_.camera_follow_offset[2] += local.z;
+        } else {
+            state_.camera_pan[0] += move.x;
+            state_.camera_pan[1] += move.y;
+            state_.camera_pan[2] += move.z;
+        }
     }
     event->accept();
 }
 
 void D3DViewport::wheelEvent(QWheelEvent* event) {
-    const float steps = event->angleDelta().y() / 120.0f;
-    const float zoom_factor = std::clamp(state_.camera_distance * 0.1f, 0.5f, 10.0f);
+    // Studio distance grows when the eye moves away from the focus, so wheel up
+    // (zoom in) subtracts and wheel down (zoom out) adds.
     state_.camera_distance =
-        std::clamp(state_.camera_distance - steps * zoom_factor, 0.5f, 2000.0f);
+        std::clamp(state_.camera_distance - static_cast<float>(event->angleDelta().y()) * 0.05f,
+                   -5000.0f, 5000.0f);
     event->accept();
 }
 

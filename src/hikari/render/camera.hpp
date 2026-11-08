@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 
 #include "hikari/math.hpp"
@@ -18,6 +19,26 @@ public:
     bool orthographic = false;
     // World-space height of the orthographic view. When zero it is derived from fov_y.
     float ortho_height = 0.0f;
+
+    // MMD does not build a rotated view matrix. It rotates the scene by
+    // Ry(yaw) * Rx(pitch) * Rz(roll) around a focus point and looks down +Z
+    // from a fixed eye. `orientation` is that rotation's inverse, i.e. the
+    // camera's world basis, and `signed_distance` is the eye's Z coordinate in
+    // that basis. MMD stores it negative (-45 by default), which places the
+    // focus in front of the eye; a positive value puts the focus behind it.
+    void place_mmd(const Vec3& focus, const Quat& orientation, float signed_distance) {
+        position = focus + orientation.rotate_vec3(Vec3(0.0f, 0.0f, signed_distance));
+        target = position + orientation.rotate_vec3(Vec3(0.0f, 0.0f, 1.0f));
+        up = orientation.rotate_vec3(Vec3(0.0f, 1.0f, 0.0f));
+    }
+
+    // MMD's orthographic projection is m00 = -2 / distance and m11 = aspect * m00,
+    // so the visible world height is |distance| / aspect. `scale` preserves the
+    // followed-model unit scale used by the studio.
+    static float mmd_ortho_height(float signed_distance, float aspect, float scale = 1.0f) {
+        const float safe_aspect = std::max(aspect, 1.0e-4f);
+        return std::max(std::abs(signed_distance) * scale / safe_aspect, 1.0e-4f);
+    }
 
     Mat4 view_matrix() const {
         const Vec3 z_axis = (target - position).normalize();
@@ -44,5 +65,16 @@ public:
     }
     Mat4 view_projection_matrix() const { return view_matrix() * projection_matrix(); }
 };
+
+// MMD rotates the scene by Ry(yaw) * Rx(pitch) * Rz(roll) and builds the view
+// from a fixed +Z look-at, so the camera's world basis is the inverse of that
+// product. Keeping the authoring order here matters: composing the axes in a
+// different order banks the camera when yaw and pitch are combined.
+inline Quat mmd_camera_orientation(float yaw, float pitch, float roll) {
+    const Quat scene_rotation = Quat::from_axis_angle(Vec3::axis_z(), roll) *
+                                Quat::from_axis_angle(Vec3::axis_x(), pitch) *
+                                Quat::from_axis_angle(Vec3::axis_y(), yaw);
+    return scene_rotation.inverse().normalize();
+}
 
 } // namespace hikari::render

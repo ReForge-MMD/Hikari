@@ -70,6 +70,7 @@ TrackKeyframe StudioAppState::capture_keyframe(const QString& track) const {
         key.fov = camera_fov_deg;
         key.parent_model = camera_parent_model;
         key.parent_bone = camera_parent_bone;
+        key.follow_offset = camera_follow_offset;
         return key;
     }
     if (track == QStringLiteral("light")) {

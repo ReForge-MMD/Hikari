@@ -263,6 +263,7 @@ QJsonObject key_to_json(const TrackKeyframe& key) {
     object[QStringLiteral("scale")] = key.scale;
     object[QStringLiteral("parent_model")] = key.parent_model;
     object[QStringLiteral("parent_bone")] = key.parent_bone;
+    object[QStringLiteral("follow_offset")] = to_json(key.follow_offset);
     object[QStringLiteral("interpolation")] = bytes_to_json(key.interpolation);
     QJsonObject ik;
     for (auto it = key.ik_enabled.begin(); it != key.ik_enabled.end(); ++it) {
@@ -314,6 +315,7 @@ TrackKeyframe key_from_json(const QJsonObject& object) {
     key.parent_model = std::max(object.value(QStringLiteral("parent_model")).toInt(-1), -1);
     key.parent_bone =
         std::max(object.value(QStringLiteral("parent_bone")).toInt(0), 0);
+    key.follow_offset = read_vec3(object.value(QStringLiteral("follow_offset")));
     key.interpolation = json_to_bytes<4>(object.value(QStringLiteral("interpolation")));
     if (key.interpolation == std::array<std::uint8_t, 4>{0, 0, 0, 0}) {
         key.interpolation = {20, 20, 20, 20};
@@ -432,6 +434,10 @@ QByteArray hkp_to_json(const ProjectData& project) {
     scene[QStringLiteral("camera_follow")] = project.scene.camera_follow;
     scene[QStringLiteral("camera_parent_model")] = project.scene.camera_parent_model;
     scene[QStringLiteral("camera_parent_bone")] = project.scene.camera_parent_bone;
+    scene[QStringLiteral("camera_follow_offset")] =
+        to_json(project.scene.camera_follow_offset);
+    scene[QStringLiteral("camera_near_clip")] = project.scene.camera_near_clip;
+    scene[QStringLiteral("camera_far_clip")] = project.scene.camera_far_clip;
     scene[QStringLiteral("light_color")] = to_json(project.scene.light_color);
     scene[QStringLiteral("light_direction")] = to_json(project.scene.light_direction);
     scene[QStringLiteral("shadow_mode")] = static_cast<int>(project.scene.shadow_mode);
@@ -504,11 +510,11 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
     project.scene.camera_yaw =
         static_cast<float>(scene.value(QStringLiteral("camera_yaw")).toDouble(0.0));
     project.scene.camera_pitch =
-        static_cast<float>(scene.value(QStringLiteral("camera_pitch")).toDouble(0.15));
+        static_cast<float>(scene.value(QStringLiteral("camera_pitch")).toDouble(0.0));
     project.scene.camera_roll =
         static_cast<float>(scene.value(QStringLiteral("camera_roll")).toDouble(0.0));
     project.scene.camera_distance =
-        static_cast<float>(scene.value(QStringLiteral("camera_distance")).toDouble(50.0));
+        static_cast<float>(scene.value(QStringLiteral("camera_distance")).toDouble(45.0));
     project.scene.camera_fov_deg =
         static_cast<float>(scene.value(QStringLiteral("camera_fov_deg")).toDouble(30.0));
     project.scene.camera_orthographic =
@@ -521,6 +527,12 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
         std::max(scene.value(QStringLiteral("camera_parent_model")).toInt(-1), -1);
     project.scene.camera_parent_bone =
         std::max(scene.value(QStringLiteral("camera_parent_bone")).toInt(0), 0);
+    project.scene.camera_follow_offset =
+        read_vec3(scene.value(QStringLiteral("camera_follow_offset")));
+    project.scene.camera_near_clip =
+        static_cast<float>(scene.value(QStringLiteral("camera_near_clip")).toDouble(0.1));
+    project.scene.camera_far_clip =
+        static_cast<float>(scene.value(QStringLiteral("camera_far_clip")).toDouble(1000.0));
     project.scene.light_color =
         read_vec3(scene.value(QStringLiteral("light_color")), {0.6f, 0.6f, 0.6f});
     project.scene.light_direction =

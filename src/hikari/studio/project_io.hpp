@@ -42,15 +42,18 @@ struct ProjectModel {
 struct ProjectScene {
     std::array<float, 3> camera_pan{0.0f, 10.0f, 0.0f};
     float camera_yaw = 0.0f;
-    float camera_pitch = 0.15f;
+    float camera_pitch = 0.0f;
     float camera_roll = 0.0f;
-    float camera_distance = 50.0f;
+    float camera_distance = 45.0f;
     float camera_fov_deg = 30.0f;
     bool camera_orthographic = false;
     CameraTarget camera_target = CameraTarget::Free;
     bool camera_follow = false;
     int camera_parent_model = -1;
     int camera_parent_bone = 0;
+    std::array<float, 3> camera_follow_offset{0.0f, 0.0f, 0.0f};
+    float camera_near_clip = 0.1f;
+    float camera_far_clip = 1000.0f;
     std::array<float, 3> light_color{0.6f, 0.6f, 0.6f};
     std::array<float, 3> light_direction{-0.5f, -1.0f, -0.5f};
     ShadowMode shadow_mode = ShadowMode::Mode1;
