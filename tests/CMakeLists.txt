@@ -3,6 +3,9 @@ add_executable(hikari_tests
   test_d3d11_effect.cpp
   test_effect.cpp
   test_formats.cpp
+  test_gfx_frame_graph.cpp
+  test_gfx_material.cpp
+  test_gfx_settings.cpp
   test_math.cpp
   test_physics.cpp
   test_skinning.cpp
@@ -15,6 +18,7 @@ target_link_libraries(hikari_tests
     hikari_animation
     hikari_physics
     hikari_render
+    hikari_gfx
     hikari_core
     Catch2::Catch2WithMain
 )

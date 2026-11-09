@@ -1,5 +1,7 @@
 #include "hikari/studio/main_window.hpp"
 
+#include "hikari/studio/graphics_panel.hpp"
+
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
@@ -877,8 +879,11 @@ void MainWindow::build_docks() {
     auto* interpolation =
         add_panel_dock(QStringLiteral("Interpolation"), QStringLiteral("InterpolationDock"),
                        build_interpolation_tab(), Qt::RightDockWidgetArea);
+    auto* graphics = add_panel_dock(QStringLiteral("Graphics"), QStringLiteral("GraphicsDock"),
+                                    build_graphics_tab(), Qt::RightDockWidgetArea);
 
     tabifyDockWidget(camera, light);
+    tabifyDockWidget(camera, graphics);
     tabifyDockWidget(light, shadow);
     tabifyDockWidget(shadow, accessory);
     tabifyDockWidget(facial, view);
@@ -1076,9 +1081,10 @@ void MainWindow::reset_panel_layout() {
     auto* view = dock(QStringLiteral("ViewDock"));
     auto* playback = dock(QStringLiteral("PlaybackDock"));
     auto* interpolation = dock(QStringLiteral("InterpolationDock"));
+    auto* graphics = dock(QStringLiteral("GraphicsDock"));
     if (model == nullptr || bone == nullptr || camera == nullptr || light == nullptr ||
         shadow == nullptr || accessory == nullptr || facial == nullptr || view == nullptr ||
-        playback == nullptr || interpolation == nullptr) {
+        playback == nullptr || interpolation == nullptr || graphics == nullptr) {
         return;
     }
 
@@ -1096,7 +1102,9 @@ void MainWindow::reset_panel_layout() {
     addDockWidget(Qt::RightDockWidgetArea, view);
     addDockWidget(Qt::RightDockWidgetArea, playback);
     addDockWidget(Qt::RightDockWidgetArea, interpolation);
+    addDockWidget(Qt::RightDockWidgetArea, graphics);
     tabifyDockWidget(camera, light);
+    tabifyDockWidget(camera, graphics);
     tabifyDockWidget(light, shadow);
     tabifyDockWidget(shadow, accessory);
     tabifyDockWidget(facial, view);
@@ -2086,6 +2094,19 @@ QWidget* MainWindow::build_accessory_tab() {
         timeline_->update();
     });
     return page;
+}
+
+QWidget* MainWindow::build_graphics_tab() {
+    graphics_panel_ = new GraphicsPanel(state_, [this] { record_scene_edit(); });
+    return graphics_panel_;
+}
+
+void MainWindow::set_native_renderer(bool native) {
+    state_.graphics.renderer =
+        native ? gfx::RendererMode::Native : gfx::RendererMode::Legacy;
+    if (graphics_panel_ != nullptr) {
+        graphics_panel_->refresh_from_state();
+    }
 }
 
 QWidget* MainWindow::build_view_tab() {

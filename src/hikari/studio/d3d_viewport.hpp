@@ -15,6 +15,7 @@
 
 #include "hikari/animation/timeline.hpp"
 #include "hikari/core/d3d11.hpp"
+#include "hikari/gfx/renderer.hpp"
 #include "hikari/render/camera.hpp"
 #include "hikari/render/scene_renderer.hpp"
 #include "hikari/studio/app_state.hpp"
@@ -150,6 +151,7 @@ private:
     void prepare_export_frame(float frame, int fps);
     bool physics_active() const;
     void render_scene();
+    void render_scene_native();
     render::OverlayGeometry build_overlay_geometry() const;
     void update_camera();
     bool camera_follow_state(Vec3& bone_position, Quat& rotation, float& scale) const;
@@ -190,6 +192,7 @@ private:
     StudioAppState& state_;
     std::unique_ptr<core::D3D11Context> context_;
     std::unique_ptr<render::SceneRenderer> renderer_;
+    std::unique_ptr<gfx::Renderer> gfx_renderer_;
     render::Camera camera_;
     ViewGizmo* gizmo_ = nullptr;
 

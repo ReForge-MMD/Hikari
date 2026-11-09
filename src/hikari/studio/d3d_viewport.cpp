@@ -406,6 +406,7 @@ bool D3DViewport::initialize() {
         context_ = std::make_unique<core::D3D11Context>(hwnd, static_cast<std::uint32_t>(width()),
                                                          static_cast<std::uint32_t>(height()));
         renderer_ = std::make_unique<render::SceneRenderer>(*context_);
+        gfx_renderer_ = std::make_unique<gfx::Renderer>(*context_);
         initialized_ = true;
         apply_screen_size();
         place_gizmo();
@@ -1357,6 +1358,7 @@ bool D3DViewport::save_project(const QString& path) {
     project.scene.shadow_detail = state_.shadow_detail;
     project.scene.gravity = state_.gravity;
     project.scene.gravity_noise = state_.gravity_noise;
+    project.scene.graphics = state_.graphics;
 
     for (const auto& model : models_) {
         ProjectModel entry;
@@ -1474,6 +1476,8 @@ bool D3DViewport::load_project(const QString& path) {
     state_.shadow_detail = project->scene.shadow_detail;
     state_.gravity = project->scene.gravity;
     state_.gravity_noise = project->scene.gravity_noise;
+    state_.graphics = project->scene.graphics;
+    state_.graphics.validate();
     last_editor_frame_ = -1.0f;
     state_.track_keys_dirty = true;
     state_.model_scale_dirty = false;
@@ -3418,7 +3422,128 @@ void D3DViewport::apply_editor_bone_override() {
     }
 }
 
+void D3DViewport::render_scene_native() {
+    context_->begin_scene();
+    const std::uint32_t width = std::max(context_->render_width, 16u);
+    const std::uint32_t height = std::max(context_->render_height, 16u);
+    context_->set_viewport(static_cast<float>(width), static_cast<float>(height));
+
+    renderer_->set_light(state_.light_color, state_.light_direction);
+    renderer_->update_camera(*context_, camera_);
+    renderer_->wireframe = state_.wireframe;
+
+    gfx::FrameView view;
+    view.view = camera_.view_matrix();
+    view.projection = camera_.projection_matrix();
+    view.view_projection = camera_.view_projection_matrix();
+    view.inverse_view = view.view.inverse_transform();
+    view.camera_position = camera_.position;
+    view.sun_direction =
+        Vec3(state_.light_direction[0], state_.light_direction[1], state_.light_direction[2])
+            .normalize();
+    view.sun_color = gfx::sun_color_from_settings(
+        state_.graphics, Vec3(state_.light_color[0], state_.light_color[1],
+                              state_.light_color[2]));
+    view.ambient_color = gfx::ambient_color_from_settings(state_.graphics);
+    view.background_color = state_.viewport_white_bg ? Vec3(0.90f, 0.92f, 0.95f)
+                                                     : Vec3(0.055f, 0.065f, 0.085f);
+    view.near_z = camera_.near_z;
+    view.far_z = camera_.far_z;
+    view.orthographic = camera_.orthographic;
+    view.draw_grid = state_.show_grid;
+    view.show_grid = state_.show_grid;
+    view.wireframe = state_.wireframe;
+    view.width = width;
+    view.height = height;
+
+    const Vec3 view_forward = camera_.target - camera_.position;
+    const render::Frustum frustum =
+        render::Frustum::from_view_projection(camera_.view_projection_matrix());
+    culled_models_ = 0;
+    culled_subsets_ = 0;
+    for (const auto& model : models_) {
+        if (!model->visible || model->mesh.subsets.empty()) {
+            continue;
+        }
+        const render::BoundingSphere model_sphere{
+            model->model_point(model->bounds_center()),
+            model->bounds_radius() * model->scale * 1.3f + 0.01f};
+        if (!frustum.intersects(model_sphere)) {
+            ++culled_models_;
+            continue;
+        }
+        render_palette_.resize(model->skeleton.skinning_palette.size());
+        const Mat4 model_transform = model->model_matrix();
+        for (std::size_t i = 0; i < render_palette_.size(); ++i) {
+            render_palette_[i] = model->skeleton.skinning_palette[i] * model_transform;
+        }
+        model->skinning.update(*context_, render_palette_);
+
+        for (std::size_t i = 0; i < model->mesh.subsets.size(); ++i) {
+            const render::MeshSubset& subset = model->mesh.subsets[i];
+            if (i < model->subset_bounds.size()) {
+                const render::BoundingSphere subset_sphere =
+                    subset_world_bounds(model->pmx.indices, model->mesh.current_vertices,
+                                        subset, render_palette_);
+                if (subset_sphere.radius > 0.0f && !frustum.intersects(subset_sphere)) {
+                    ++culled_subsets_;
+                    continue;
+                }
+            }
+            const bool transparent =
+                subset.material_index < model->materials.size() &&
+                model->materials[subset.material_index].constants.diffuse[3] < 0.999f;
+            gfx::DrawItem draw;
+            draw.mesh = &model->mesh;
+            draw.materials = &model->materials;
+            draw.textures = &model->textures;
+            draw.skinning = &model->skinning;
+            draw.subset = i;
+            if (transparent) {
+                const Vec3 center = subset_world_center(
+                    model->pmx.indices, model->mesh.current_vertices, subset, render_palette_);
+                draw.depth = (center - camera_.position).dot(view_forward);
+                view.transparent.push_back(draw);
+            } else {
+                view.opaque.push_back(draw);
+            }
+        }
+    }
+    std::stable_sort(view.transparent.begin(), view.transparent.end(),
+                     [](const gfx::DrawItem& a, const gfx::DrawItem& b) {
+                         return a.depth > b.depth;
+                     });
+    if ((culled_models_ > 0 || culled_subsets_ > 0) && ++cull_log_counter_ % 120 == 0) {
+        core::log_msg("[studio] native frustum culled models=" +
+                      std::to_string(culled_models_) +
+                      " subsets=" + std::to_string(culled_subsets_));
+    }
+
+    gfx_renderer_->render(state_.graphics, view, context_->render_target_view.Get());
+
+    if (!exporting_) {
+        if (auto list = renderer_->record_overlay_geometry(*context_, build_overlay_geometry())) {
+            context_->execute_command_list(list.Get(), false);
+        }
+    }
+    context_->end_scene();
+
+    if (context_->scene_target_ready()) {
+        const QRect target = scene_rect();
+        const float letterbox[4] = {0.05f, 0.05f, 0.06f, 1.0f};
+        context_->clear_backbuffer(letterbox);
+        context_->blit_scene_to_backbuffer(static_cast<float>(target.x()),
+                                           static_cast<float>(target.y()),
+                                           static_cast<float>(target.width()),
+                                           static_cast<float>(target.height()));
+    }
+}
+
 void D3DViewport::render_scene() {
+    if (state_.graphics.renderer == gfx::RendererMode::Native && gfx_renderer_ != nullptr) {
+        render_scene_native();
+        return;
+    }
     context_->begin_scene();
     const float clear_color[4] = {0.13f, 0.14f, 0.17f, 1.0f};
     context_->clear(clear_color, 1.0f, 0);

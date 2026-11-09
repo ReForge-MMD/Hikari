@@ -10,6 +10,8 @@ add_executable(hikari_studio WIN32
   curve_editor.hpp
   d3d_viewport.cpp
   d3d_viewport.hpp
+  graphics_panel.cpp
+  graphics_panel.hpp
   hikari.rc
   localization.cpp
   localization.hpp
@@ -37,6 +39,7 @@ target_link_libraries(hikari_studio
     hikari_animation
     hikari_physics
     hikari_render
+    hikari_gfx
     hikari_video
     hikari_audio
     Qt6::Widgets

@@ -169,6 +169,7 @@ SceneSnapshot StudioAppState::capture_snapshot(bool capture_pending_motion) {
     snapshot.shadow_detail = shadow_detail;
     snapshot.gravity = gravity;
     snapshot.gravity_noise = gravity_noise;
+    snapshot.graphics = graphics;
 
     snapshot.audio_path = audio_path;
     snapshot.audio_duration = audio_duration;
@@ -229,6 +230,7 @@ void StudioAppState::undo_keyframes() {    if (undo_stack.empty()) {
     shadow_detail = snapshot.shadow_detail;
     gravity = snapshot.gravity;
     gravity_noise = snapshot.gravity_noise;
+    graphics = snapshot.graphics;
 
     audio_path = snapshot.audio_path;
     audio_duration = snapshot.audio_duration;
@@ -287,6 +289,7 @@ void StudioAppState::redo_keyframes() {
     shadow_detail = snapshot.shadow_detail;
     gravity = snapshot.gravity;
     gravity_noise = snapshot.gravity_noise;
+    graphics = snapshot.graphics;
 
     audio_path = snapshot.audio_path;
     audio_duration = snapshot.audio_duration;

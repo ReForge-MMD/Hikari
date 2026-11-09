@@ -450,6 +450,11 @@ QByteArray hkp_to_json(const ProjectData& project) {
     scene[QStringLiteral("shadow_detail")] = project.scene.shadow_detail;
     scene[QStringLiteral("gravity")] = to_json(project.scene.gravity);
     scene[QStringLiteral("gravity_noise")] = project.scene.gravity_noise;
+    const QJsonDocument graphics_document =
+        QJsonDocument::fromJson(QByteArray::fromStdString(project.scene.graphics.to_json()));
+    if (graphics_document.isObject()) {
+        scene[QStringLiteral("graphics")] = graphics_document.object();
+    }
     root[QStringLiteral("scene")] = scene;
 
     QJsonArray models;
@@ -559,6 +564,13 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
         read_vec3(scene.value(QStringLiteral("gravity")), {0.0f, -9.8f, 0.0f});
     project.scene.gravity_noise =
         static_cast<float>(scene.value(QStringLiteral("gravity_noise")).toDouble(0.0));
+    const QJsonObject graphics = scene.value(QStringLiteral("graphics")).toObject();
+    if (!graphics.isEmpty()) {
+        const QByteArray graphics_bytes =
+            QJsonDocument(graphics).toJson(QJsonDocument::Compact);
+        project.scene.graphics.from_json(std::string(
+            graphics_bytes.constData(), static_cast<std::size_t>(graphics_bytes.size())));
+    }
 
     for (const auto& value : root.value(QStringLiteral("models")).toArray()) {
         const QJsonObject item = value.toObject();

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "hikari/formats/vmd.hpp"
+#include "hikari/gfx/settings.hpp"
 #include "hikari/math.hpp"
 
 namespace hikari::studio {
@@ -125,6 +126,7 @@ struct SceneSnapshot {
     float shadow_detail = 0.5f;
     std::array<float, 3> gravity{0.0f, -9.8f, 0.0f};
     float gravity_noise = 0.0f;
+    gfx::GraphicsSettings graphics;
 
     QString audio_path;
     double audio_duration = 0.0;
@@ -218,6 +220,7 @@ struct StudioAppState {
     ShadowMode shadow_mode = ShadowMode::Mode1;
     float shadow_range = 8875.0f;
     float shadow_detail = 0.5f;
+    gfx::GraphicsSettings graphics;
 
     QString accessory_name;
     std::array<float, 3> accessory_pos{0.0f, 0.0f, 0.0f};

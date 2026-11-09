@@ -174,6 +174,12 @@ void AppSettings::apply_to(StudioAppState& state) const {
                    1.0f, 3.5f);
     state.jiggle_enabled =
         physics.value(QStringLiteral("jiggle_enabled")).toBool(state.jiggle_enabled);
+
+    const QJsonObject graphics = root_.value(QStringLiteral("graphics")).toObject();
+    if (!graphics.isEmpty()) {
+        const QByteArray bytes = QJsonDocument(graphics).toJson(QJsonDocument::Compact);
+        state.graphics.from_json(std::string(bytes.constData(), static_cast<std::size_t>(bytes.size())));
+    }
 }
 
 void AppSettings::capture_from(const StudioAppState& state) {
@@ -217,6 +223,12 @@ void AppSettings::capture_from(const StudioAppState& state) {
     physics[QStringLiteral("speed")] = state.physics_speed;
     physics[QStringLiteral("jiggle_enabled")] = state.jiggle_enabled;
     root_[QStringLiteral("physics")] = physics;
+
+    const QJsonDocument graphics_document =
+        QJsonDocument::fromJson(QByteArray::fromStdString(state.graphics.to_json()));
+    if (graphics_document.isObject()) {
+        root_[QStringLiteral("graphics")] = graphics_document.object();
+    }
 
     root_[QStringLiteral("camera_presets")] = camera_presets_;
 }

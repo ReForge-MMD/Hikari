@@ -31,15 +31,24 @@ int main(int argc, char** argv) {
     QString model_path;
     QString motion_path;
     QString audio_path;
+    bool native_renderer = false;
+    QStringList positional;
     const QStringList arguments = application.arguments();
-    if (arguments.size() > 1) {
-        model_path = arguments[1];
+    for (int i = 1; i < arguments.size(); ++i) {
+        if (arguments[i] == QStringLiteral("--native")) {
+            native_renderer = true;
+        } else {
+            positional.append(arguments[i]);
+        }
     }
-    if (arguments.size() > 2) {
-        motion_path = arguments[2];
+    if (positional.size() > 0) {
+        model_path = positional[0];
     }
-    if (arguments.size() > 3) {
-        audio_path = arguments[3];
+    if (positional.size() > 1) {
+        motion_path = positional[1];
+    }
+    if (positional.size() > 2) {
+        audio_path = positional[2];
     }
 
     hikari::studio::localization::load_language();
@@ -53,6 +62,7 @@ int main(int argc, char** argv) {
     application.processEvents();
 
     hikari::studio::MainWindow window(model_path, motion_path, audio_path);
+    window.set_native_renderer(native_renderer);
     QObject::connect(&window, &hikari::studio::MainWindow::startupFinished, &splash,
                      [&splash, &window] { splash.finish(&window); });
     window.show();

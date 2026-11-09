@@ -65,6 +65,7 @@ struct ProjectScene {
     float shadow_detail = 0.5f;
     std::array<float, 3> gravity{0.0f, -9.8f, 0.0f};
     float gravity_noise = 0.0f;
+    gfx::GraphicsSettings graphics;
 };
 
 struct ProjectTrack {

@@ -27,6 +27,7 @@ class QTimer;
 namespace hikari::studio {
 
 class D3DViewport;
+class GraphicsPanel;
 class TimelineWidget;
 class ViewportFooter;
 class ViewportHeader;
@@ -36,6 +37,8 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QString model_path, QString motion_path, QString audio_path = {},
                         QWidget* parent = nullptr);
+
+    void set_native_renderer(bool native);
 
 signals:
     void startupFinished();
@@ -61,6 +64,7 @@ private:
     QWidget* build_bone_tab();
     QWidget* build_facial_tab();
     QWidget* build_camera_tab();
+    QWidget* build_graphics_tab();
     QWidget* build_light_tab();
     QWidget* build_shadow_tab();
     QWidget* build_accessory_tab();
@@ -100,6 +104,7 @@ private:
     StudioAppState state_;
     AppSettings app_settings_;
     D3DViewport* viewport_ = nullptr;
+    GraphicsPanel* graphics_panel_ = nullptr;
     ViewportHeader* header_ = nullptr;
     ViewportFooter* footer_ = nullptr;
     TimelineWidget* timeline_ = nullptr;
