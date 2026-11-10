@@ -140,6 +140,7 @@ private:
     void draw_shadow_blur(const GraphicsSettings& settings, const FrameView& view);
     void update_shadow_constants(const GraphicsSettings& settings, const FrameView& view);
     void bind_shadow_constants();
+    void ensure_shadow_map(int quality);
     std::vector<ShaderDefine> shadow_defines(const GraphicsSettings& settings) const;
 
     core::D3D11Context& context_;
@@ -147,6 +148,7 @@ private:
     TargetPool targets_;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
+    std::uint32_t current_shadow_res_ = 0;
 
     Microsoft::WRL::ComPtr<ID3D11Buffer> frame_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> material_buffer_;

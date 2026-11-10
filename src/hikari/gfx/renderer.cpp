@@ -57,6 +57,16 @@ Vec3 ambient_color_from_settings(const GraphicsSettings& settings) {
     return settings.sky.ambient_color * settings.sky.ambient_intensity;
 }
 
+uint32_t shadow_resolution_from_quality(int quality) {
+    switch (quality) {
+    case 1: return 1024;
+    case 2: return 2048;
+    case 3: return 4096;
+    case 4: return 8192;
+    default: return 2048;
+    }
+}
+
 Renderer::Renderer(core::D3D11Context& context)
     : context_(context),
       shaders_(context),
@@ -175,8 +185,10 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
                                 DXGI_FORMAT_R16G16B16A16_FLOAT);
     }
     targets_.create_depth(context_.device.Get(), "Depth", width, height);
-    // Shadow map: D32 2048x2048 array, 4 cascades
-    targets_.create_array_depth(context_.device.Get(), "ShadowMap", 2048, 2048, 4);
+    // Shadow map: D32 array, 4 cascades (default 2048 or current_shadow_res_)
+    const uint32_t init_shadow_res = current_shadow_res_ > 0 ? current_shadow_res_ : 2048;
+    targets_.create_array_depth(context_.device.Get(), "ShadowMap", init_shadow_res, init_shadow_res, 4);
+    current_shadow_res_ = init_shadow_res;
     // Sky visibility: R32G32F 1024x1024 + D32 depth
     targets_.create_target(context_.device.Get(), "SkyVisibility", 1024, 1024,
                             DXGI_FORMAT_R32G32_FLOAT);
@@ -186,6 +198,18 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
                             DXGI_FORMAT_R8G8B8A8_UNORM);
     targets_.create_target(context_.device.Get(), "ShadowMaskBlur", width, height,
                             DXGI_FORMAT_R8G8B8A8_UNORM);
+}
+
+void Renderer::ensure_shadow_map(int quality) {
+    if (quality <= 0) {
+        return;
+    }
+    const uint32_t target_res = shadow_resolution_from_quality(quality);
+    const DepthTarget* existing = targets_.get_depth("ShadowMap");
+    if (existing == nullptr || current_shadow_res_ != target_res) {
+        targets_.create_array_depth(context_.device.Get(), "ShadowMap", target_res, target_res, 4);
+        current_shadow_res_ = target_res;
+    }
 }
 
 void Renderer::reload_shaders() {
@@ -199,6 +223,7 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     }
     resize(view.width, view.height);
     ensure_targets(width_, height_);
+    ensure_shadow_map(settings.shadows.quality);
     update_frame_constants(settings, view, !view.show_tonemap);
     update_shadow_constants(settings, view);
     draw_shadow_cascades(settings, view);
@@ -645,8 +670,30 @@ std::vector<ShaderDefine> Renderer::shadow_defines(const GraphicsSettings& setti
         default: return 0;
         }
     };
+    const auto quality_to_pcss_blocker = [](int q) -> int {
+        switch (q) {
+        case 1: return 8;
+        case 2: return 16;
+        case 3: return 24;
+        case 4: return 32;
+        default: return 16;
+        }
+    };
+    const auto quality_to_pcss_filter = [](int q) -> int {
+        switch (q) {
+        case 1: return 12;
+        case 2: return 16;
+        case 3: return 24;
+        case 4: return 32;
+        default: return 16;
+        }
+    };
     std::vector<ShaderDefine> defines;
     defines.push_back({"SUN_SHADOW_PCSS", settings.shadows.pcss ? "1" : "0"});
+    defines.push_back({"PCSS_BLOCKER_SAMPLES",
+                        std::to_string(quality_to_pcss_blocker(settings.shadows.quality))});
+    defines.push_back({"PCSS_FILTER_SAMPLES",
+                        std::to_string(quality_to_pcss_filter(settings.shadows.quality))});
     defines.push_back({"CONTACT_SHADOW_STEPS",
                         std::to_string(quality_to_contact(settings.shadows.contact_quality))});
     defines.push_back({"SSGS_STEPS",
@@ -671,7 +718,9 @@ void Renderer::update_shadow_constants(const GraphicsSettings& settings, const F
                                        : hikari::Vec3(0.0f, 0.0f, 1.0f);
 
     constexpr uint32_t kCascadeCount = 4;
-    constexpr uint32_t kShadowRes = 2048;
+    const uint32_t shadow_res = current_shadow_res_ > 0
+                                    ? current_shadow_res_
+                                    : shadow_resolution_from_quality(settings.shadows.quality);
     const float near_z = std::max(view.near_z, 0.5f);
     const float far_z = std::min(view.far_z, 300.0f);
     constexpr float lambda = 0.85f;
@@ -740,6 +789,16 @@ void Renderer::update_shadow_constants(const GraphicsSettings& settings, const F
             min_z = std::min(min_z, lz); max_z = std::max(max_z, lz);
         }
 
+        // Add 8% safety padding on X and Y to eliminate cascade boundary cuts and penumbra clipping
+        const float span_x = max_x - min_x;
+        const float span_y = max_y - min_y;
+        const float pad_x = span_x * 0.08f;
+        const float pad_y = span_y * 0.08f;
+        min_x -= pad_x;
+        max_x += pad_x;
+        min_y -= pad_y;
+        max_y += pad_y;
+
         // Extend Z to catch shadow casters behind and above the frustum.
         min_z -= 100.0f;
         max_z += 50.0f;
@@ -747,7 +806,7 @@ void Renderer::update_shadow_constants(const GraphicsSettings& settings, const F
         // Snap to texel boundaries to suppress shimmering.
         const float width = max_x - min_x;
         const float height = max_y - min_y;
-        const float texel_size = std::max(width, height) / static_cast<float>(kShadowRes);
+        const float texel_size = std::max(width, height) / static_cast<float>(shadow_res);
         min_x = std::floor(min_x / texel_size) * texel_size;
         min_y = std::floor(min_y / texel_size) * texel_size;
         max_x = min_x + std::ceil(width  / texel_size) * texel_size;
@@ -781,13 +840,13 @@ void Renderer::update_shadow_constants(const GraphicsSettings& settings, const F
     };
     const float contact_steps = quality_to_contact(settings.shadows.contact_quality);
     const float ssgs_steps    = quality_to_ssgs(settings.shadows.ssgs_quality);
-    constexpr float kShadowRes_f = static_cast<float>(kShadowRes);
+    const float shadow_res_f = static_cast<float>(shadow_res);
 
     constants.shadow_params0 = {0.0005f, 1.5f, settings.shadows.pcss ? 1.0f : 0.0f, 2.0f};
     constants.shadow_params1 = {settings.shadows.light_radius, 0.5f, 0.3f, 2.0f};
     constants.shadow_params2 = {0.3f, 0.5f, static_cast<float>(kCascadeCount), 1.0f / 1024.0f};
     constants.shadow_params3 = {static_cast<float>(settings.ao.sky_visibility),
-                                 1.0f / kShadowRes_f, contact_steps, ssgs_steps};
+                                 1.0f / shadow_res_f, contact_steps, ssgs_steps};
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(context_.context->Map(shadow_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
@@ -837,7 +896,9 @@ void Renderer::draw_shadow_cascades(const GraphicsSettings& settings, const Fram
                                        ? hikari::Vec3(0.0f, 1.0f, 0.0f)
                                        : hikari::Vec3(0.0f, 0.0f, 1.0f);
     constexpr uint32_t kCascadeCount = 4;
-    constexpr uint32_t kShadowRes = 2048;
+    const uint32_t shadow_res = current_shadow_res_ > 0
+                                    ? current_shadow_res_
+                                    : shadow_resolution_from_quality(settings.shadows.quality);
     const float near_z = std::max(view.near_z, 0.5f);
     const float far_z = std::min(view.far_z, 300.0f);
     constexpr float lambda = 0.85f;
@@ -883,10 +944,18 @@ void Renderer::draw_shadow_cascades(const GraphicsSettings& settings, const Fram
             min_y=std::min(min_y,ly);max_y=std::max(max_y,ly);
             min_z=std::min(min_z,lz);max_z=std::max(max_z,lz);
         }
+        const float span_x = max_x - min_x;
+        const float span_y = max_y - min_y;
+        const float pad_x = span_x * 0.08f;
+        const float pad_y = span_y * 0.08f;
+        min_x -= pad_x;
+        max_x += pad_x;
+        min_y -= pad_y;
+        max_y += pad_y;
         min_z -= 100.0f;
         max_z += 50.0f;
         const float width=max_x-min_x,height=max_y-min_y;
-        const float texel_size=std::max(width,height)/static_cast<float>(kShadowRes);
+        const float texel_size=std::max(width,height)/static_cast<float>(shadow_res);
         min_x=std::floor(min_x/texel_size)*texel_size;
         min_y=std::floor(min_y/texel_size)*texel_size;
         max_x=min_x+std::ceil(width/texel_size)*texel_size;
@@ -918,8 +987,8 @@ void Renderer::draw_shadow_cascades(const GraphicsSettings& settings, const Fram
     for (uint32_t ci = 0; ci < kCascadeCount && ci < shadow_map->slice_dsvs.size(); ++ci) {
         // Set viewport for shadow map resolution
         D3D11_VIEWPORT vp{};
-        vp.Width = static_cast<float>(kShadowRes);
-        vp.Height = static_cast<float>(kShadowRes);
+        vp.Width = static_cast<float>(shadow_res);
+        vp.Height = static_cast<float>(shadow_res);
         vp.MinDepth = 0.0f;
         vp.MaxDepth = 1.0f;
         context_.context->RSSetViewports(1, &vp);

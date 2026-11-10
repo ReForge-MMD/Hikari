@@ -90,7 +90,7 @@ void GraphicsPanel::build_controls() {
     shadow_quality_ = new QComboBox();
     shadow_quality_->addItems({QStringLiteral("Disabled"), QStringLiteral("Low (1024)"),
                                QStringLiteral("Medium (2048)"), QStringLiteral("High (4096)"),
-                               QStringLiteral("Cinematic (4096)")});
+                               QStringLiteral("Cinematic (8192)")});
     shadow_quality_->setToolTip(QStringLiteral("Cascaded shadow map quality preset."));
 
     shadow_pcss_ = new QCheckBox(QStringLiteral("PCSS variable penumbra"));
