@@ -686,8 +686,10 @@ void Renderer::update_shadow_constants(const GraphicsSettings& settings, const F
     }
 
     for (uint32_t ci = 0; ci < kCascadeCount; ++ci) {
-        // Build 8 frustum corners in view space for [near, far] range of this cascade.
-        const float n = cascade_near[ci];
+        // Build 8 frustum corners in view space spanning from camera near_z to this cascade's far plane.
+        // Starting from near_z guarantees that close shadow casters (characters, props) are always
+        // rasterized into all subsequent cascades, completely eliminating shadow clipping across cascade boundaries.
+        const float n = near_z;
         const float f = cascade_far[ci];
         // Use camera projection to unproject NDC corners.
         // For perspective: corner_view = (NDC_x / proj[0][0], NDC_y / proj[1][1], 1) * depth.
@@ -850,7 +852,7 @@ void Renderer::draw_shadow_cascades(const GraphicsSettings& settings, const Fram
     }
     std::array<std::array<std::array<float, 4>, 4>, 4> light_vp{};
     for (uint32_t ci = 0; ci < kCascadeCount; ++ci) {
-        const float n = cascade_near[ci];
+        const float n = near_z;
         const float f = cascade_far[ci];
         const float fx = view.projection.m[0][0] > 1.0e-6f ? 1.0f / view.projection.m[0][0] : 1.0f;
         const float fy = view.projection.m[1][1] > 1.0e-6f ? 1.0f / view.projection.m[1][1] : 1.0f;

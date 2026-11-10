@@ -367,19 +367,8 @@ float3 contact_shadow_geometric_normal(float3 tangent_x, float3 tangent_y, float
     return geometric_normal * (dot(geometric_normal, shading_normal) < 0.0f ? -1.0f : 1.0f);
 }
 
-struct CascadeSample {
-    float shadow;
-    float weight;
-    bool in_bounds;
-};
-
-CascadeSample sample_single_cascade(float3 world_pos, float3 normal, int cascade, float no_l,
-                                    float rotation) {
-    CascadeSample result;
-    result.shadow = 1.0f;
-    result.weight = 0.0f;
-    result.in_bounds = false;
-
+float sample_single_cascade(float3 world_pos, float3 normal, int cascade, float no_l,
+                            float rotation) {
     const float texel_world = max(CascadeTexelWorld[cascade], 1.0e-6f);
     const float normal_bias_scale = saturate(1.0f - saturate(no_l));
     const float3 offset_pos =
@@ -388,16 +377,10 @@ CascadeSample sample_single_cascade(float3 world_pos, float3 normal, int cascade
     light_clip.xyz /= max(light_clip.w, 1.0e-6f);
 
     const float2 uv = float2(light_clip.x * 0.5f + 0.5f, 0.5f - light_clip.y * 0.5f);
-    const float2 edge_dist = min(uv, 1.0f - uv);
-    const float min_edge = min(edge_dist.x, edge_dist.y);
-
-    if (min_edge <= 0.001f || light_clip.z < 0.0f || light_clip.z > 1.0f) {
-        return result;
+    if (uv.x < 0.001f || uv.x > 0.999f || uv.y < 0.001f || uv.y > 0.999f ||
+        light_clip.z < 0.0f || light_clip.z > 1.0f) {
+        return 1.0f;
     }
-
-    result.in_bounds = true;
-    const float kBorderMargin = 0.10f;
-    result.weight = saturate(min_edge / kBorderMargin);
 
     const float receiver = saturate(light_clip.z);
     const float base_bias = ShadowParams0.x * (1.0f + 1.5f * normal_bias_scale);
@@ -425,8 +408,7 @@ CascadeSample sample_single_cascade(float3 world_pos, float3 normal, int cascade
     }
 
     if (blockers == 0) {
-        result.shadow = 1.0f;
-        return result;
+        return 1.0f;
     }
 
     // Step 2: Penumbra Estimation (NVIDIA formula for directional sunlight)
@@ -449,8 +431,7 @@ CascadeSample sample_single_cascade(float3 world_pos, float3 normal, int cascade
         lit += ShadowMapArray.SampleCmpLevelZero(
             ShadowCmpSampler, float3(uv + offset, (float)cascade), comp_depth);
     }
-    result.shadow = lit / 16.0f;
-    return result;
+    return lit / 16.0f;
 #else
     float lit = 0.0f;
     [unroll]
@@ -463,9 +444,35 @@ CascadeSample sample_single_cascade(float3 world_pos, float3 normal, int cascade
                 ShadowCmpSampler, float3(uv + offset, (float)cascade), receiver - base_bias - plane_bias);
         }
     }
-    result.shadow = lit / 9.0f;
-    return result;
+    return lit / 9.0f;
 #endif
+}
+
+int find_best_cascade(float3 world_pos, float3 normal, float view_z, float no_l,
+                      out float out_border_fade) {
+    const int max_cascades = min((int)ShadowParams2.z, 4);
+    const int initial = choose_cascade(view_z);
+    out_border_fade = 1.0f;
+
+    [unroll]
+    for (int c = 0; c < 4; ++c) {
+        if (c < initial || c >= max_cascades) {
+            continue;
+        }
+        const float texel_world = max(CascadeTexelWorld[c], 1.0e-6f);
+        const float normal_bias_scale = saturate(1.0f - saturate(no_l));
+        const float3 offset_pos =
+            world_pos + normal * (texel_world * (ShadowParams0.y * (0.8f + 1.2f * normal_bias_scale)));
+        float4 clip = mul(float4(offset_pos, 1.0f), LightViewProjection[c]);
+        clip.xyz /= max(clip.w, 1.0e-6f);
+        const float2 uv = float2(clip.x * 0.5f + 0.5f, 0.5f - clip.y * 0.5f);
+        const float min_edge = min(min(uv.x, 1.0f - uv.x), min(uv.y, 1.0f - uv.y));
+        if (min_edge > 0.001f && clip.z >= 0.0f && clip.z <= 1.0f) {
+            out_border_fade = saturate(min_edge / 0.10f);
+            return c;
+        }
+    }
+    return min(initial, max_cascades - 1);
 }
 
 float sample_sun_shadow(float3 world_pos, float3 normal, float view_z, float no_l,
@@ -477,15 +484,11 @@ float sample_sun_shadow(float3 world_pos, float3 normal, float view_z, float no_
     const float terminator = smoothstep(0.0f, 0.12f, no_l);
     const int max_cascades = min((int)ShadowParams2.z, 4);
 
-    int target_cascade = choose_cascade(view_z);
-    CascadeSample primary = sample_single_cascade(world_pos, normal, target_cascade, no_l, rotation);
-    while (!primary.in_bounds && (target_cascade + 1 < max_cascades)) {
-        target_cascade += 1;
-        primary = sample_single_cascade(world_pos, normal, target_cascade, no_l, rotation);
-    }
-
+    float border_fade = 1.0f;
+    const int target_cascade = find_best_cascade(world_pos, normal, view_z, no_l, border_fade);
     cascade_used = target_cascade;
-    float factor = primary.shadow;
+
+    float factor = sample_single_cascade(world_pos, normal, target_cascade, no_l, rotation);
 
     float z_weight = 1.0f;
     if (target_cascade + 1 < max_cascades) {
@@ -496,13 +499,11 @@ float sample_sun_shadow(float3 world_pos, float3 normal, float view_z, float no_
         }
     }
 
-    const float effective_weight = min(primary.weight, z_weight);
+    const float effective_weight = min(border_fade, z_weight);
     if (effective_weight < 1.0f && (target_cascade + 1 < max_cascades)) {
-        CascadeSample secondary =
+        const float secondary =
             sample_single_cascade(world_pos, normal, target_cascade + 1, no_l, rotation);
-        if (secondary.in_bounds) {
-            factor = lerp(secondary.shadow, primary.shadow, effective_weight);
-        }
+        factor = lerp(secondary, factor, effective_weight);
     }
 
     const int last_cascade = max_cascades - 1;
