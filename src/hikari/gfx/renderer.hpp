@@ -56,6 +56,7 @@ struct FrameView {
 
     std::vector<DrawItem> opaque;
     std::vector<DrawItem> transparent;
+    std::vector<DrawItem> shadow_casters;
 };
 
 // Must match FrameParams in shaders/gfx_core.hlsl.
@@ -77,6 +78,24 @@ struct FrameConstants {
 Vec3 color_temperature_rgb(float kelvin);
 Vec3 sun_color_from_settings(const GraphicsSettings& settings, const Vec3& fallback);
 Vec3 ambient_color_from_settings(const GraphicsSettings& settings);
+
+// Must match ShadowParams in shaders/gfx_core.hlsl.
+struct ShadowConstants {
+    std::array<std::array<std::array<float, 4>, 4>, 4> light_view_proj{};
+    std::array<std::array<float, 4>, 4> sky_visibility_matrix{};
+    std::array<float, 4> cascade_splits{};
+    std::array<float, 4> cascade_texel_world{};
+    std::array<float, 4> cascade_light_range{};
+    std::array<float, 4> shadow_params0{};  // depth_bias, normal_bias_texels, pcss_enable, blur_radius
+    std::array<float, 4> shadow_params1{};  // light_radius, contact_length, contact_thickness, ssgs_length
+    std::array<float, 4> shadow_params2{};  // ssgs_thickness, sky_height_bias, cascade_count, sky_texel_uv
+    std::array<float, 4> shadow_params3{};  // sky_visibility_mode, texel_uv_x, contact_steps, ssgs_steps
+};
+
+struct ShadowDrawConstants {
+    std::array<std::array<float, 4>, 4> matrix{};
+    std::array<float, 4> params{};
+};
 
 class Renderer {
 public:
@@ -114,6 +133,15 @@ private:
     std::vector<ShaderDefine> lighting_defines(const GraphicsSettings& settings,
                                                bool linear_tonemap) const;
 
+    // Shadow pass methods
+    void draw_shadow_cascades(const GraphicsSettings& settings, const FrameView& view);
+    void draw_sky_visibility(const GraphicsSettings& settings, const FrameView& view);
+    void draw_shadow_mask(const GraphicsSettings& settings, const FrameView& view);
+    void draw_shadow_blur(const GraphicsSettings& settings, const FrameView& view);
+    void update_shadow_constants(const GraphicsSettings& settings, const FrameView& view);
+    void bind_shadow_constants();
+    std::vector<ShaderDefine> shadow_defines(const GraphicsSettings& settings) const;
+
     core::D3D11Context& context_;
     ShaderLibrary shaders_;
     TargetPool targets_;
@@ -123,6 +151,8 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> frame_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> material_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> grid_buffer_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> shadow_buffer_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> shadow_draw_buffer_;
     std::uint32_t grid_vertex_count_ = 0;
     render::GpuTexture white_texture_;
 };

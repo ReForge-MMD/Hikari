@@ -3465,13 +3465,6 @@ void D3DViewport::render_scene_native() {
         if (!model->visible || model->mesh.subsets.empty()) {
             continue;
         }
-        const render::BoundingSphere model_sphere{
-            model->model_point(model->bounds_center()),
-            model->bounds_radius() * model->scale * 1.3f + 0.01f};
-        if (!frustum.intersects(model_sphere)) {
-            ++culled_models_;
-            continue;
-        }
         render_palette_.resize(model->skeleton.skinning_palette.size());
         const Mat4 model_transform = model->model_matrix();
         for (std::size_t i = 0; i < render_palette_.size(); ++i) {
@@ -3479,15 +3472,24 @@ void D3DViewport::render_scene_native() {
         }
         model->skinning.update(*context_, render_palette_);
 
+        const render::BoundingSphere model_sphere{
+            model->model_point(model->bounds_center()),
+            model->bounds_radius() * model->scale * 1.3f + 0.01f};
+        const bool model_in_camera = frustum.intersects(model_sphere);
+        if (!model_in_camera) {
+            ++culled_models_;
+        }
+
         for (std::size_t i = 0; i < model->mesh.subsets.size(); ++i) {
             const render::MeshSubset& subset = model->mesh.subsets[i];
-            if (i < model->subset_bounds.size()) {
+            bool subset_in_camera = model_in_camera;
+            if (subset_in_camera && i < model->subset_bounds.size()) {
                 const render::BoundingSphere subset_sphere =
                     subset_world_bounds(model->pmx.indices, model->mesh.current_vertices,
                                         subset, render_palette_);
                 if (subset_sphere.radius > 0.0f && !frustum.intersects(subset_sphere)) {
+                    subset_in_camera = false;
                     ++culled_subsets_;
-                    continue;
                 }
             }
             const bool transparent =
@@ -3500,12 +3502,17 @@ void D3DViewport::render_scene_native() {
             draw.skinning = &model->skinning;
             draw.subset = i;
             if (transparent) {
-                const Vec3 center = subset_world_center(
-                    model->pmx.indices, model->mesh.current_vertices, subset, render_palette_);
-                draw.depth = (center - camera_.position).dot(view_forward);
-                view.transparent.push_back(draw);
+                if (subset_in_camera) {
+                    const Vec3 center = subset_world_center(
+                        model->pmx.indices, model->mesh.current_vertices, subset, render_palette_);
+                    draw.depth = (center - camera_.position).dot(view_forward);
+                    view.transparent.push_back(draw);
+                }
             } else {
-                view.opaque.push_back(draw);
+                if (subset_in_camera) {
+                    view.opaque.push_back(draw);
+                }
+                view.shadow_casters.push_back(draw);
             }
         }
     }

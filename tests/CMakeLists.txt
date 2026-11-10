@@ -6,6 +6,7 @@ add_executable(hikari_tests
   test_gfx_frame_graph.cpp
   test_gfx_material.cpp
   test_gfx_settings.cpp
+  test_gfx_shadow.cpp
   test_math.cpp
   test_physics.cpp
   test_skinning.cpp
@@ -46,3 +47,15 @@ endif()
 
 include(Catch)
 catch_discover_tests(hikari_tests)
+
+if(TARGET hikari_gfx_lab)
+  add_test(NAME gfx_phase3_shadow
+    COMMAND hikari_gfx_lab
+      --phase 3 --scene synthetic
+      --capture ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase3_shadow.bmp
+      --probe ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase3_shadow.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase3_shadow.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase3_shadow PROPERTIES TIMEOUT 60)
+endif()

@@ -35,6 +35,11 @@ enum class DebugView : std::uint8_t {
     Specular = 5,
     Emissive = 6,
     Depth = 7,
+    ShadowCascades = 8,
+    ShadowPCSS = 9,
+    ContactShadow = 10,
+    SSGS = 11,
+    SkyVisibility = 12,
 };
 
 struct SunSettings {

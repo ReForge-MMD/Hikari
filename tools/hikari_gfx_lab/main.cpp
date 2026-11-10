@@ -30,6 +30,11 @@ struct Options {
     float exposure = 0.35f;
     float sun = 1.5f;
     float ambient = 0.10f;
+    int debug = 0;
+    float sun_elevation = -1.0f;
+    float sun_azimuth = 180.0f;
+    bool animate_sun = false;
+    std::string camera = "default";
     bool linear_tonemap = false;
     bool validate = false;
     bool list_targets = false;
@@ -74,6 +79,11 @@ void print_help() {
         << "  --exposure <n>     Tonemap exposure (default 0.6).\n"
         << "  --sun <n>          Sun intensity multiplier (default 1.2).\n"
         << "  --ambient <n>      Ambient intensity (default 0.10).\n"
+        << "  --debug <n>        Debug view (0=Off, 8=Cascades, 9=PCSS, 10=Contact, 11=SSGS, 12=SkyVis).\n"
+        << "  --sun-elevation <n> Sun elevation angle in degrees.\n"
+        << "  --sun-azimuth <n>   Sun azimuth angle in degrees.\n"
+        << "  --animate-sun      Continuously rotate the sun in preview mode.\n"
+        << "  --camera <name>    Camera preset (default, close, inside).\n"
         << "  --linear-tonemap   Use the linear operator for diagnosis.\n"
         << "  --validate-shaders Compile and run the default shader set.\n"
         << "  --list-targets     List render target names.\n"
@@ -116,6 +126,16 @@ Options parse_options(int argc, char** argv) {
             options.sun = std::stof(next("--sun"));
         } else if (argument == "--ambient") {
             options.ambient = std::stof(next("--ambient"));
+        } else if (argument == "--debug") {
+            options.debug = std::stoi(next("--debug"));
+        } else if (argument == "--sun-elevation") {
+            options.sun_elevation = std::stof(next("--sun-elevation"));
+        } else if (argument == "--sun-azimuth") {
+            options.sun_azimuth = std::stof(next("--sun-azimuth"));
+        } else if (argument == "--animate-sun") {
+            options.animate_sun = true;
+        } else if (argument == "--camera") {
+            options.camera = next("--camera");
         } else if (argument == "--linear-tonemap") {
             options.linear_tonemap = true;
         } else if (argument == "--validate-shaders") {
@@ -163,19 +183,39 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
     settings.post.tonemap = options.linear_tonemap
                                 ? hikari::gfx::TonemapOperator::Linear
                                 : hikari::gfx::TonemapOperator::AgXBase;
+    if (options.phase == 3) {
+        settings.shadows.quality = 2;
+        settings.shadows.pcss = true;
+        settings.shadows.blur = true;
+        settings.shadows.contact_quality = 3;
+        settings.shadows.ssgs_quality = 3;
+        settings.ao.sky_visibility = 1;
+    }
+    if (options.debug >= 0 && options.debug <= 12) {
+        settings.debug.view = static_cast<hikari::gfx::DebugView>(options.debug);
+    }
     settings.validate();
     return settings;
 }
 
 hikari::render::Camera frame_camera(const hikari::gfx_lab::LabScene& scene,
+                                    const Options& options,
                                     std::uint32_t width, std::uint32_t height) {
     hikari::render::Camera camera;
     const hikari::Vec3 center = scene.center();
     const float radius = std::max(scene.radius(), 0.5f);
     const float fov = 0.5235987756f;
     const float distance = radius / std::tan(fov * 0.5f) * 1.12f;
-    camera.position = center + hikari::Vec3(radius * 0.04f, radius * 0.06f, -distance);
-    camera.target = center + hikari::Vec3(0.0f, radius * 0.04f, 0.0f);
+    if (options.camera == "close") {
+        camera.position = center + hikari::Vec3(0.0f, radius * 0.1f, -radius * 0.45f);
+        camera.target = center + hikari::Vec3(0.0f, radius * 0.1f, 0.0f);
+    } else if (options.camera == "inside") {
+        camera.position = center + hikari::Vec3(0.0f, radius * 0.05f, -radius * 0.2f);
+        camera.target = center + hikari::Vec3(0.0f, radius * 0.05f, radius * 0.5f);
+    } else {
+        camera.position = center + hikari::Vec3(radius * 0.04f, radius * 0.06f, -distance);
+        camera.target = center + hikari::Vec3(0.0f, radius * 0.04f, 0.0f);
+    }
     camera.up = hikari::Vec3(0.0f, 1.0f, 0.0f);
     camera.fov_y = fov;
     camera.aspect = static_cast<float>(width) / static_cast<float>(std::max(height, 1u));
@@ -205,6 +245,7 @@ hikari::Vec3 subset_center(const hikari::gfx_lab::LabScene& scene,
 hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
                                  const hikari::render::Camera& camera,
                                  const hikari::gfx::GraphicsSettings& settings,
+                                 const Options& options,
                                  std::uint32_t width, std::uint32_t height) {
     hikari::gfx::FrameView view;
     view.view = camera.view_matrix();
@@ -212,7 +253,16 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
     view.view_projection = camera.view_projection_matrix();
     view.inverse_view = view.view.inverse_transform();
     view.camera_position = camera.position;
-    view.sun_direction = hikari::Vec3(-0.45f, -1.0f, -0.32f).normalize();
+    if (options.sun_elevation >= 0.0f) {
+        constexpr float kDegToRad = 3.1415926535f / 180.0f;
+        const float el = options.sun_elevation * kDegToRad;
+        const float az = options.sun_azimuth * kDegToRad;
+        view.sun_direction = hikari::Vec3(std::cos(el) * std::sin(az),
+                                          std::sin(el),
+                                          std::cos(el) * std::cos(az)).normalize();
+    } else {
+        view.sun_direction = hikari::Vec3(-0.45f, -1.0f, -0.32f).normalize();
+    }
     view.sun_color = hikari::gfx::sun_color_from_settings(settings, hikari::Vec3(1.0f, 0.97f, 0.92f));
     view.ambient_color = hikari::gfx::ambient_color_from_settings(settings);
     view.background_color = hikari::Vec3(0.055f, 0.065f, 0.085f);
@@ -252,7 +302,7 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
 }
 
 int run_headless(const Options& options) {
-    if (options.phase != 1 && options.phase != 2) {
+    if (options.phase != 1 && options.phase != 2 && options.phase != 3) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -299,9 +349,9 @@ int run_headless(const Options& options) {
         hikari::gfx::TargetPool final_pool;
         final_pool.create_target(context.device.Get(), "Final", width, height,
                                  DXGI_FORMAT_R8G8B8A8_UNORM);
-        const hikari::render::Camera camera = frame_camera(scene, width, height);
+        const hikari::render::Camera camera = frame_camera(scene, options, width, height);
         const hikari::gfx::FrameView view =
-            make_view(scene, camera, settings, width, height);
+            make_view(scene, camera, settings, options, width, height);
 
         const auto start = std::chrono::steady_clock::now();
         renderer.render(settings, view, final_pool.get("Final")->rtv.Get());
@@ -404,7 +454,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 }
 
 int run_window(const Options& options) {
-    if (options.phase != 1 && options.phase != 2) {
+    if (options.phase != 1 && options.phase != 2 && options.phase != 3) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -489,8 +539,13 @@ int run_window(const Options& options) {
                 context.resize(width, height);
                 renderer.resize(width, height);
             }
-            const hikari::render::Camera camera = frame_camera(scene, width, height);
-            hikari::gfx::FrameView view = make_view(scene, camera, settings, width, height);
+            const hikari::render::Camera camera = frame_camera(scene, options, width, height);
+            hikari::gfx::FrameView view = make_view(scene, camera, settings, options, width, height);
+            if (options.animate_sun) {
+                static float angle = 0.0f;
+                angle += 0.01f;
+                view.sun_direction = hikari::Vec3(std::cos(angle), -0.8f, std::sin(angle)).normalize();
+            }
             view.show_geometry = g_show_geometry;
             view.show_lighting = g_show_lighting;
             view.show_transparent = g_show_transparent;

@@ -39,6 +39,14 @@ private:
     QComboBox* tonemap_ = nullptr;
     QCheckBox* sun_disk_ = nullptr;
     QCheckBox* limb_darkening_ = nullptr;
+    QComboBox* shadow_quality_ = nullptr;
+    QCheckBox* shadow_pcss_ = nullptr;
+    QDoubleSpinBox* shadow_light_radius_ = nullptr;
+    QCheckBox* shadow_blur_ = nullptr;
+    QComboBox* contact_shadow_quality_ = nullptr;
+    QComboBox* ssgs_quality_ = nullptr;
+    QComboBox* sky_visibility_ = nullptr;
+    QComboBox* debug_view_ = nullptr;
     QCheckBox* wireframe_ = nullptr;
     QLabel* status_ = nullptr;
 };
