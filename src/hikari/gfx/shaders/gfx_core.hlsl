@@ -972,53 +972,212 @@ float4 ForwardPS(VSOut input) : SV_Target {
     return float4(color, alpha);
 }
 
-float3 aces_fitted(float3 color) {
+float luminance(float3 color) {
+    return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+float3 tonemap_reinhard(float3 color, float white_pt) {
+    color = max(0.0f, color);
+    const float luma = luminance(color);
+    const float tone_mapped_luma = luma * (1.0f + luma / (white_pt * white_pt)) / (1.0f + luma);
+    color *= tone_mapped_luma / max(luma, 1.0e-6f);
+    return saturate(color);
+}
+
+float4 tonemap_hable_curve(float4 x) {
+    const float a = 0.22f;
+    const float b = 0.30f;
+    const float c = 0.10f;
+    const float d = 0.20f;
+    const float e = 0.01f;
+    const float f = 0.30f;
+    return ((x * (a * x + c * b) + d * e) / (x * (a * x + b) + d * f)) - (e / f);
+}
+
+float3 tonemap_hable(float3 color, float white_pt) {
+    color = max(0.0f, color);
+    float4 curr = tonemap_hable_curve(float4(color * 2.0f, white_pt));
+    curr /= curr.w;
+    return saturate(curr.rgb);
+}
+
+float3 tonemap_hejl(float3 hdr, float white_pt) {
+    hdr = max(0.0f, hdr);
+    const float4 vh = float4(hdr, white_pt);
+    const float4 va = 1.425f * vh + 0.05f;
+    const float4 vf = (vh * va + 0.004f) / (vh * (va + 0.55f) + 0.0491f) - 0.0821f;
+    return saturate(vf.rgb / vf.www);
+}
+
+float3 tonemap_aces_srgb(float3 x) {
+    x = max(0.0f, x);
     const float a = 2.51f;
     const float b = 0.03f;
     const float c = 2.43f;
     const float d = 0.59f;
     const float e = 0.14f;
-    return saturate((color * (a * color + b)) / (color * (c * color + d) + e));
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
-float3 agx_contrast(float3 x) {
-    const float3 x2 = x * x;
-    const float3 x4 = x2 * x2;
-    return 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 - 6.868f * x2 * x +
-           0.4298f * x2 + 0.1191f * x - 0.00232f;
+float3 tonemap_naughty_dog(float3 x) {
+    x = max(0.0f, x);
+    const float a = -2586.3655f;
+    const float b = 0.6900f;
+    const float c = -767.6706f;
+    const float d = -8.5706f;
+    const float e = 2.8784f;
+    const float f = 107.4683f;
+    return saturate(((x * (a * x + c * b) + d * e) / (x * (a * x + b) + d * f)) - (e / f));
 }
 
-float3 agx(float3 color) {
-    const float3x3 agx_in = float3x3(
-        0.842479062253094f, 0.0423282422610123f, 0.0423756549057051f,
-        0.0784335999999992f, 0.878468636469772f, 0.0784336f,
-        0.0792237451477643f, 0.0791661274605434f, 0.879142973793104f);
-    const float3x3 agx_out = float3x3(
-        0.856627153315983f, 0.0951212405381588f, 0.0482510387262912f,
-        0.137318972929847f, 0.761241990602591f, 0.101439036467562f,
-        0.11189821299995f, 0.0767994186031903f, 0.811302368396859f);
-    const float min_ev = -12.47393f;
-    const float max_ev = 4.026069f;
-    color = max(color, float3(1.0e-10f, 1.0e-10f, 1.0e-10f));
-    color = mul(agx_in, color);
-    color = clamp(log2(color), min_ev, max_ev);
-    color = (color - min_ev) / (max_ev - min_ev);
-    color = agx_contrast(color);
-    color = mul(agx_out, color);
-    return saturate(color);
+float3 tonemap_aces_fitted(float3 color) {
+    color = max(0.0f, color);
+    static const float3x3 aces_input_mat = {
+        0.59719f, 0.35458f, 0.04823f,
+        0.07600f, 0.90834f, 0.01566f,
+        0.02840f, 0.13383f, 0.83777f
+    };
+    static const float3x3 aces_output_mat = {
+        1.60475f, -0.53108f, -0.07367f,
+       -0.10208f,  1.10813f, -0.00605f,
+       -0.00327f, -0.07276f,  1.07602f
+    };
+    color = mul(aces_input_mat, color);
+    const float3 a = color * (color + 0.0245786f) - 0.000090537f;
+    const float3 b = color * (0.983729f * color + 0.4329510f) + 0.238081f;
+    color = a / b;
+    // Maps directly to sRGB display encoding; linearize so subsequent pipeline gamma behaves correctly
+    return srgb_to_linear(saturate(mul(aces_output_mat, color)));
+}
+
+float3 tonemap_agx(float3 val, int look) {
+    static const float3x3 agx_inset_mat = {
+        0.842479065f, 0.078433600f, 0.079223745f,
+        0.042328242f, 0.878468640f, 0.079166127f,
+        0.042375655f, 0.078433600f, 0.879142973f
+    };
+    static const float3x3 agx_out_mat = {
+        1.19687900f, -0.09802088f, -0.09902974f,
+       -0.05289685f,  1.15190313f, -0.09896118f,
+       -0.05297164f, -0.09804345f,  1.15107367f
+    };
+
+    val = max(1.0e-6f, val);
+    val = mul(agx_inset_mat, val);
+
+    // Normalized log2 encoding over [-12.47393 EV, +4.026069 EV] range (16.5 stops dynamic range)
+    val = clamp((log2(val) + 12.47393f) / 16.5f, 0.0f, 1.0f);
+
+    // Exact 6th-order polynomial fit of the official Blender 4.0 / OCIO AgX Base Contrast S-Curve
+    val = val * (val * (val * (val * (val * (15.5f * val - 40.14f) + 31.96f) - 6.868f) + 0.4298f) + 0.1191f) - 0.00232f;
+
+    if (look == 1) {
+        // AgX Punchy look (CDL slope 1.0, power 1.35, sat 1.4)
+        val = pow(max(0.0f, val), 1.35f);
+        const float luma = dot(val, float3(0.2126f, 0.7152f, 0.0722f));
+        val = luma + 1.4f * (val - luma);
+    } else if (look == 2) {
+        // AgX Golden look (CDL slope [1.0, 0.9, 0.5], power 0.8, sat 1.3)
+        val = pow(max(0.0f, val * float3(1.0f, 0.9f, 0.5f)), 0.8f);
+        const float luma = dot(val, float3(0.2126f, 0.7152f, 0.0722f));
+        val = luma + 1.3f * (val - luma);
+    }
+
+    val = mul(agx_out_mat, val);
+
+    // Maps directly to sRGB display encoding; linearize so subsequent pipeline gamma behaves correctly
+    return srgb_to_linear(saturate(val));
+}
+
+float3 tonemap_pbr_neutral(float3 color) {
+    const float start_compression = 0.8f - 0.04f;
+    const float desaturation = 0.15f;
+
+    color = max(0.0f, color);
+
+    const float x = min(color.r, min(color.g, color.b));
+    const float offset = x < 0.08f ? x - 6.25f * x * x : 0.04f;
+    color -= offset;
+
+    const float peak = max(color.r, max(color.g, color.b));
+    if (peak < start_compression) {
+        return saturate(color);
+    }
+
+    const float d = 1.0f - start_compression;
+    const float new_peak = 1.0f - (d * d) / (peak + d - start_compression);
+    color *= new_peak / peak;
+
+    const float g = 1.0f - 1.0f / (desaturation * (peak - new_peak) + 1.0f);
+    return saturate(lerp(color, new_peak.xxx, g));
+}
+
+float gt7_curve_eval(float x) {
+    if (x <= 0.0f) {
+        return 0.0f;
+    }
+    const float mid_point = 0.538f;
+    const float toe_strength = 1.280f;
+    const float linear_limit = 1.11f;
+    const float ka = 2.96333f;
+    const float kb = -3.37335f;
+    const float kc = -0.53957f;
+
+    if (x < linear_limit) {
+        const float w = smoothstep(0.0f, mid_point, x);
+        const float toe = mid_point * pow(max(x / mid_point, 0.0f), toe_strength);
+        return (1.0f - w) * toe + w * x;
+    }
+    return ka + kb * exp(x * kc);
+}
+
+float3 tonemap_gt7(float3 color) {
+    color = max(0.0f, color);
+    const float3 curve_color = float3(
+        gt7_curve_eval(color.r),
+        gt7_curve_eval(color.g),
+        gt7_curve_eval(color.b)
+    );
+    const float sdr_factor = 0.4f;
+    const float3 mapped = curve_color * sdr_factor;
+
+    const float peak = max(mapped.r, max(mapped.g, mapped.b));
+    const float luma = dot(mapped, float3(0.2126f, 0.7152f, 0.0722f));
+    const float desat = saturate((peak - 0.85f) * 4.0f);
+    return saturate(lerp(mapped, luma.xxx, desat * 0.35f));
 }
 
 float4 TonemapPS(FSOut input) : SV_Target {
-    const float3 hdr = HdrTex.Sample(LinearSampler, input.uv).rgb * Params0.z;
+    const float3 hdr = max(0.0f, HdrTex.Sample(LinearSampler, input.uv).rgb * Params0.z);
     float3 color;
 #if TONEMAP_OPERATOR == 0
     color = hdr;
 #elif TONEMAP_OPERATOR == 1
-    color = hdr / (1.0f + hdr);
+    color = tonemap_reinhard(hdr, 4.0f);
+#elif TONEMAP_OPERATOR == 2
+    color = tonemap_hable(hdr, 4.0f);
+#elif TONEMAP_OPERATOR == 3
+    color = tonemap_hable(hdr, 8.0f);
+#elif TONEMAP_OPERATOR == 4
+    color = tonemap_hejl(hdr, 4.0f);
 #elif TONEMAP_OPERATOR == 5
-    color = aces_fitted(hdr);
+    color = tonemap_aces_srgb(hdr);
+#elif TONEMAP_OPERATOR == 6
+    color = tonemap_naughty_dog(hdr);
+#elif TONEMAP_OPERATOR == 7
+    color = tonemap_aces_fitted(hdr);
+#elif TONEMAP_OPERATOR == 8
+    color = tonemap_agx(hdr, 0);
+#elif TONEMAP_OPERATOR == 9
+    color = tonemap_agx(hdr, 1);
+#elif TONEMAP_OPERATOR == 10
+    color = tonemap_pbr_neutral(hdr);
+#elif TONEMAP_OPERATOR == 11
+    color = tonemap_gt7(hdr);
+#elif TONEMAP_OPERATOR == 12
+    color = tonemap_agx(hdr, 2);
 #else
-    color = agx(hdr);
+    color = hdr;
 #endif
     color = pow(saturate(color), 1.0f / 2.2f);
     return float4(color, 1.0f);

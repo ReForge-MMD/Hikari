@@ -1,6 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "hikari/core/shader.hpp"
 #include "hikari/gfx/settings.hpp"
+#include "hikari/gfx/shader_library.hpp"
 
 using hikari::gfx::DiffuseBrdf;
 using hikari::gfx::GraphicsSettings;
@@ -74,5 +80,30 @@ TEST_CASE("preset values are valid and select the native renderer", "[gfx][setti
         REQUIRE(settings.renderer == hikari::gfx::RendererMode::Native);
         REQUIRE(settings.preset == preset);
         REQUIRE(settings.validate() == 0);
+    }
+}
+
+TEST_CASE("every tonemap operator has a valid distinct name", "[gfx][settings]") {
+    for (int i = 0; i <= static_cast<int>(TonemapOperator::AgXGolden); ++i) {
+        const char* name = hikari::gfx::tonemap_operator_name(static_cast<TonemapOperator>(i));
+        REQUIRE(name != nullptr);
+        REQUIRE(std::strlen(name) > 0);
+        REQUIRE(std::strcmp(name, "Unknown") != 0);
+    }
+}
+
+TEST_CASE("all tonemap operators compile cleanly in TonemapPS", "[gfx][shader]") {
+    const auto& sources = hikari::gfx::embedded_shader_sources();
+    const auto it = sources.find("gfx_core.hlsl");
+    REQUIRE(it != sources.end());
+    const std::string& source = it->second;
+
+    for (int i = 0; i <= static_cast<int>(TonemapOperator::AgXGolden); ++i) {
+        const std::vector<std::pair<std::string, std::string>> defines = {
+            {"TONEMAP_OPERATOR", std::to_string(i)}
+        };
+        const auto bytecode =
+            hikari::core::compile_hlsl(source, "TonemapPS", "ps_5_0", "gfx_core.hlsl", defines);
+        REQUIRE_FALSE(bytecode.empty());
     }
 }
