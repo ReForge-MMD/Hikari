@@ -1,16 +1,21 @@
 add_library(hikari_gfx STATIC
   frame_graph.cpp
   gbuffer.cpp
+  ibl.cpp
   material.cpp
   renderer.cpp
   settings.cpp
   shader_library.cpp
+  sky.cpp
+  sky_assets.cpp
   target_pool.cpp
 )
 
 target_link_libraries(hikari_gfx
   PUBLIC hikari_options hikari_core hikari_render hikari_formats hikari_animation
 )
+
+target_include_directories(hikari_gfx PRIVATE ${Stb_INCLUDE_DIR})
 
 set(HIKARI_GFX_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(HIKARI_GFX_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/gfx_shader_sources.generated.cpp")

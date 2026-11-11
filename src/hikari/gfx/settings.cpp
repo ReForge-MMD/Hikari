@@ -243,6 +243,7 @@ int GraphicsSettings::validate() {
     clamp_int(shadows.contact_quality, 0, 3);
     clamp_int(shadows.ssgs_quality, 0, 3);
 
+    clamp_int(sky.quality, 0, 4);
     clamp_float(sky.time_of_day, 0.0f, 24.0f);
     if (sky.time_of_day >= 24.0f) {
         sky.time_of_day = 0.0f;
@@ -250,11 +251,18 @@ int GraphicsSettings::validate() {
     clamp_float(sky.turbidity, 0.0f, 10.0f);
     clamp_float(sky.ozone, 0.0f, 5.0f);
     clamp_float(sky.sun_radius, 0.0f, 20.0f);
+    clamp_float(sky.sun_radiance, 0.0f, 1000.0f);
+    clamp_float(sky.mie_anisotropy, -0.99f, 0.99f);
     clamp_float(sky.cloud_coverage, 0.0f, 1.0f);
+    clamp_float(sky.cloud_density, 0.0f, 4.0f);
     clamp_float(sky.cloud_speed, 0.0f, 10.0f);
+    clamp_float(sky.cloud_turbulence, 0.0f, 2.0f);
     clamp_float(sky.star_brightness, 0.0f, 10.0f);
+    clamp_float(sky.milky_way_intensity, 0.0f, 10.0f);
     clamp_float(sky.moon_intensity, 0.0f, 10.0f);
+    clamp_float(sky.moon_phase, 0.0f, 1.0f);
     clamp_float(sky.ambient_intensity, 0.0f, 10.0f);
+    clamp_int(sky.ibl_update_hz, 1, 60);
 
     clamp_int(ibl.quality, 0, 2);
     clamp_float(ibl.intensity, 0.0f, 10.0f);
@@ -364,7 +372,10 @@ std::uint64_t GraphicsSettings::permutation_key() const {
     mix(hash, sun.specular_disk);
     mix(hash, sun.limb_darkening);
     mix(hash, sun.sky_coupling);
+    mix(hash, sun.corona);
     mix(hash, sun.auto_cct);
+    mix(hash, sky.enabled);
+    mix(hash, sky.quality);
     mix(hash, shadows.quality);
     mix(hash, shadows.pcss);
     mix(hash, shadows.blur);
@@ -429,16 +440,25 @@ std::string GraphicsSettings::to_json() const {
     put_bool(out, "shadows.blur", shadows.blur, true);
     put_int(out, "shadows.contact_quality", shadows.contact_quality, true);
     put_int(out, "shadows.ssgs_quality", shadows.ssgs_quality, true);
+    put_bool(out, "sky.enabled", sky.enabled, true);
+    put_int(out, "sky.quality", sky.quality, true);
     put_float(out, "sky.time_of_day", sky.time_of_day, true);
     put_float(out, "sky.turbidity", sky.turbidity, true);
+    put_float(out, "sky.sun_radiance", sky.sun_radiance, true);
+    put_float(out, "sky.mie_anisotropy", sky.mie_anisotropy, true);
     put_float(out, "sky.ozone", sky.ozone, true);
     put_float(out, "sky.sun_radius", sky.sun_radius, true);
     put_float(out, "sky.cloud_coverage", sky.cloud_coverage, true);
+    put_float(out, "sky.cloud_density", sky.cloud_density, true);
     put_float(out, "sky.cloud_speed", sky.cloud_speed, true);
+    put_float(out, "sky.cloud_turbulence", sky.cloud_turbulence, true);
     put_float(out, "sky.star_brightness", sky.star_brightness, true);
+    put_float(out, "sky.milky_way_intensity", sky.milky_way_intensity, true);
     put_float(out, "sky.moon_intensity", sky.moon_intensity, true);
+    put_float(out, "sky.moon_phase", sky.moon_phase, true);
     put_float(out, "sky.ambient_intensity", sky.ambient_intensity, true);
     put_vec3(out, "sky.ambient_color", sky.ambient_color, true);
+    put_int(out, "sky.ibl_update_hz", sky.ibl_update_hz, true);
     put_int(out, "ibl.quality", ibl.quality, true);
     put_float(out, "ibl.intensity", ibl.intensity, true);
     put_float(out, "ibl.rotation_degrees", ibl.rotation_degrees, true);
@@ -579,16 +599,27 @@ bool GraphicsSettings::from_json(const std::string& json) {
     shadows.blur = read_bool(values, "shadows.blur", shadows.blur);
     shadows.contact_quality = read_int(values, "shadows.contact_quality", shadows.contact_quality);
     shadows.ssgs_quality = read_int(values, "shadows.ssgs_quality", shadows.ssgs_quality);
+    sky.enabled = read_bool(values, "sky.enabled", sky.enabled);
+    sky.quality = read_int(values, "sky.quality", sky.quality);
     sky.time_of_day = read_float(values, "sky.time_of_day", sky.time_of_day);
     sky.turbidity = read_float(values, "sky.turbidity", sky.turbidity);
+    sky.sun_radiance = read_float(values, "sky.sun_radiance", sky.sun_radiance);
+    sky.mie_anisotropy = read_float(values, "sky.mie_anisotropy", sky.mie_anisotropy);
     sky.ozone = read_float(values, "sky.ozone", sky.ozone);
     sky.sun_radius = read_float(values, "sky.sun_radius", sky.sun_radius);
     sky.cloud_coverage = read_float(values, "sky.cloud_coverage", sky.cloud_coverage);
+    sky.cloud_density = read_float(values, "sky.cloud_density", sky.cloud_density);
     sky.cloud_speed = read_float(values, "sky.cloud_speed", sky.cloud_speed);
+    sky.cloud_turbulence =
+        read_float(values, "sky.cloud_turbulence", sky.cloud_turbulence);
     sky.star_brightness = read_float(values, "sky.star_brightness", sky.star_brightness);
+    sky.milky_way_intensity =
+        read_float(values, "sky.milky_way_intensity", sky.milky_way_intensity);
     sky.moon_intensity = read_float(values, "sky.moon_intensity", sky.moon_intensity);
+    sky.moon_phase = read_float(values, "sky.moon_phase", sky.moon_phase);
     sky.ambient_intensity = read_float(values, "sky.ambient_intensity", sky.ambient_intensity);
     sky.ambient_color = read_vec3(values, "sky.ambient_color", sky.ambient_color);
+    sky.ibl_update_hz = read_int(values, "sky.ibl_update_hz", sky.ibl_update_hz);
     ibl.quality = read_int(values, "ibl.quality", ibl.quality);
     ibl.intensity = read_float(values, "ibl.intensity", ibl.intensity);
     ibl.rotation_degrees = read_float(values, "ibl.rotation_degrees", ibl.rotation_degrees);

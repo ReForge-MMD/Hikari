@@ -14,6 +14,8 @@
 #include "hikari/core/d3d11.hpp"
 #include "hikari/gfx/renderer.hpp"
 #include "hikari/gfx/settings.hpp"
+#include "hikari/gfx/sky.hpp"
+#include "hikari/gfx/sky_assets.hpp"
 #include "hikari/render/camera.hpp"
 #include "scene.hpp"
 
@@ -33,8 +35,21 @@ struct Options {
     int debug = 0;
     float sun_elevation = -1.0f;
     float sun_azimuth = 180.0f;
+    int sky_coupling = -1;
+    float time_of_day = -1.0f;
+    float sky_time = 0.0f;
+    float sky_drift = 0.0f;
+    int sky_hz = -1;
+    int ibl = -1;
+    float cloud_coverage = -1.0f;
+    float moon_intensity = -1.0f;
+    std::string ibl_path;
+    float ibl_rotation = 0.0f;
+    float ibl_intensity = -1.0f;
+    int frames = 1;
     bool animate_sun = false;
     std::string camera = "default";
+    float camera_azimuth = 0.0f;
     bool linear_tonemap = false;
     bool validate = false;
     bool list_targets = false;
@@ -70,7 +85,7 @@ void print_help() {
         << "  hikari_gfx_lab --phase 2 --scene room --pmx <stage.pmx>\n"
         << "  hikari_gfx_lab --phase 2 --scene character --pmx <model.pmx>\n\n"
         << "Options:\n"
-        << "  --phase <n>        Phase scenario. This build implements phase 1 and 2.\n"
+        << "  --phase <n>        Phase scenario. This build implements phase 1 to 4.\n"
         << "  --scene <name>     synthetic, room, or character.\n"
         << "  --pmx <path>       Override the scene PMX path.\n"
         << "  --capture <path>   Headless BMP capture.\n"
@@ -79,11 +94,24 @@ void print_help() {
         << "  --exposure <n>     Tonemap exposure (default 0.6).\n"
         << "  --sun <n>          Sun intensity multiplier (default 1.2).\n"
         << "  --ambient <n>      Ambient intensity (default 0.10).\n"
-        << "  --debug <n>        Debug view (0=Off, 8=Cascades, 9=PCSS, 10=Contact, 11=SSGS, 12=SkyVis).\n"
+        << "  --debug <n>        Debug view (0=Off, 8=Cascades, 9=PCSS, 10=Contact, 11=SSGS, 12=SkyVis, 13=SkyCube, 14=SkyIrradiance, 15=SkyPrefilter, 16=SkyPrefilterRough, 17=IblSpecular).\n"
         << "  --sun-elevation <n> Sun elevation angle in degrees.\n"
         << "  --sun-azimuth <n>   Sun azimuth angle in degrees.\n"
+        << "  --sky-coupling <n>  Fade the direct sun into the sky at low elevation (0/1).\n"
+        << "  --time-of-day <h>  Sky time of day in hours, 0 to 24 (phase 4).\n"
+        << "  --time <s>         Sky animation time in seconds for clouds and meteors.\n"
+        << "  --sky-drift <s>    Advance sky time by s seconds per rendered frame.\n"
+        << "  --sky-hz <n>       Cap captured environment refreshes per second (default 10).\n"
+        << "  --cloud-coverage <n> Cloud layer coverage, 0 clear to 1 overcast (phase 4).\n"
+        << "  --moon-intensity <n> Moon disk and moonlight intensity (phase 4).\n"
+        << "  --ibl <n>          IBL quality (0=off, 1=128, 2=256 sky capture).\n"
+        << "  --ibl-path <file>  Load a custom .hdr or .dds environment instead of the sky.\n"
+        << "  --ibl-rotation <d> Rotate the environment around the vertical axis, degrees.\n"
+        << "  --ibl-intensity <n> Environment specular intensity multiplier.\n"
+        << "  --frames <n>       Render the headless capture n times and report the mean time.\n"
         << "  --animate-sun      Continuously rotate the sun in preview mode.\n"
-        << "  --camera <name>    Camera preset (default, close, inside).\n"
+        << "  --camera <name>    Camera preset (default, close, inside, sky, band).\n"
+        << "  --camera-azimuth <d> Orbit the camera preset around the scene center, degrees.\n"
         << "  --linear-tonemap   Use the linear operator for diagnosis.\n"
         << "  --validate-shaders Compile and run the default shader set.\n"
         << "  --list-targets     List render target names.\n"
@@ -132,10 +160,36 @@ Options parse_options(int argc, char** argv) {
             options.sun_elevation = std::stof(next("--sun-elevation"));
         } else if (argument == "--sun-azimuth") {
             options.sun_azimuth = std::stof(next("--sun-azimuth"));
+        } else if (argument == "--sky-coupling") {
+            options.sky_coupling = std::stoi(next("--sky-coupling"));
+        } else if (argument == "--time-of-day") {
+            options.time_of_day = std::stof(next("--time-of-day"));
+        } else if (argument == "--time") {
+            options.sky_time = std::stof(next("--time"));
+        } else if (argument == "--sky-drift") {
+            options.sky_drift = std::stof(next("--sky-drift"));
+        } else if (argument == "--sky-hz") {
+            options.sky_hz = std::stoi(next("--sky-hz"));
+        } else if (argument == "--cloud-coverage") {
+            options.cloud_coverage = std::stof(next("--cloud-coverage"));
+        } else if (argument == "--moon-intensity") {
+            options.moon_intensity = std::stof(next("--moon-intensity"));
+        } else if (argument == "--ibl") {
+            options.ibl = std::stoi(next("--ibl"));
+        } else if (argument == "--ibl-path") {
+            options.ibl_path = next("--ibl-path");
+        } else if (argument == "--ibl-rotation") {
+            options.ibl_rotation = std::stof(next("--ibl-rotation"));
+        } else if (argument == "--ibl-intensity") {
+            options.ibl_intensity = std::stof(next("--ibl-intensity"));
+        } else if (argument == "--frames") {
+            options.frames = std::max(std::stoi(next("--frames")), 1);
         } else if (argument == "--animate-sun") {
             options.animate_sun = true;
         } else if (argument == "--camera") {
             options.camera = next("--camera");
+        } else if (argument == "--camera-azimuth") {
+            options.camera_azimuth = std::stof(next("--camera-azimuth"));
         } else if (argument == "--linear-tonemap") {
             options.linear_tonemap = true;
         } else if (argument == "--validate-shaders") {
@@ -178,6 +232,9 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
     settings.sun.limb_darkening = true;
     settings.sun.auto_cct = true;
     settings.sun.color_temperature = 6500.0f;
+    if (options.sky_coupling >= 0) {
+        settings.sun.sky_coupling = options.sky_coupling != 0;
+    }
     settings.sky.ambient_intensity = options.ambient;
     settings.post.exposure = options.exposure;
     settings.post.tonemap = options.linear_tonemap
@@ -191,7 +248,31 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
         settings.shadows.ssgs_quality = 3;
         settings.ao.sky_visibility = 1;
     }
-    if (options.debug >= 0 && options.debug <= 12) {
+    if (options.time_of_day >= 0.0f) {
+        settings.sky.time_of_day = options.time_of_day;
+    }
+    if (options.phase == 4) {
+        settings.sky.enabled = true;
+        settings.sky.quality = 3;
+    }
+    if (options.ibl >= 0) {
+        settings.ibl.quality = options.ibl;
+    }
+    settings.ibl.custom_path = options.ibl_path;
+    settings.ibl.rotation_degrees = options.ibl_rotation;
+    if (options.ibl_intensity >= 0.0f) {
+        settings.ibl.intensity = options.ibl_intensity;
+    }
+    if (options.sky_hz >= 0) {
+        settings.sky.ibl_update_hz = options.sky_hz;
+    }
+    if (options.cloud_coverage >= 0.0f) {
+        settings.sky.cloud_coverage = options.cloud_coverage;
+    }
+    if (options.moon_intensity >= 0.0f) {
+        settings.sky.moon_intensity = options.moon_intensity;
+    }
+    if (options.debug >= 0 && options.debug <= 17) {
         settings.debug.view = static_cast<hikari::gfx::DebugView>(options.debug);
     }
     settings.validate();
@@ -199,6 +280,7 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
 }
 
 hikari::render::Camera frame_camera(const hikari::gfx_lab::LabScene& scene,
+                                    const hikari::gfx::GraphicsSettings& settings,
                                     const Options& options,
                                     std::uint32_t width, std::uint32_t height) {
     hikari::render::Camera camera;
@@ -206,18 +288,57 @@ hikari::render::Camera frame_camera(const hikari::gfx_lab::LabScene& scene,
     const float radius = std::max(scene.radius(), 0.5f);
     const float fov = 0.5235987756f;
     const float distance = radius / std::tan(fov * 0.5f) * 1.12f;
+    float sky_fov = fov;
     if (options.camera == "close") {
         camera.position = center + hikari::Vec3(0.0f, radius * 0.1f, -radius * 0.45f);
         camera.target = center + hikari::Vec3(0.0f, radius * 0.1f, 0.0f);
     } else if (options.camera == "inside") {
         camera.position = center + hikari::Vec3(0.0f, radius * 0.05f, -radius * 0.2f);
         camera.target = center + hikari::Vec3(0.0f, radius * 0.05f, radius * 0.5f);
+    } else if (options.camera == "sky") {
+        // Phase 4 sky capture: aim at the anti-solar point so the moon, stars,
+        // and the Milky Way band sit inside the frame. Other phases keep a
+        // pitched-up view over the scene.
+        if (options.phase == 4) {
+            const hikari::Vec3 moon_direction =
+                -hikari::gfx::sun_direction_from_time_of_day(settings.sky.time_of_day);
+            camera.position = center + hikari::Vec3(0.0f, radius * 0.06f, 0.0f);
+            camera.target = camera.position + moon_direction * (radius * 4.0f);
+        } else {
+            camera.position =
+                center + hikari::Vec3(0.0f, radius * 0.06f, -distance * 0.35f);
+            camera.target =
+                camera.position + hikari::Vec3(0.0f, radius * 1.25f, radius * 0.10f);
+        }
+        sky_fov = 1.0471976f;
+    } else if (options.camera == "band") {
+        // Frames the brightest part of the generated Milky Way band, which the
+        // anti-solar sky preset cannot show.
+        const auto core = hikari::gfx::milky_way_core_direction();
+        camera.position = center + hikari::Vec3(0.0f, radius * 0.06f, 0.0f);
+        camera.target = camera.position + hikari::Vec3(core[0], core[1], core[2]) * (radius * 4.0f);
+        sky_fov = 1.0471976f;
     } else {
         camera.position = center + hikari::Vec3(radius * 0.04f, radius * 0.06f, -distance);
         camera.target = center + hikari::Vec3(0.0f, radius * 0.04f, 0.0f);
     }
     camera.up = hikari::Vec3(0.0f, 1.0f, 0.0f);
-    camera.fov_y = fov;
+    if (options.camera_azimuth != 0.0f) {
+        // Orbiting both the eye and the target around the scene center turns any
+        // preset into a turntable frame without changing its framing.
+        constexpr float kDegToRad = 3.1415926535f / 180.0f;
+        const float angle = options.camera_azimuth * kDegToRad;
+        const float c = std::cos(angle);
+        const float s = std::sin(angle);
+        const auto orbit = [&](const hikari::Vec3& point) {
+            const hikari::Vec3 local = point - center;
+            return center + hikari::Vec3(local.x * c + local.z * s, local.y,
+                                         -local.x * s + local.z * c);
+        };
+        camera.position = orbit(camera.position);
+        camera.target = orbit(camera.target);
+    }
+    camera.fov_y = sky_fov;
     camera.aspect = static_cast<float>(width) / static_cast<float>(std::max(height, 1u));
     camera.near_z = std::max(radius * 0.01f, 0.01f);
     camera.far_z = std::max(radius * 20.0f, 100.0f);
@@ -257,9 +378,12 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
         constexpr float kDegToRad = 3.1415926535f / 180.0f;
         const float el = options.sun_elevation * kDegToRad;
         const float az = options.sun_azimuth * kDegToRad;
-        view.sun_direction = hikari::Vec3(std::cos(el) * std::sin(az),
-                                          std::sin(el),
-                                          std::cos(el) * std::cos(az)).normalize();
+        view.sun_direction = -hikari::Vec3(std::cos(el) * std::sin(az),
+                                           std::sin(el),
+                                           std::cos(el) * std::cos(az)).normalize();
+    } else if (options.phase == 4) {
+        view.sun_direction = -hikari::gfx::sun_direction_from_time_of_day(
+            settings.sky.time_of_day);
     } else {
         view.sun_direction = hikari::Vec3(-0.45f, -1.0f, -0.32f).normalize();
     }
@@ -268,6 +392,7 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
     view.background_color = hikari::Vec3(0.055f, 0.065f, 0.085f);
     view.near_z = camera.near_z;
     view.far_z = camera.far_z;
+    view.time_seconds = options.sky_time;
     view.orthographic = camera.orthographic;
     view.draw_grid = true;
     view.show_grid = true;
@@ -302,7 +427,7 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
 }
 
 int run_headless(const Options& options) {
-    if (options.phase != 1 && options.phase != 2 && options.phase != 3) {
+    if (options.phase < 1 || options.phase > 4) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -349,15 +474,36 @@ int run_headless(const Options& options) {
         hikari::gfx::TargetPool final_pool;
         final_pool.create_target(context.device.Get(), "Final", width, height,
                                  DXGI_FORMAT_R8G8B8A8_UNORM);
-        const hikari::render::Camera camera = frame_camera(scene, options, width, height);
-        const hikari::gfx::FrameView view =
+        const hikari::render::Camera camera =
+            frame_camera(scene, settings, options, width, height);
+        hikari::gfx::FrameView view =
             make_view(scene, camera, settings, options, width, height);
 
         const auto start = std::chrono::steady_clock::now();
-        renderer.render(settings, view, final_pool.get("Final")->rtv.Get());
+        std::vector<double> frame_times;
+        frame_times.reserve(static_cast<std::size_t>(options.frames));
+        for (int frame = 0; frame < options.frames; ++frame) {
+            view.time_seconds =
+                options.sky_time + options.sky_drift * static_cast<float>(frame);
+            const auto frame_start = std::chrono::steady_clock::now();
+            renderer.render(settings, view, final_pool.get("Final")->rtv.Get());
+            frame_times.push_back(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          frame_start)
+                    .count());
+        }
         const auto end = std::chrono::steady_clock::now();
-        const double frame_ms =
-            std::chrono::duration<double, std::milli>(end - start).count();
+        const double frame_ms = std::chrono::duration<double, std::milli>(end - start).count() /
+                                static_cast<double>(options.frames);
+        // First-use shader compilation dominates the mean, so also report the
+        // mean of the last quarter of the run as the steady state cost.
+        const std::size_t warm_start = frame_times.size() * 3 / 4;
+        double warm_ms = 0.0;
+        for (std::size_t i = warm_start; i < frame_times.size(); ++i) {
+            warm_ms += frame_times[i];
+        }
+        warm_ms /= static_cast<double>(frame_times.size() - warm_start);
+        const double max_ms = *std::max_element(frame_times.begin(), frame_times.end());
 
         ID3D11Texture2D* capture_texture = final_pool.get("Final")->texture.Get();
         if (options.target != "Final") {
@@ -384,7 +530,17 @@ int run_headless(const Options& options) {
             return 1;
         }
         std::cout << "phase " << options.phase << " scene " << scene.name << " rendered "
-                  << width << 'x' << height << " in " << frame_ms << " ms\n";
+                  << width << 'x' << height << " in " << frame_ms << " ms (warm " << warm_ms
+                  << " ms, max " << max_ms << " ms), sky updates "
+                  << renderer.sky_update_count() << '/' << options.frames << '\n';
+        if (!settings.ibl.custom_path.empty()) {
+            std::cout << "ibl source: " << (renderer.ibl_custom_active() ? "loaded " : "rejected ")
+                      << settings.ibl.custom_path;
+            if (!renderer.ibl_custom_active()) {
+                std::cout << " (" << renderer.ibl_error() << ')';
+            }
+            std::cout << '\n';
+        }
         if (!options.compare.empty()) {
             const auto golden = hikari::gfx_lab::read_capture(options.compare, &error);
             if (!golden) {
@@ -454,7 +610,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 }
 
 int run_window(const Options& options) {
-    if (options.phase != 1 && options.phase != 2 && options.phase != 3) {
+    if (options.phase < 1 || options.phase > 4) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -539,13 +695,19 @@ int run_window(const Options& options) {
                 context.resize(width, height);
                 renderer.resize(width, height);
             }
-            const hikari::render::Camera camera = frame_camera(scene, options, width, height);
+            const hikari::render::Camera camera =
+                frame_camera(scene, settings, options, width, height);
             hikari::gfx::FrameView view = make_view(scene, camera, settings, options, width, height);
             if (options.animate_sun) {
                 static float angle = 0.0f;
                 angle += 0.01f;
                 view.sun_direction = hikari::Vec3(std::cos(angle), -0.8f, std::sin(angle)).normalize();
             }
+            static const auto sky_clock = std::chrono::steady_clock::now();
+            view.time_seconds =
+                options.sky_time +
+                std::chrono::duration<float>(std::chrono::steady_clock::now() - sky_clock)
+                    .count();
             view.show_geometry = g_show_geometry;
             view.show_lighting = g_show_lighting;
             view.show_transparent = g_show_transparent;

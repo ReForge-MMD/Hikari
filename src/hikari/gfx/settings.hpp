@@ -40,6 +40,11 @@ enum class DebugView : std::uint8_t {
     ContactShadow = 10,
     SSGS = 11,
     SkyVisibility = 12,
+    SkyCube = 13,
+    SkyIrradiance = 14,
+    SkyPrefilter = 15,
+    SkyPrefilterRoughness = 16,
+    IblSpecular = 17,
 };
 
 struct SunSettings {
@@ -66,16 +71,26 @@ struct ShadowSettings {
 };
 
 struct SkySettings {
+    bool enabled = false;
+    int quality = 2;
     float time_of_day = 12.0f;
     float turbidity = 1.0f;
     float ozone = 1.0f;
     float sun_radius = 1.0f;
+    float sun_radiance = 10.0f;
+    float mie_anisotropy = 0.76f;
     float cloud_coverage = 0.35f;
+    float cloud_density = 1.0f;
     float cloud_speed = 0.15f;
+    float cloud_turbulence = 1.0f;
     float star_brightness = 1.0f;
+    float milky_way_intensity = 1.0f;
     float moon_intensity = 1.0f;
+    float moon_phase = 0.5f;
     float ambient_intensity = 0.10f;
     Vec3 ambient_color{0.55f, 0.66f, 0.82f};
+    // Upper bound on captured environment refreshes per second.
+    int ibl_update_hz = 10;
 };
 
 struct IblSettings {

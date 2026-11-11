@@ -1,5 +1,6 @@
 #include "hikari/gfx/target_pool.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace hikari::gfx {
@@ -40,6 +41,67 @@ void TargetPool::create_target(ID3D11Device* device, const std::string& name,
                                                         target.uav.GetAddressOf()))) {
         throw std::runtime_error("CreateUnorderedAccessView failed: " + name);
     }
+    targets_[name] = std::move(target);
+}
+
+void TargetPool::create_cubemap(ID3D11Device* device, const std::string& name,
+                                std::uint32_t size, DXGI_FORMAT format,
+                                std::uint32_t mip_levels) {
+    if (device == nullptr || size == 0) {
+        throw std::runtime_error("invalid cubemap description: " + name);
+    }
+    std::uint32_t available = 1;
+    for (std::uint32_t mip_size = size; mip_size > 1; mip_size >>= 1) {
+        ++available;
+    }
+    mip_levels = std::clamp(mip_levels, 1u, available);
+    Target target;
+    target.width = size;
+    target.height = size;
+    target.format = format;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = size;
+    desc.Height = size;
+    desc.MipLevels = mip_levels;
+    desc.ArraySize = 6;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, target.texture.GetAddressOf()))) {
+        throw std::runtime_error("CreateTexture2D cubemap failed: " + name);
+    }
+
+    target.mip_face_rtvs.resize(static_cast<std::size_t>(mip_levels) * 6);
+    for (std::uint32_t mip = 0; mip < mip_levels; ++mip) {
+        for (std::uint32_t face = 0; face < 6; ++face) {
+            D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
+            rtv_desc.Format = format;
+            rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+            rtv_desc.Texture2DArray.MipSlice = mip;
+            rtv_desc.Texture2DArray.FirstArraySlice = face;
+            rtv_desc.Texture2DArray.ArraySize = 1;
+            Microsoft::WRL::ComPtr<ID3D11RenderTargetView>& rtv =
+                target.mip_face_rtvs[static_cast<std::size_t>(mip) * 6 + face];
+            if (FAILED(device->CreateRenderTargetView(target.texture.Get(), &rtv_desc,
+                                                      rtv.GetAddressOf()))) {
+                throw std::runtime_error("CreateRenderTargetView cubemap face failed: " + name);
+            }
+        }
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+    srv_desc.TextureCube.MostDetailedMip = 0;
+    srv_desc.TextureCube.MipLevels = mip_levels;
+    if (FAILED(device->CreateShaderResourceView(target.texture.Get(), &srv_desc,
+                                                target.srv.GetAddressOf()))) {
+        throw std::runtime_error("CreateShaderResourceView cubemap failed: " + name);
+    }
+
     targets_[name] = std::move(target);
 }
 

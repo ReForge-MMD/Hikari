@@ -95,6 +95,7 @@ public:
 
     std::string vs_profile() const;
     std::string ps_profile() const;
+    std::string cs_profile() const;
 
     void dispatch_compute(std::uint32_t x, std::uint32_t y, std::uint32_t z) const;
     void dispatch_compute_indirect(ID3D11Buffer* buffer, std::uint32_t offset) const;

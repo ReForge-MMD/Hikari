@@ -26,6 +26,10 @@ struct ShaderProgram {
     core::ShaderReflectionData pixel_reflection;
 };
 
+struct ComputeProgram {
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute;
+};
+
 // Compiles and caches shader permutations. Sources are embedded at build time;
 // setting HIKARI_GFX_SHADER_DIR to a directory containing gfx_core.hlsl enables
 // hot reload from disk for the lab.
@@ -38,6 +42,12 @@ public:
                              const std::vector<ShaderDefine>& defines = {},
                              const std::vector<D3D11_INPUT_ELEMENT_DESC>* layout = nullptr);
 
+    // Compute entry points are cached separately because they have no vertex
+    // stage and no input layout.
+    const ComputeProgram& get_compute(const std::string& key, const std::string& source_name,
+                                      const std::string& cs_entry,
+                                      const std::vector<ShaderDefine>& defines = {});
+
     void reload();
 
 private:
@@ -45,6 +55,7 @@ private:
 
     core::D3D11Context& context_;
     std::unordered_map<std::string, ShaderProgram> cache_;
+    std::unordered_map<std::string, ComputeProgram> compute_cache_;
 };
 
 const std::unordered_map<std::string, std::string>& embedded_shader_sources();

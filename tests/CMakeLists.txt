@@ -4,9 +4,11 @@ add_executable(hikari_tests
   test_effect.cpp
   test_formats.cpp
   test_gfx_frame_graph.cpp
+  test_gfx_ibl.cpp
   test_gfx_material.cpp
   test_gfx_settings.cpp
   test_gfx_shadow.cpp
+  test_gfx_sky.cpp
   test_math.cpp
   test_physics.cpp
   test_skinning.cpp
@@ -58,4 +60,36 @@ if(TARGET hikari_gfx_lab)
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase3_shadow PROPERTIES TIMEOUT 60)
+
+  # Phase 4 captures go to the build tree so the committed goldens stay inputs.
+  add_test(NAME gfx_phase4_sky
+    COMMAND hikari_gfx_lab
+      --phase 4 --scene synthetic --time-of-day 12 --ibl 1
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase4_sky.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase4_sky.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase4_sky.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase4_sky PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase4_night
+    COMMAND hikari_gfx_lab
+      --phase 4 --scene synthetic --time-of-day 0 --ibl 1
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase4_night.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase4_night.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase4_night.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase4_night PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase4_custom_ibl
+    COMMAND hikari_gfx_lab
+      --phase 4 --scene synthetic --time-of-day 12 --ibl 1
+      --ibl-path ${CMAKE_SOURCE_DIR}/tests/gfx/assets/phase4_custom.hdr
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase4_custom_ibl.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase4_custom_ibl.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase4_custom_ibl.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase4_custom_ibl PROPERTIES TIMEOUT 120)
 endif()

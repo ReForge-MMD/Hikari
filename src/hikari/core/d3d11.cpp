@@ -205,6 +205,17 @@ std::string D3D11Context::ps_profile() const {
     }
 }
 
+std::string D3D11Context::cs_profile() const {
+    switch (feature_level) {
+    case D3D_FEATURE_LEVEL_10_1:
+        return "cs_4_1";
+    case D3D_FEATURE_LEVEL_10_0:
+        return "cs_4_0";
+    default:
+        return "cs_5_0";
+    }
+}
+
 void D3D11Context::dispatch_compute(std::uint32_t x, std::uint32_t y, std::uint32_t z) const {
     if (x == 0 || y == 0 || z == 0) {
         return;

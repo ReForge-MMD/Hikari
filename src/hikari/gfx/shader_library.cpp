@@ -72,6 +72,34 @@ const ShaderProgram& ShaderLibrary::get(const std::string& key, const std::strin
 
 void ShaderLibrary::reload() {
     cache_.clear();
+    compute_cache_.clear();
+}
+
+const ComputeProgram& ShaderLibrary::get_compute(const std::string& key,
+                                                 const std::string& source_name,
+                                                 const std::string& cs_entry,
+                                                 const std::vector<ShaderDefine>& defines) {
+    std::string cache_key = key + "|compute|" + cs_entry;
+    for (const ShaderDefine& define : defines) {
+        cache_key += '|';
+        cache_key += define.name;
+        cache_key += '=';
+        cache_key += define.value;
+    }
+    const auto existing = compute_cache_.find(cache_key);
+    if (existing != compute_cache_.end()) {
+        return existing->second;
+    }
+
+    const std::string source = load_source(source_name);
+    const auto bytecode = core::compile_hlsl(source, cs_entry, context_.cs_profile(), source_name,
+                                             to_compile_defines(defines));
+    ComputeProgram program;
+    if (FAILED(context_.device->CreateComputeShader(bytecode.data(), bytecode.size(), nullptr,
+                                                    program.compute.GetAddressOf()))) {
+        throw std::runtime_error("CreateComputeShader failed for " + cache_key);
+    }
+    return compute_cache_.emplace(std::move(cache_key), std::move(program)).first->second;
 }
 
 std::string ShaderLibrary::load_source(const std::string& source_name) const {

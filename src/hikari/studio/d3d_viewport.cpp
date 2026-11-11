@@ -22,6 +22,7 @@
 #include "hikari/audio/audio_player.hpp"
 #include "hikari/audio/audio_track.hpp"
 #include "hikari/core/log.hpp"
+#include "hikari/gfx/sky.hpp"
 #include "hikari/render/frustum.hpp"
 #include "hikari/studio/viewport_chrome.hpp"
 
@@ -2078,6 +2079,31 @@ bool D3DViewport::capture_image(const QString& path) {
     }
 }
 
+QImage D3DViewport::preview_image(const QSize& size) {
+    if (!initialized_ || context_ == nullptr || size.isEmpty()) {
+        return {};
+    }
+    try {
+        const core::D3D11Context::CaptureResult capture = context_->capture_scene();
+        if (capture.width == 0 || capture.height == 0) {
+            return {};
+        }
+        const QImage frame(capture.rgba.data(), static_cast<int>(capture.width),
+                           static_cast<int>(capture.height),
+                           static_cast<int>(capture.width) * 4, QImage::Format_RGBA8888);
+        return frame.copy().scaled(size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+QString D3DViewport::ibl_error() const {
+    if (gfx_renderer_ == nullptr) {
+        return {};
+    }
+    return QString::fromStdString(gfx_renderer_->ibl_error());
+}
+
 void D3DViewport::prepare_export_frame(float frame, int fps) {
     ModelInstance* active = active_model();
     state_.current_frame = frame;
@@ -3441,6 +3467,12 @@ void D3DViewport::render_scene_native() {
     view.sun_direction =
         Vec3(state_.light_direction[0], state_.light_direction[1], state_.light_direction[2])
             .normalize();
+    // The "Sky coupled" light mode takes the sun position from the atmosphere so
+    // the disk the sky draws and the direct light that illuminates the scene agree.
+    if (state_.graphics.sky.enabled && state_.graphics.sun.light_mode == 2) {
+        view.sun_direction =
+            -gfx::sun_direction_from_time_of_day(state_.graphics.sky.time_of_day);
+    }
     view.sun_color = gfx::sun_color_from_settings(
         state_.graphics, Vec3(state_.light_color[0], state_.light_color[1],
                               state_.light_color[2]));

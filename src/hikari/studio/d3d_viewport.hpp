@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QImage>
 #include <QList>
 #include <QRect>
 #include <QStringList>
@@ -78,6 +79,13 @@ public:
     int culled_subsets() const { return culled_subsets_; }
     void request_physics_reset();
     bool capture_image(const QString& path);
+    // Copy of the last rendered scene, scaled for a dock thumbnail. It reads the
+    // scene target back, so it is meant for an occasional refresh rather than a
+    // per-frame stream.
+    QImage preview_image(const QSize& size);
+    // Reason the last custom environment load failed; empty when it succeeded or
+    // no file is configured.
+    QString ibl_error() const;
     bool render_frames(const QString& directory, int start, int end, int fps);
     bool export_video(const VideoExportOptions& options,
                       const std::function<bool(int, int)>& progress);

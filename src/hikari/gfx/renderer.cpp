@@ -6,10 +6,55 @@
 #include <stdexcept>
 #include <string>
 
+#include "hikari/gfx/ibl.hpp"
+#include "hikari/gfx/sky.hpp"
+#include "hikari/gfx/sky_assets.hpp"
+
 namespace hikari::gfx {
 namespace {
 
 const char* kShaderSource = "gfx_core.hlsl";
+
+// Nine real SH coefficients with three floats each.
+constexpr std::uint32_t kSkyShCoefficientCount = 27;
+// Must match SH_GROUPS and SH_THREADS in SkyShProjectCS/SkyShReduceCS.
+constexpr std::uint32_t kSkyShGroupCount = 32;
+constexpr std::uint32_t kSkyShPartialCount = kSkyShGroupCount * kSkyShCoefficientCount;
+
+// Creates a structured float buffer with both a shader resource view and an
+// unordered access view, the shape every compute-written buffer in the sky path
+// needs.
+void create_float_structured_buffer(ID3D11Device* device, std::uint32_t element_count,
+                                    const char* name,
+                                    Microsoft::WRL::ComPtr<ID3D11Buffer>& buffer,
+                                    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>& uav,
+                                    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& srv) {
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = sizeof(float) * element_count;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    desc.StructureByteStride = sizeof(float);
+    if (FAILED(device->CreateBuffer(&desc, nullptr, buffer.GetAddressOf()))) {
+        throw std::runtime_error(std::string("CreateBuffer failed: ") + name);
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+    uav_desc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.NumElements = element_count;
+    if (FAILED(device->CreateUnorderedAccessView(buffer.Get(), &uav_desc, uav.GetAddressOf()))) {
+        throw std::runtime_error(std::string("CreateUnorderedAccessView failed: ") + name);
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    srv_desc.Buffer.NumElements = element_count;
+    if (FAILED(device->CreateShaderResourceView(buffer.Get(), &srv_desc, srv.GetAddressOf()))) {
+        throw std::runtime_error(std::string("CreateShaderResourceView failed: ") + name);
+    }
+}
 
 std::array<float, 4> to_array4(const Vec3& value, float w) {
     return {value.x, value.y, value.z, w};
@@ -17,6 +62,72 @@ std::array<float, 4> to_array4(const Vec3& value, float w) {
 
 std::array<std::array<float, 4>, 4> to_array(const Mat4& matrix) {
     return matrix.m;
+}
+
+// Face bases in the Direct3D cubemap order: +X, -X, +Y, -Y, +Z, -Z. The rows of
+// the reconstructed InverseView are right, up, and forward, so the mapping from
+// a face texel back to a direction matches TextureCube sampling exactly. The
+// shared table lives in sky.cpp because the CPU cubemap conversion needs it too.
+std::array<std::array<float, 4>, 4> face_inverse_view(std::uint32_t face) {
+    const CubeFaceBasis& basis = cube_face_basis(face);
+    std::array<std::array<float, 4>, 4> inverse_view{};
+    inverse_view[0] = {basis.right.x, basis.right.y, basis.right.z, 0.0f};
+    inverse_view[1] = {basis.up.x, basis.up.y, basis.up.z, 0.0f};
+    inverse_view[2] = {basis.forward.x, basis.forward.y, basis.forward.z, 0.0f};
+    inverse_view[3] = {0.0f, 0.0f, 0.0f, 1.0f};
+    return inverse_view;
+}
+
+// Half float conversion for the 16 bit float capture target, matching the
+// rounding of a hardware store: round to nearest even on the truncated mantissa.
+std::uint16_t float_to_half(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t sign = (bits >> 16) & 0x8000u;
+    const std::uint32_t exponent = (bits >> 23) & 0xffu;
+    std::uint32_t mantissa = bits & 0x7fffffu;
+    if (exponent == 0xffu) {
+        return static_cast<std::uint16_t>(sign | 0x7c00u | (mantissa != 0 ? 0x200u : 0u));
+    }
+    const int unbiased = static_cast<int>(exponent) - 127 + 15;
+    if (unbiased >= 31) {
+        return static_cast<std::uint16_t>(sign | 0x7c00u);
+    }
+    if (unbiased <= 0) {
+        if (unbiased < -10) {
+            return static_cast<std::uint16_t>(sign);
+        }
+        mantissa |= 0x800000u;
+        const int shift = 14 - unbiased;
+        const std::uint32_t rounded = (mantissa + (1u << (shift - 1))) >> shift;
+        return static_cast<std::uint16_t>(sign | rounded);
+    }
+    mantissa += 0x1000u;
+    if ((mantissa & 0x800000u) != 0) {
+        mantissa = 0;
+        if (unbiased + 1 >= 31) {
+            return static_cast<std::uint16_t>(sign | 0x7c00u);
+        }
+        return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(unbiased + 1) << 10));
+    }
+    return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(unbiased) << 10) |
+                                      (mantissa >> 13));
+}
+
+// The capture only needs to be redone when a sky input moves by more than the
+// eye can see in a reflection. Relative tolerance keeps the test scale free.
+bool sky_value_changed(float a, float b) {
+    const float scale = std::max(1.0f, std::max(std::abs(a), std::abs(b)));
+    return std::abs(a - b) > 1.0e-3f * scale;
+}
+
+bool sky_values_changed(const std::array<float, 4>& a, const std::array<float, 4>& b) {
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (sky_value_changed(a[i], b[i])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -120,6 +231,26 @@ void Renderer::create_buffers() {
                                              shadow_draw_buffer_.GetAddressOf()))) {
         throw std::runtime_error("CreateBuffer shadow draw constants failed");
     }
+
+    // SkyParams buffer (b4)
+    D3D11_BUFFER_DESC sky_desc{};
+    sky_desc.ByteWidth = sizeof(SkyConstants);
+    sky_desc.Usage = D3D11_USAGE_DYNAMIC;
+    sky_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    sky_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(context_.device->CreateBuffer(&sky_desc, nullptr, sky_buffer_.GetAddressOf()))) {
+        throw std::runtime_error("CreateBuffer sky constants failed");
+    }
+
+    // IblParams buffer (b5)
+    D3D11_BUFFER_DESC ibl_desc{};
+    ibl_desc.ByteWidth = sizeof(IblConstants);
+    ibl_desc.Usage = D3D11_USAGE_DYNAMIC;
+    ibl_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ibl_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(context_.device->CreateBuffer(&ibl_desc, nullptr, ibl_buffer_.GetAddressOf()))) {
+        throw std::runtime_error("CreateBuffer IBL constants failed");
+    }
 }
 
 void Renderer::build_grid() {
@@ -169,6 +300,7 @@ void Renderer::resize(std::uint32_t width, std::uint32_t height) {
     }
     width_ = width;
     height_ = height;
+    sky_capture_size_ = 0;
     targets_.clear();
     ensure_targets(width, height);
 }
@@ -198,6 +330,9 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
                             DXGI_FORMAT_R8G8B8A8_UNORM);
     targets_.create_target(context_.device.Get(), "ShadowMaskBlur", width, height,
                             DXGI_FORMAT_R8G8B8A8_UNORM);
+    // Sun transmittance by altitude: one texel per atmosphere sample step.
+    targets_.create_target(context_.device.Get(), "SunTransmittance", 64, 1,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT);
 }
 
 void Renderer::ensure_shadow_map(int quality) {
@@ -224,13 +359,34 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     resize(view.width, view.height);
     ensure_targets(width_, height_);
     ensure_shadow_map(settings.shadows.quality);
+    ensure_sky_capture(settings);
+    ensure_ibl_environment(settings);
     update_frame_constants(settings, view, !view.show_tonemap);
     update_shadow_constants(settings, view);
+    update_sky_constants(settings, view);
+    update_ibl_constants(settings);
     draw_shadow_cascades(settings, view);
     draw_sky_visibility(settings, view);
+    draw_sun_transmittance(settings, view);
+    // The capture rewrites the frame constants for every cube face. Capture,
+    // prefilter, and SH are one unit, so the throttle skips all three together
+    // and the lighting pass keeps the resources of the last refresh.
+    if (should_refresh_sky_environment(settings, view)) {
+        if (ibl_custom_active_) {
+            // A file-backed environment replaces the capture: upload its six
+            // faces into the same target, then reuse prefilter and SH as is.
+            upload_ibl_environment();
+        } else {
+            draw_sky_capture(settings, view);
+        }
+        draw_sky_prefilter(settings, view);
+        draw_sky_sh(settings);
+    }
+    update_frame_constants(settings, view, !view.show_tonemap);
     draw_geometry(view);
     draw_shadow_mask(settings, view);
     draw_shadow_blur(settings, view);
+    draw_sky_background(settings, view);
     draw_lighting(settings, view);
     draw_transparent(view);
     draw_tonemap(settings, view, final_rtv, !view.show_tonemap);
@@ -238,14 +394,23 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
 
     ID3D11ShaderResourceView* null_views[8] = {};
     context_.context->PSSetShaderResources(0, 8, null_views);
+    // Slots 8..11 hold the material texture and the shadow/sky helper targets;
+    // they must be released before those targets are rebound as render targets.
+    context_.context->PSSetShaderResources(8, 4, null_views);
+    context_.context->PSSetShaderResources(12, 6, null_views);
     context_.context->VSSetShaderResources(0, 1, null_views);
     ID3D11ShaderResourceView* null_diffuse = nullptr;
-    context_.context->PSSetShaderResources(8, 1, &null_diffuse);
     context_.context->VSSetShaderResources(8, 1, &null_diffuse);
 }
 
 void Renderer::update_frame_constants(const GraphicsSettings& settings, const FrameView& view,
                                       bool linear_tonemap) {
+    upload_frame_constants(build_frame_constants(settings, view, linear_tonemap));
+}
+
+FrameConstants Renderer::build_frame_constants(const GraphicsSettings& settings,
+                                               const FrameView& view,
+                                               bool linear_tonemap) const {
     (void)settings;
     (void)linear_tonemap;
     FrameConstants constants;
@@ -257,7 +422,7 @@ void Renderer::update_frame_constants(const GraphicsSettings& settings, const Fr
     constants.sun_direction = to_array4(view.sun_direction.normalize(), 0.0f);
     constants.sun_color = to_array4(view.sun_color, 0.0f);
     constants.ambient_color = to_array4(view.ambient_color, 0.0f);
-    constants.params0 = {view.near_z, view.far_z, settings.post.exposure, 0.0f};
+    constants.params0 = {view.near_z, view.far_z, settings.post.exposure, view.time_seconds};
     constants.params1 = {view.orthographic ? 1.0f : 0.0f, static_cast<float>(width_),
                          static_cast<float>(height_), 0.0f};
     const float ortho_width =
@@ -267,7 +432,10 @@ void Renderer::update_frame_constants(const GraphicsSettings& settings, const Fr
     constants.params2 = {view.projection.m[0][0], view.projection.m[1][1], ortho_width,
                          ortho_height};
     constants.background_color = to_array4(view.background_color, 1.0f);
+    return constants;
+}
 
+void Renderer::upload_frame_constants(const FrameConstants& constants) {
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context_.context->Map(frame_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
                                      &mapped))) {
@@ -306,6 +474,9 @@ std::vector<ShaderDefine> Renderer::lighting_defines(const GraphicsSettings& set
     defines.push_back({"SUN_SPECULAR_DISK_ENABLE",
                        settings.sun.specular_disk ? "1" : "0"});
     defines.push_back({"SUN_LIMB_DARKENING", settings.sun.limb_darkening ? "1" : "0"});
+    defines.push_back({"SKY_ENABLE", settings.sky.enabled ? "1" : "0"});
+    defines.push_back({"SUN_SKY_COUPLING", settings.sun.sky_coupling ? "1" : "0"});
+    defines.push_back({"SUN_CORONA_ENABLE", settings.sun.corona ? "1" : "0"});
     defines.push_back({"SUN_ANGULAR_RADIUS", std::to_string(settings.sun.angular_radius)});
     defines.push_back({"DIFFUSE_BRDF_TYPE",
                        std::to_string(static_cast<int>(settings.brdf.diffuse_type))});
@@ -316,6 +487,10 @@ std::vector<ShaderDefine> Renderer::lighting_defines(const GraphicsSettings& set
                                           ? 0
                                           : static_cast<int>(settings.post.tonemap))});
     defines.push_back({"DEBUG_VIEW", std::to_string(static_cast<int>(settings.debug.view))});
+    defines.push_back({"IBL_QUALITY", std::to_string(std::clamp(settings.ibl.quality, 0, 2))});
+    // Selects the custom environment background, which is a different pixel
+    // shader path rather than a parameter, so it belongs in the permutation.
+    defines.push_back({"SKY_SOURCE_CUSTOM", ibl_custom_active_ ? "1" : "0"});
     return defines;
 }
 
@@ -404,6 +579,386 @@ void Renderer::draw_item(const DrawItem& item, bool transparent) {
     context_.context->DrawIndexed(subset.index_count, subset.index_start, 0);
 }
 
+void Renderer::ensure_sky_capture(const GraphicsSettings& settings) {
+    const std::uint32_t size = sky_capture_resolution(settings.ibl.quality);
+    if (size == 0) {
+        return;
+    }
+    if (targets_.get("SkyCapture") != nullptr && sky_capture_size_ == size) {
+        return;
+    }
+    targets_.create_cubemap(context_.device.Get(), "SkyCapture", size,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT);
+    targets_.create_cubemap(context_.device.Get(), "SkyPrefilter", size,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, sky_prefilter_mip_count(size));
+    sky_capture_size_ = size;
+    // A fresh chain has no content yet, so the next frame must not be throttled.
+    sky_capture_valid_ = false;
+}
+
+// Loads ibl.custom_path when it changes, or when the capture size changes so an
+// already decoded source can be converted to the new face size. Failures keep
+// the previous state usable and are reported through ibl_error().
+void Renderer::ensure_ibl_environment(const GraphicsSettings& settings) {
+    const std::uint32_t size = sky_capture_resolution(settings.ibl.quality);
+    if (settings.ibl.custom_path == ibl_source_path_ && size == ibl_target_size_) {
+        return;
+    }
+    ibl_source_path_ = settings.ibl.custom_path;
+    ibl_target_size_ = size;
+    ibl_error_.clear();
+    ibl_custom_active_ = false;
+    ibl_cubemap_ = {};
+    // The capture no longer describes the requested source, whatever it was.
+    sky_capture_valid_ = false;
+    if (ibl_source_path_.empty()) {
+        return;
+    }
+    if (size == 0) {
+        ibl_error_ = "IBL quality 0 keeps image based lighting off";
+        return;
+    }
+    IblLoadResult loaded = load_ibl_image(ibl_source_path_);
+    if (!loaded.ok()) {
+        ibl_error_ = std::move(loaded.error);
+        return;
+    }
+    IblLoadResult converted = ibl_image_to_cubemap(loaded.image, size);
+    if (!converted.ok()) {
+        ibl_error_ = std::move(converted.error);
+        return;
+    }
+    ibl_cubemap_ = std::move(converted.image);
+    ibl_custom_active_ = true;
+}
+
+// Copies the decoded cubemap into the R16G16B16A16_FLOAT capture target. Only
+// mip 0 is written: the prefilter chain derives every other level from it.
+void Renderer::upload_ibl_environment() {
+    const Target* cube = targets_.get("SkyCapture");
+    if (cube == nullptr || !ibl_cubemap_.cubemap) {
+        return;
+    }
+    const std::uint32_t mip_count = static_cast<std::uint32_t>(cube->mip_face_rtvs.size() / 6);
+    const std::uint32_t size = ibl_cubemap_.width;
+    if (mip_count == 0 || size == 0 || cube->width != size) {
+        return;
+    }
+    std::vector<std::uint16_t> pixels(static_cast<std::size_t>(size) * size * 4);
+    for (std::uint32_t face = 0; face < 6; ++face) {
+        const float* source = ibl_cubemap_.face_data(face);
+        if (source == nullptr) {
+            return;
+        }
+        for (std::size_t texel = 0; texel < static_cast<std::size_t>(size) * size; ++texel) {
+            for (std::uint32_t channel = 0; channel < 4; ++channel) {
+                pixels[texel * 4 + channel] = float_to_half(source[texel * 4 + channel]);
+            }
+        }
+        const UINT subresource = D3D11CalcSubresource(0, face, mip_count);
+        context_.context->UpdateSubresource(cube->texture.Get(), subresource, nullptr,
+                                            pixels.data(), size * 8, 0);
+    }
+}
+
+// Decides whether the capture, prefilter, and SH refresh run on this frame. A
+// changed sky input requests a refresh, the update rate caps how often it may
+// happen, and a fresh or resized chain bypasses the cap.
+bool Renderer::should_refresh_sky_environment(const GraphicsSettings& settings,
+                                              const FrameView& view) {
+    if (sky_capture_resolution(settings.ibl.quality) == 0) {
+        return false;
+    }
+    // A file-backed environment does not depend on the analytic sky, so it stays
+    // available when the procedural sky is switched off.
+    if (ibl_custom_active_) {
+        if (!sky_capture_valid_) {
+            sky_capture_valid_ = true;
+            ++sky_update_count_;
+            return true;
+        }
+        return false;
+    }
+    if (!settings.sky.enabled) {
+        return false;
+    }
+    const SkyConstants constants = build_sky_constants(settings, view);
+    bool changed = !sky_capture_valid_;
+    if (!changed && (sky_values_changed(constants.sky_params0, sky_capture_state_.sky_params0) ||
+                     sky_values_changed(constants.sky_params1, sky_capture_state_.sky_params1) ||
+                     sky_values_changed(constants.sky_params2, sky_capture_state_.sky_params2) ||
+                     sky_values_changed(constants.sky_params3, sky_capture_state_.sky_params3))) {
+        changed = true;
+    }
+    // Roughly a tenth of a degree of sun movement is the smallest change that
+    // survives the 128 or 256 pixel capture, so anything below it only costs a
+    // refresh without changing the result.
+    constexpr float kMinimumSunDot = 0.9999985f;
+    if (!changed && view.sun_direction.dot(sky_capture_sun_) < kMinimumSunDot) {
+        changed = true;
+    }
+    if (!changed) {
+        return false;
+    }
+
+    const float rate = static_cast<float>(std::clamp(settings.sky.ibl_update_hz, 1, 60));
+    const auto interval =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<float>(1.0f / rate));
+    const auto now = std::chrono::steady_clock::now();
+    if (sky_capture_valid_ && now - sky_capture_time_ < interval) {
+        return false;
+    }
+
+    sky_capture_state_ = constants;
+    sky_capture_sun_ = view.sun_direction;
+    sky_capture_valid_ = true;
+    sky_capture_time_ = now;
+    ++sky_update_count_;
+    return true;
+}
+
+void Renderer::draw_sky_capture(const GraphicsSettings& settings, const FrameView& view) {
+    if (!settings.sky.enabled) {
+        return;
+    }
+    const Target* cube = targets_.get("SkyCapture");
+    const Target* sun_lut = targets_.get("SunTransmittance");
+    if (cube == nullptr || cube->mip_face_rtvs.size() != 6 || sun_lut == nullptr) {
+        return;
+    }
+    ensure_sky_textures();
+
+    ID3D11ShaderResourceView* lut_srv = sun_lut->srv.Get();
+    context_.context->PSSetShaderResources(11, 1, &lut_srv);
+    ID3D11ShaderResourceView* sky_textures[3] = {cloud_texture_.srv.Get(),
+                                                 milky_way_texture_.srv.Get(),
+                                                 moon_texture_.srv.Get()};
+    context_.context->PSSetShaderResources(12, 3, sky_textures);
+
+    const auto defines = lighting_defines(settings, false);
+    const ShaderProgram& program = shaders_.get("sky_capture", kShaderSource, "FullscreenVS",
+                                                "SkyCapturePS", defines, nullptr);
+
+    FrameConstants constants = build_frame_constants(settings, view, false);
+    const Mat4 face_projection =
+        perspective_lh(3.14159265358979323846f * 0.5f, 1.0f, 0.1f, 10.0f);
+    constants.projection = to_array(face_projection);
+    constants.params1 = {0.0f, static_cast<float>(cube->width),
+                         static_cast<float>(cube->height), 0.0f};
+    constants.params2 = {face_projection.m[0][0], face_projection.m[1][1], 0.0f, 0.0f};
+
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<float>(cube->width);
+    vp.Height = static_cast<float>(cube->height);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    context_.context->RSSetViewports(1, &vp);
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+    context_.context->RSSetState(
+        context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+    bind_sky_samplers();
+    bind_frame_constants();
+    bind_sky_constants();
+
+    for (std::size_t face = 0; face < 6; ++face) {
+        constants.inverse_view = face_inverse_view(static_cast<std::uint32_t>(face));
+        upload_frame_constants(constants);
+
+        ID3D11RenderTargetView* rtv = cube->mip_face_rtvs[face].Get();
+        context_.context->OMSetRenderTargets(1, &rtv, nullptr);
+        draw_fullscreen(program);
+    }
+
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    context_.context->OMSetRenderTargets(1, &null_rtv, nullptr);
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
+}
+
+// GGX prefilter of the captured sky into the mip chain of SkyPrefilter, one
+// roughness step per mip: 0 at mip 0 (a copy), 1 at the last mip. The split sum
+// then picks a level by roughness instead of convolving per pixel.
+void Renderer::draw_sky_prefilter(const GraphicsSettings& settings, const FrameView& view) {
+    if (sky_capture_resolution(settings.ibl.quality) == 0 ||
+        (!settings.sky.enabled && !ibl_custom_active_)) {
+        return;
+    }
+    const Target* source = targets_.get("SkyCapture");
+    const Target* prefilter = targets_.get("SkyPrefilter");
+    if (source == nullptr || prefilter == nullptr || prefilter->mip_face_rtvs.empty()) {
+        return;
+    }
+    const std::uint32_t mip_count =
+        static_cast<std::uint32_t>(prefilter->mip_face_rtvs.size() / 6);
+    if (mip_count == 0) {
+        return;
+    }
+
+    const auto defines = lighting_defines(settings, false);
+    const ShaderProgram& program = shaders_.get("sky_prefilter", kShaderSource, "FullscreenVS",
+                                                "SkyPrefilterPS", defines, nullptr);
+
+    FrameConstants frame = build_frame_constants(settings, view, false);
+    const Mat4 face_projection =
+        perspective_lh(3.14159265358979323846f * 0.5f, 1.0f, 0.1f, 10.0f);
+    frame.projection = to_array(face_projection);
+    frame.params1 = {0.0f, static_cast<float>(source->width),
+                     static_cast<float>(source->height), 0.0f};
+    frame.params2 = {face_projection.m[0][0], face_projection.m[1][1], 0.0f, 0.0f};
+
+    SkyConstants sky = build_sky_constants(settings, view);
+
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+    context_.context->RSSetState(
+        context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+    bind_sky_samplers();
+    bind_frame_constants();
+    bind_sky_constants();
+    ID3D11ShaderResourceView* cube_srv = source->srv.Get();
+    context_.context->PSSetShaderResources(15, 1, &cube_srv);
+
+    for (std::uint32_t mip = 0; mip < mip_count; ++mip) {
+        const float roughness =
+            mip_count > 1 ? static_cast<float>(mip) / static_cast<float>(mip_count - 1) : 0.0f;
+        // A mirror lobe needs one tap; wider lobes need more samples to hide the
+        // blotches that a sparse high dynamic range sky (stars) leaves behind.
+        const float samples = mip == 0 ? 1.0f : 16.0f * static_cast<float>(mip);
+        sky.sky_params4 = {roughness, samples, static_cast<float>(mip_count), 0.0f};
+        upload_sky_constants(sky);
+
+        D3D11_VIEWPORT vp{};
+        vp.Width = static_cast<float>(std::max(prefilter->width >> mip, 1u));
+        vp.Height = vp.Width;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        context_.context->RSSetViewports(1, &vp);
+
+        for (std::uint32_t face = 0; face < 6; ++face) {
+            frame.inverse_view = face_inverse_view(face);
+            upload_frame_constants(frame);
+
+            ID3D11RenderTargetView* rtv =
+                prefilter->mip_face_rtvs[static_cast<std::size_t>(mip) * 6 + face].Get();
+            context_.context->OMSetRenderTargets(1, &rtv, nullptr);
+            draw_fullscreen(program);
+        }
+    }
+
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    context_.context->OMSetRenderTargets(1, &null_rtv, nullptr);
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(15, 1, &null_srv);
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
+}
+
+void Renderer::ensure_sky_sh() {
+    if (sky_sh_buffer_ != nullptr) {
+        return;
+    }
+    create_float_structured_buffer(context_.device.Get(), kSkyShCoefficientCount, "sky SH",
+                                   sky_sh_buffer_, sky_sh_uav_, sky_sh_srv_);
+    create_float_structured_buffer(context_.device.Get(), kSkyShPartialCount, "sky SH partial",
+                                   sky_sh_partial_buffer_, sky_sh_partial_uav_,
+                                   sky_sh_partial_srv_);
+}
+
+void Renderer::draw_sky_sh(const GraphicsSettings& settings) {
+    if (sky_capture_resolution(settings.ibl.quality) == 0 ||
+        (!settings.sky.enabled && !ibl_custom_active_)) {
+        return;
+    }
+    const Target* cube = targets_.get("SkyCapture");
+    if (cube == nullptr) {
+        return;
+    }
+    ensure_sky_sh();
+
+    auto* sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
+    context_.context->CSSetSamplers(3, 1, &sampler);
+    ID3D11ShaderResourceView* cube_srv = cube->srv.Get();
+    context_.context->CSSetShaderResources(15, 1, &cube_srv);
+
+    // First pass: one partial sum per group over a slice of the Fibonacci sphere.
+    const ComputeProgram& project =
+        shaders_.get_compute("sky_sh_project", kShaderSource, "SkyShProjectCS");
+    ID3D11UnorderedAccessView* partial = sky_sh_partial_uav_.Get();
+    context_.cs_set_uavs(0, {partial});
+    context_.context->CSSetShader(project.compute.Get(), nullptr, 0);
+    context_.context->Dispatch(kSkyShGroupCount, 1, 1);
+    context_.context->CSSetShader(nullptr, nullptr, 0);
+
+    // The partial buffer becomes an input, so it must leave the UAV slot first.
+    context_.cs_set_uavs(0, {nullptr});
+    ID3D11ShaderResourceView* partial_srv = sky_sh_partial_srv_.Get();
+    context_.context->CSSetShaderResources(0, 1, &partial_srv);
+    ID3D11UnorderedAccessView* output = sky_sh_uav_.Get();
+    context_.cs_set_uavs(1, {output});
+
+    // Second pass: sum the partials in one group and write the final coefficients.
+    const ComputeProgram& reduce =
+        shaders_.get_compute("sky_sh_reduce", kShaderSource, "SkyShReduceCS");
+    context_.context->CSSetShader(reduce.compute.Get(), nullptr, 0);
+    context_.context->Dispatch(1, 1, 1);
+    context_.context->CSSetShader(nullptr, nullptr, 0);
+
+    context_.cs_set_uavs(1, {nullptr});
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->CSSetShaderResources(0, 1, &null_srv);
+    context_.context->CSSetShaderResources(15, 1, &null_srv);
+}
+
+void Renderer::draw_sky_background(const GraphicsSettings& settings, const FrameView& view) {
+    const Target* hdr = targets_.get("Hdr");
+    if (hdr == nullptr) {
+        throw std::runtime_error("native renderer HDR target is missing");
+    }
+    ID3D11RenderTargetView* views[] = {hdr->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    context_.context->ClearRenderTargetView(hdr->rtv.Get(),
+                                            view.background_color.to_array().data());
+    if (!settings.sky.enabled) {
+        return;
+    }
+
+    const auto defines = lighting_defines(settings, false);
+    const ShaderProgram& program =
+        shaders_.get("sky", kShaderSource, "FullscreenVS", "SkyPS", defines, nullptr);
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
+
+    const Target* sun_lut = targets_.get("SunTransmittance");
+    if (sun_lut != nullptr) {
+        ID3D11ShaderResourceView* lut_srv = sun_lut->srv.Get();
+        context_.context->PSSetShaderResources(11, 1, &lut_srv);
+    }
+    ensure_sky_textures();
+    const Target* cube = targets_.get("SkyCapture");
+    ID3D11ShaderResourceView* sky_textures[4] = {
+        cloud_texture_.srv.Get(), milky_way_texture_.srv.Get(), moon_texture_.srv.Get(),
+        cube != nullptr ? cube->srv.Get() : nullptr};
+    context_.context->PSSetShaderResources(12, 4, sky_textures);
+    const Target* prefilter = targets_.get("SkyPrefilter");
+    ID3D11ShaderResourceView* prefilter_srv =
+        prefilter != nullptr ? prefilter->srv.Get() : nullptr;
+    context_.context->PSSetShaderResources(17, 1, &prefilter_srv);
+
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+    context_.context->RSSetState(
+        context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+    bind_sky_samplers();
+    bind_frame_constants();
+    bind_sky_constants();
+    draw_fullscreen(program);
+}
+
 void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& view) {
     (void)view;
     const Target* hdr = targets_.get("Hdr");
@@ -413,7 +968,6 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
     }
     ID3D11RenderTargetView* views[] = {hdr->rtv.Get()};
     context_.context->OMSetRenderTargets(1, views, nullptr);
-    context_.context->ClearRenderTargetView(hdr->rtv.Get(), view.background_color.to_array().data());
     if (!view.show_lighting) {
         return;
     }
@@ -451,12 +1005,37 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
             context_.context->PSSetShaderResources(9, 1, &sky_srv);
         }
     }
+    if (settings.sky.enabled) {
+        const Target* sun_lut = targets_.get("SunTransmittance");
+        if (sun_lut != nullptr) {
+            ID3D11ShaderResourceView* lut_srv = sun_lut->srv.Get();
+            context_.context->PSSetShaderResources(11, 1, &lut_srv);
+        }
+        ensure_sky_textures();
+        ID3D11ShaderResourceView* sky_textures[3] = {cloud_texture_.srv.Get(),
+                                                     milky_way_texture_.srv.Get(),
+                                                     moon_texture_.srv.Get()};
+        context_.context->PSSetShaderResources(12, 3, sky_textures);
+        if (sky_sh_srv_ != nullptr && sky_capture_resolution(settings.ibl.quality) > 0) {
+            ID3D11ShaderResourceView* sh_srv = sky_sh_srv_.Get();
+            context_.context->PSSetShaderResources(16, 1, &sh_srv);
+        }
+        const Target* prefiltered = targets_.get("SkyPrefilter");
+        if (prefiltered != nullptr && settings.ibl.quality > 0) {
+            ID3D11ShaderResourceView* prefilter_srv = prefiltered->srv.Get();
+            context_.context->PSSetShaderResources(17, 1, &prefilter_srv);
+        }
+    }
     bind_shadow_constants();
+    bind_sky_constants();
+    bind_ibl_constants();
 
     auto* sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
     context_.context->PSSetSamplers(0, 1, &sampler);
     auto* point_sampler = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
     context_.context->PSSetSamplers(1, 1, &point_sampler);
+    auto* wrap_sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
+    context_.context->PSSetSamplers(3, 1, &wrap_sampler);
     context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
                                       nullptr, 0xFFFFFFFF);
     context_.context->OMSetDepthStencilState(
@@ -872,6 +1451,112 @@ void Renderer::bind_shadow_constants() {
     context_.context->PSSetConstantBuffers(2, 1, buffers);
 }
 
+SkyConstants Renderer::build_sky_constants(const GraphicsSettings& settings,
+                                           const FrameView& view) const {
+    constexpr float kObserverAltitudeM = 1000.0f;
+    constexpr float kMinimumSunAngle = 5.0e-4f;
+    constexpr float kMaximumSunAngle = 0.35f;
+    SkyConstants constants;
+    const float angular_radius =
+        settings.sun.angular_radius * std::max(settings.sky.sun_radius, 0.0f);
+    constants.sky_params0 = {settings.sky.turbidity, settings.sky.ozone,
+                             settings.sky.sun_radiance,
+                             std::clamp(angular_radius, kMinimumSunAngle, kMaximumSunAngle)};
+    constants.sky_params1 = {
+        static_cast<float>(atmosphere_step_count(settings.sky.quality)),
+        settings.sky.mie_anisotropy,
+        kObserverAltitudeM + std::max(view.camera_position.y, 0.0f),
+        std::max(view.time_seconds, 0.0f)};
+    constants.sky_params2 = {settings.sky.cloud_coverage, settings.sky.cloud_density,
+                             settings.sky.cloud_speed, settings.sky.cloud_turbulence};
+    constants.sky_params3 = {settings.sky.moon_phase, settings.sky.moon_intensity,
+                             settings.sky.star_brightness,
+                             settings.sky.milky_way_intensity};
+    return constants;
+}
+
+void Renderer::upload_sky_constants(const SkyConstants& constants) {
+    if (sky_buffer_ == nullptr) {
+        return;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_.context->Map(sky_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                     &mapped))) {
+        throw std::runtime_error("Map sky constants failed");
+    }
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context_.context->Unmap(sky_buffer_.Get(), 0);
+}
+
+void Renderer::update_sky_constants(const GraphicsSettings& settings, const FrameView& view) {
+    upload_sky_constants(build_sky_constants(settings, view));
+}
+
+void Renderer::bind_sky_constants() {
+    if (sky_buffer_ == nullptr) {
+        return;
+    }
+    ID3D11Buffer* buffers[] = {sky_buffer_.Get()};
+    context_.context->PSSetConstantBuffers(4, 1, buffers);
+}
+
+void Renderer::update_ibl_constants(const GraphicsSettings& settings) {
+    if (ibl_buffer_ == nullptr) {
+        return;
+    }
+    constexpr float kDegreesToRadians = 3.14159265358979323846f / 180.0f;
+    const std::uint32_t size = sky_capture_resolution(settings.ibl.quality);
+    const float last_mip =
+        size > 0 ? static_cast<float>(sky_prefilter_mip_count(size)) - 1.0f : 0.0f;
+    IblConstants constants;
+    constants.ibl_params0 = {settings.ibl.intensity, last_mip,
+                             settings.ibl.rotation_degrees * kDegreesToRadians,
+                             settings.sky.ambient_intensity};
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_.context->Map(ibl_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                     &mapped))) {
+        throw std::runtime_error("Map IBL constants failed");
+    }
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context_.context->Unmap(ibl_buffer_.Get(), 0);
+}
+
+void Renderer::bind_ibl_constants() {
+    if (ibl_buffer_ == nullptr) {
+        return;
+    }
+    ID3D11Buffer* buffers[] = {ibl_buffer_.Get()};
+    context_.context->PSSetConstantBuffers(5, 1, buffers);
+}
+
+// Every sky entry point samples the transmittance LUT through PointSampler and
+// the procedural layers through SkySampler, so both must be bound explicitly
+// even when a previous pass happened to leave the same states behind.
+void Renderer::bind_sky_samplers() {
+    auto* linear_clamp = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    context_.context->PSSetSamplers(0, 1, &linear_clamp);
+    auto* point_clamp = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    context_.context->PSSetSamplers(1, 1, &point_clamp);
+    auto* linear_wrap = context_.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
+    context_.context->PSSetSamplers(3, 1, &linear_wrap);
+}
+
+void Renderer::ensure_sky_textures() {
+    if (cloud_texture_.srv != nullptr) {
+        return;
+    }
+    const SkyImage& clouds = cloud_noise_image();
+    cloud_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
+        context_, clouds.width, clouds.height, clouds.rgba.data());
+    const SkyImage& milky_way = milky_way_image();
+    milky_way_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
+        context_, milky_way.width, milky_way.height, milky_way.rgba.data());
+    const SkyImage& moon = moon_albedo_image();
+    moon_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
+        context_, moon.width, moon.height, moon.rgba.data());
+}
+
 void Renderer::draw_shadow_cascades(const GraphicsSettings& settings, const FrameView& view) {
     if (settings.shadows.quality == 0 || shadow_draw_buffer_ == nullptr) {
         return;
@@ -1156,6 +1841,46 @@ void Renderer::draw_sky_visibility(const GraphicsSettings& settings, const Frame
     ID3D11RenderTargetView* null_rtv = nullptr;
     context_.context->OMSetRenderTargets(1, &null_rtv, nullptr);
     (void)view;
+}
+
+void Renderer::draw_sun_transmittance(const GraphicsSettings& settings, const FrameView& view) {
+    (void)view;
+    if (!settings.sky.enabled) {
+        return;
+    }
+    const Target* target = targets_.get("SunTransmittance");
+    if (target == nullptr) {
+        return;
+    }
+
+    // The LUT is sampled by the lighting pass, so render() releases the SRV
+    // slots at the end of every frame.
+    ID3D11RenderTargetView* views[] = {target->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    D3D11_VIEWPORT vp{};
+    vp.Width = static_cast<float>(target->width);
+    vp.Height = static_cast<float>(target->height);
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    context_.context->RSSetViewports(1, &vp);
+
+    const ShaderProgram& program = shaders_.get(
+        "sun_transmittance", kShaderSource, "FullscreenVS", "SunTransmittancePS", {}, nullptr);
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+    context_.context->RSSetState(
+        context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+    bind_frame_constants();
+    bind_sky_constants();
+    draw_fullscreen(program);
+
+    // The LUT is sampled by the sky capture and the lighting pass later in the
+    // frame; release the render target binding so those reads are well defined.
+    ID3D11RenderTargetView* null_rtv = nullptr;
+    context_.context->OMSetRenderTargets(1, &null_rtv, nullptr);
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
 }
 
 void Renderer::draw_shadow_mask(const GraphicsSettings& settings, const FrameView& view) {

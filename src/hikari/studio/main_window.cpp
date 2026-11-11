@@ -2098,6 +2098,14 @@ QWidget* MainWindow::build_accessory_tab() {
 
 QWidget* MainWindow::build_graphics_tab() {
     graphics_panel_ = new GraphicsPanel(state_, [this] { record_scene_edit(); });
+    // The viewport owns the renderer, so the dock asks it lazily; the viewport is
+    // created after the docks in build_viewport_area().
+    graphics_panel_->set_preview_provider([this](const QSize& size) -> QImage {
+        return viewport_ != nullptr ? viewport_->preview_image(size) : QImage();
+    });
+    graphics_panel_->set_ibl_error_provider([this]() -> QString {
+        return viewport_ != nullptr ? viewport_->ibl_error() : QString();
+    });
     return graphics_panel_;
 }
 

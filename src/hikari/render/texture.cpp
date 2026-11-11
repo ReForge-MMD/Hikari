@@ -216,6 +216,35 @@ GpuTexture GpuTexture::from_rgba_bytes(core::D3D11Context& context, std::uint32_
     return result;
 }
 
+GpuTexture GpuTexture::from_rgba_bytes_mipped(core::D3D11Context& context,
+                                              std::uint32_t width, std::uint32_t height,
+                                              const std::uint8_t* pixels) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 0;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+
+    GpuTexture result;
+    result.width = width;
+    result.height = height;
+    if (FAILED(context.device->CreateTexture2D(&desc, nullptr, result.texture.GetAddressOf()))) {
+        throw std::runtime_error("CreateTexture2D failed");
+    }
+    if (FAILED(context.device->CreateShaderResourceView(result.texture.Get(), nullptr,
+                                                        result.srv.GetAddressOf()))) {
+        throw std::runtime_error("CreateShaderResourceView failed");
+    }
+    context.context->UpdateSubresource(result.texture.Get(), 0, nullptr, pixels, width * 4, 0);
+    context.context->GenerateMips(result.srv.Get());
+    return result;
+}
+
 GpuTexture GpuTexture::from_memory(core::D3D11Context& context, const std::uint8_t* data,
                                    std::size_t size) {
     Image image;
