@@ -819,17 +819,20 @@ void Renderer::update_shadow_constants(const GraphicsSettings& settings, const F
         constants.cascade_light_range[ci] = max_z - min_z;
     }
 
-    // Sky visibility orthographic top-down: 400x400 centered forward of camera
+    // Sky visibility orthographic top-down: 160x160 centered forward of camera
+    constexpr float kSkyExtent = 160.0f;
+    constexpr float kSkyHalfExtent = kSkyExtent * 0.5f;
     const hikari::Vec3 cam_pos = view.camera_position;
     const float fx = view.inverse_view.m[2][0];
     const float fz = view.inverse_view.m[2][2];
     const float f_len = std::sqrt(fx * fx + fz * fz);
-    const float off_x = f_len > 1e-3f ? (fx / f_len) * 40.0f : 0.0f;
-    const float off_z = f_len > 1e-3f ? (fz / f_len) * 40.0f : 0.0f;
+    const float off_x = f_len > 1e-3f ? (fx / f_len) * 20.0f : 0.0f;
+    const float off_z = f_len > 1e-3f ? (fz / f_len) * 20.0f : 0.0f;
     const hikari::Vec3 sky_eye(cam_pos.x + off_x, 300.0f, cam_pos.z + off_z);
     const auto sky_view = look_along(sky_eye, hikari::Vec3(0.0f, -1.0f, 0.0f),
                                      hikari::Vec3(0.0f, 0.0f, 1.0f));
-    const auto sky_proj = ortho_lh_01(-200.0f, 200.0f, -200.0f, 200.0f, 0.0f, 600.0f);
+    const auto sky_proj = ortho_lh_01(-kSkyHalfExtent, kSkyHalfExtent,
+                                      -kSkyHalfExtent, kSkyHalfExtent, 0.0f, 600.0f);
     constants.sky_visibility_matrix = mat_mul(sky_view, sky_proj);
 
     const auto quality_to_contact = [](int q) -> float {
@@ -838,13 +841,17 @@ void Renderer::update_shadow_constants(const GraphicsSettings& settings, const F
     const auto quality_to_ssgs = [](int q) -> float {
         switch (q) { case 1: return 16.0f; case 2: return 24.0f; case 3: return 32.0f; default: return 0.0f; }
     };
+    const auto quality_to_ssgs_distance = [](int q) -> float {
+        switch (q) { case 1: return 3.0f; case 2: return 5.5f; case 3: return 8.0f; default: return 0.0f; }
+    };
     const float contact_steps = quality_to_contact(settings.shadows.contact_quality);
     const float ssgs_steps    = quality_to_ssgs(settings.shadows.ssgs_quality);
+    const float ssgs_dist     = quality_to_ssgs_distance(settings.shadows.ssgs_quality);
     const float shadow_res_f = static_cast<float>(shadow_res);
 
     constants.shadow_params0 = {0.0005f, 1.5f, settings.shadows.pcss ? 1.0f : 0.0f, 2.0f};
-    constants.shadow_params1 = {settings.shadows.light_radius, 0.5f, 0.3f, 2.0f};
-    constants.shadow_params2 = {0.3f, 0.5f, static_cast<float>(kCascadeCount), 1.0f / 1024.0f};
+    constants.shadow_params1 = {settings.shadows.light_radius, 0.5f, 0.3f, ssgs_dist};
+    constants.shadow_params2 = {0.3f, 0.5f, static_cast<float>(kCascadeCount), kSkyExtent};
     constants.shadow_params3 = {static_cast<float>(settings.ao.sky_visibility),
                                  1.0f / shadow_res_f, contact_steps, ssgs_steps};
 
@@ -1076,16 +1083,19 @@ void Renderer::draw_sky_visibility(const GraphicsSettings& settings, const Frame
     context_.context->ClearDepthStencilView(sky_depth->dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
 
     // Build top-down orthographic matrix matching update_shadow_constants.
+    constexpr float kSkyExtent = 160.0f;
+    constexpr float kSkyHalfExtent = kSkyExtent * 0.5f;
     const hikari::Vec3 cam_pos = view.camera_position;
     const float fx = view.inverse_view.m[2][0];
     const float fz = view.inverse_view.m[2][2];
     const float f_len = std::sqrt(fx * fx + fz * fz);
-    const float off_x = f_len > 1e-3f ? (fx / f_len) * 40.0f : 0.0f;
-    const float off_z = f_len > 1e-3f ? (fz / f_len) * 40.0f : 0.0f;
+    const float off_x = f_len > 1e-3f ? (fx / f_len) * 20.0f : 0.0f;
+    const float off_z = f_len > 1e-3f ? (fz / f_len) * 20.0f : 0.0f;
     const hikari::Vec3 sky_eye(cam_pos.x + off_x, 300.0f, cam_pos.z + off_z);
     const auto sky_view = look_along(sky_eye, hikari::Vec3(0.0f, -1.0f, 0.0f),
                                      hikari::Vec3(0.0f, 0.0f, 1.0f));
-    const auto sky_proj = ortho_lh_01(-200.0f, 200.0f, -200.0f, 200.0f, 0.0f, 600.0f);
+    const auto sky_proj = ortho_lh_01(-kSkyHalfExtent, kSkyHalfExtent,
+                                      -kSkyHalfExtent, kSkyHalfExtent, 0.0f, 600.0f);
     ShadowDrawConstants draw_consts{};
     draw_consts.matrix = mat_mul(sky_view, sky_proj);
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -1250,6 +1260,11 @@ void Renderer::draw_shadow_blur(const GraphicsSettings& settings, const FrameVie
         context_.context->PSSetShaderResources(10, 1, &input_srv);
         ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
         context_.context->PSSetShaderResources(5, 1, &depth_srv);
+        const Target* gb1 = targets_.get("GB1");
+        if (gb1 != nullptr) {
+            ID3D11ShaderResourceView* gb1_srv = gb1->srv.Get();
+            context_.context->PSSetShaderResources(1, 1, &gb1_srv);
+        }
         auto* sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
         context_.context->PSSetSamplers(0, 1, &sampler);
         context_.context->OMSetBlendState(
@@ -1262,8 +1277,10 @@ void Renderer::draw_shadow_blur(const GraphicsSettings& settings, const FrameVie
         bind_shadow_constants();
         draw_fullscreen(program);
 
-        // Unbind input SRV
+        // Unbind input SRVs
         context_.context->PSSetShaderResources(10, 1, &null_srv);
+        ID3D11ShaderResourceView* null_gb1 = nullptr;
+        context_.context->PSSetShaderResources(1, 1, &null_gb1);
     };
 
     // H pass: ShadowMask -> ShadowMaskBlur

@@ -72,6 +72,7 @@ $RECYCLE.BIN/
 
 # Reference & 3rd-party dev packages
 ref-code/
+ref-docs/
 mmdplugin_dev_ver0.41_x64/
 
 # Runtime logs & temp

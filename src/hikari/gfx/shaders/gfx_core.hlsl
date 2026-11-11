@@ -498,9 +498,9 @@ float sample_sun_shadow(float3 world_pos, float3 normal, float view_z, float no_
     return lerp(0.0f, factor, terminator);
 }
 
-float screen_space_shadow(float3 world_pos, float3 normal, float3 light_dir, int steps,
-                          float max_distance, float thickness, float no_l, float rotation) {
-    if (steps <= 0 || max_distance <= 0.0f) {
+float trace_contact_shadow(float3 world_pos, float3 normal, float3 light_dir, int steps,
+                           float rotation) {
+    if (steps <= 0) {
         return 1.0f;
     }
     const float3 view_pos = mul(float4(world_pos, 1.0f), View).xyz;
@@ -525,6 +525,8 @@ float screen_space_shadow(float3 world_pos, float3 normal, float3 light_dir, int
     const float normal_bias =
         max(0.003f, pixel_footprint * 0.5f) * (1.0f + 2.0f * slope_scale);
 
+    // Adaptive max distance based on view depth (Ray-MMD formula)
+    const float max_distance = min(1.0f, max(0.08f, view_pos.z * 0.04f));
     const float3 ray_origin = view_pos + geom_normal * normal_bias;
     const float3 ray_end = ray_origin + view_light * max_distance;
 
@@ -556,7 +558,7 @@ float screen_space_shadow(float3 world_pos, float3 normal, float3 light_dir, int
 
         const float travel_dist = ray_t * max_distance;
         const float cone_radius = max(0.004f, vs_end_radius * ray_t + normal_bias * 0.4f);
-        const float cone_thickness = cone_radius * 2.2f + 0.008f;
+        const float cone_thickness = cone_radius * 2.8f + max(0.012f, view_pos.z * 0.003f);
 
         const float scene_depth_raw = DepthTex.SampleLevel(PointSampler, sample_uv, 0).r;
         if (scene_depth_raw >= 0.99999f) {
@@ -568,7 +570,7 @@ float screen_space_shadow(float3 world_pos, float3 normal, float3 light_dir, int
         if (penetration > 0.0f && penetration <= cone_thickness) {
             const float weight = 1.0f - abs(penetration / cone_thickness - 0.5f) * 2.0f;
             const float contact_falloff = saturate(1.0f - travel_dist / max_distance);
-            const float soft_occl = saturate(weight * 1.5f) * terminator_fade * contact_falloff;
+            const float soft_occl = saturate(weight * 1.8f) * terminator_fade * contact_falloff;
             if (soft_occl > occlusion) {
                 occlusion = soft_occl;
                 hit_t = ray_t;
@@ -580,18 +582,102 @@ float screen_space_shadow(float3 world_pos, float3 normal, float3 light_dir, int
     }
 
     const float distance_fade = 1.0f - smoothstep(0.65f, 1.0f, hit_t);
+    const float shadow = 1.0f - occlusion * distance_fade;
+    // Square the shadow attenuation for crisp, noticeable crevice and contact grounding (Ray-MMD)
+    return shadow * shadow;
+}
+
+float trace_ssgs(float3 world_pos, float3 normal, float3 light_dir, int steps,
+                 float max_distance, float rotation) {
+    if (steps <= 0 || max_distance <= 0.0f) {
+        return 1.0f;
+    }
+    const float3 view_pos = mul(float4(world_pos, 1.0f), View).xyz;
+    const float3 view_normal = normalize(mul(float4(normal, 0.0f), View).xyz);
+    const float3 view_light = normalize(mul(float4(light_dir, 0.0f), View).xyz);
+
+    const float n_dot_l = dot(view_normal, view_light);
+    if (n_dot_l <= 0.0f) {
+        return 1.0f;
+    }
+
+    const float terminator_fade = smoothstep(0.0f, 0.20f, n_dot_l);
+
+    const float3 view_pos_dx = ddx(view_pos);
+    const float3 view_pos_dy = ddy(view_pos);
+    const float3 geom_normal =
+        contact_shadow_geometric_normal(view_pos_dx, view_pos_dy, view_normal);
+
+    float pixel_footprint = max(length(view_pos_dx), length(view_pos_dy));
+    pixel_footprint = min(pixel_footprint, max(0.01f, view_pos.z * 0.01f));
+    const float slope_scale = 1.0f - saturate(n_dot_l);
+    const float normal_bias = max(0.03f, pixel_footprint * 1.2f) * (1.0f + 2.0f * slope_scale);
+
+    const float3 ray_origin = view_pos + geom_normal * normal_bias;
+    const float3 ray_end = ray_origin + view_light * max_distance;
+
+    const float4 clip_start = mul(float4(ray_origin, 1.0f), Projection);
+    const float4 clip_end = mul(float4(ray_end, 1.0f), Projection);
+
+    float occlusion = 0.0f;
+    float hit_t = 1.0f;
+    const float jitter = frac(rotation);
+
+    [loop]
+    for (int i = 0; i < steps; ++i) {
+        const float norm_step = (float(i) + jitter) / float(steps);
+        const float ray_t = pow(norm_step, 1.35f);
+        const float ray_z = ray_origin.z + view_light.z * (ray_t * max_distance);
+        const float4 clip_pos = lerp(clip_start, clip_end, ray_t);
+        if (clip_pos.w <= 1.0e-4f) {
+            break;
+        }
+        const float2 sample_uv = float2(clip_pos.x / clip_pos.w * 0.5f + 0.5f,
+                                        0.5f - clip_pos.y / clip_pos.w * 0.5f);
+        if (sample_uv.x < 0.001f || sample_uv.x > 0.999f ||
+            sample_uv.y < 0.001f || sample_uv.y > 0.999f) {
+            break;
+        }
+
+        const float travel_dist = ray_t * max_distance;
+        // Volumetric thickness that scales with distance to capture real geometric limbs & bodies
+        const float thickness = max(0.08f, travel_dist * 0.09f + normal_bias * 2.0f);
+
+        const float scene_depth_raw = DepthTex.SampleLevel(PointSampler, sample_uv, 0).r;
+        if (scene_depth_raw >= 0.99999f) {
+            continue;
+        }
+        const float scene_depth = linear_view_depth(scene_depth_raw);
+        const float penetration = ray_z - scene_depth;
+
+        if (penetration > 0.0f && penetration <= thickness) {
+            // Smooth parabolic bell-curve thickness weighting to eliminate step banding
+            const float weight = 1.0f - abs(penetration / thickness - 0.5f) * 2.0f;
+            const float soft_occl = saturate(weight * 1.6f) * terminator_fade;
+            if (soft_occl > occlusion) {
+                occlusion = soft_occl;
+                hit_t = ray_t;
+            }
+            if (occlusion >= 0.95f) {
+                break;
+            }
+        }
+    }
+
+    const float distance_fade = 1.0f - smoothstep(0.70f, 1.0f, hit_t);
     return 1.0f - occlusion * distance_fade;
 }
 
-float sample_sky_visibility(float3 world_pos, float3 normal) {
+float sample_sky_visibility(float3 world_pos, float3 normal, out float3 out_bent_normal) {
+    out_bent_normal = normal;
     const float4 clip = mul(float4(world_pos, 1.0f), SkyVisibilityMatrix);
     const float2 uv = float2(clip.x * 0.5f + 0.5f, 0.5f - clip.y * 0.5f);
     if (uv.x < 0.001f || uv.x > 0.999f || uv.y < 0.001f || uv.y > 0.999f) {
         return 1.0f;
     }
 
-    // Edge fade: smoothly transition across the outer 10% of the coverage area
-    const float2 dist_from_edge = saturate(min(uv, 1.0f - uv) * 10.0f);
+    // Edge fade: smoothly transition across the outer 8% of the coverage area
+    const float2 dist_from_edge = saturate(min(uv, 1.0f - uv) * 12.5f);
     const float edge_fade = dist_from_edge.x * dist_from_edge.y;
 
     static const float2 s_dirs[8] = {
@@ -599,65 +685,105 @@ float sample_sky_visibility(float3 world_pos, float3 normal) {
         float2(-1.0f,  0.0f),
         float2( 0.0f,  1.0f),
         float2( 0.0f, -1.0f),
-        float2( 0.7071f,  0.7071f),
-        float2(-0.7071f,  0.7071f),
-        float2( 0.7071f, -0.7071f),
-        float2(-0.7071f, -0.7071f)
+        float2( 0.70710678f,  0.70710678f),
+        float2(-0.70710678f,  0.70710678f),
+        float2( 0.70710678f, -0.70710678f),
+        float2(-0.70710678f, -0.70710678f)
     };
 
 #if SKY_VISIBILITY_ENABLE == 1
     const int NUM_DIRS = 4;
-    const int NUM_STEPS = 2;
-    static const float s_radii[2] = { 5.0f, 30.0f };
+    const int NUM_STEPS = 3;
+    static const float s_radii[3] = { 0.75f, 2.5f, 8.0f };
 #else
     const int NUM_DIRS = 8;
-    const int NUM_STEPS = 3;
-    static const float s_radii[3] = { 3.5f, 16.0f, 55.0f };
+    const int NUM_STEPS = 4;
+    static const float s_radii[4] = { 0.5f, 1.6f, 4.5f, 12.0f };
 #endif
 
-    const float range = 400.0f;
-    float total_occlusion = 0.0f;
-    float total_weight = 0.0f;
+    const float range = ShadowParams2.w > 1.0f ? ShadowParams2.w : 160.0f;
+
+    // Interleaved gradient noise for jittering azimuthal direction per pixel to prevent banding
+    const float noise = frac(52.9829189f * frac(dot(uv * 1024.0f, float2(0.06711056f, 0.00583715f))));
+    const float angle = noise * (6.2831853f / float(NUM_DIRS));
+    const float cos_a = cos(angle);
+    const float sin_a = sin(angle);
+
+    float total_visibility = 0.0f;
+    float2 unoccluded_dir_sum = float2(0.0f, 0.0f);
 
     [unroll]
     for (int d = 0; d < NUM_DIRS; ++d) {
-        const float2 dir = s_dirs[d];
-        const float n_dot_d = dot(normal.xz, dir);
-        const float dir_weight = saturate(normal.y * 0.5f + 0.5f + n_dot_d * 0.5f);
+        const float2 base_dir = s_dirs[d];
+        const float2 dir = float2(base_dir.x * cos_a - base_dir.y * sin_a,
+                                  base_dir.x * sin_a + base_dir.y * cos_a);
 
-        float max_sin_theta = 0.0f;
+        float max_dir_occlusion = 0.0f;
+
         [unroll]
         for (int s = 0; s < NUM_STEPS; ++s) {
             const float r = s_radii[s];
             const float2 sample_uv = uv + float2(dir.x, -dir.y) * (r / range);
             if (sample_uv.x >= 0.0f && sample_uv.x <= 1.0f &&
                 sample_uv.y >= 0.0f && sample_uv.y <= 1.0f) {
-                const float2 s_data = SkyVisibilityTex.SampleLevel(LinearSampler, sample_uv, 0).rg;
-                if (s_data.y > 0.5f || s_data.x > -9000.0f) {
-                    float dh = s_data.x - world_pos.y;
-                    if (dh > 0.5f) {
-                        dh = min(dh, 120.0f);
-                        const float sin_theta = dh / sqrt(dh * dh + r * r);
-                        max_sin_theta = max(max_sin_theta, sin_theta);
+                const float2 s_data = SkyVisibilityTex.SampleLevel(PointSampler, sample_uv, 0).rg;
+                if (s_data.y > 0.5f) {
+                    const float dh = s_data.x - world_pos.y;
+                    if (dh > 0.05f) {
+                        const float dist = sqrt(dh * dh + r * r);
+                        const float sin_theta = dh / dist;
+
+                        // Occluder unit direction vector in 3D
+                        const float3 to_occluder = float3(dir.x * r, dh, dir.y * r) / dist;
+                        const float n_dot_occ = dot(normal, to_occluder);
+
+                        if (n_dot_occ > 0.0f) {
+                            // Distance falloff (Far Cry 4 / LSAO): smooth quadratic attenuation up to 18 units
+                            const float max_dist = 18.0f;
+                            float dist_falloff = saturate(1.0f - dist / max_dist);
+                            dist_falloff = dist_falloff * dist_falloff;
+
+                            // Height clearance falloff: ambient light enters beneath high ceilings
+                            const float max_height = 10.0f;
+                            const float height_falloff = saturate(1.0f - dh / max_height);
+
+                            const float step_occlusion = sin_theta * dist_falloff * height_falloff *
+                                                         saturate(n_dot_occ * 1.25f);
+                            max_dir_occlusion = max(max_dir_occlusion, step_occlusion);
+                        }
                     }
                 }
             }
         }
 
-        total_occlusion += max_sin_theta * dir_weight;
-        total_weight += dir_weight;
+        const float dir_vis = 1.0f - saturate(max_dir_occlusion);
+        total_visibility += dir_vis;
+        unoccluded_dir_sum += dir * dir_vis;
     }
 
-    float avg_occlusion = total_occlusion / max(total_weight, 1.0e-4f);
+    float avg_visibility = total_visibility / float(NUM_DIRS);
+
+    // Subtle undersurface darkening for faces pointing purely downward away from the sky
     if (normal.y < 0.0f) {
-        avg_occlusion = max(avg_occlusion, saturate(-normal.y * 1.2f));
+        avg_visibility *= lerp(1.0f, 0.65f, saturate(-normal.y));
     }
 
-    const float strength = 0.60f;
-    const float min_floor = 0.08f;
-    float sky_vis = saturate(1.0f - avg_occlusion * strength);
-    sky_vis = max(min_floor, sky_vis);
-    return lerp(1.0f, sky_vis, edge_fade);
+    const float strength = 0.70f;
+    const float min_floor = 0.18f;
+    float final_vis = saturate(lerp(1.0f, avg_visibility, strength));
+    final_vis = max(min_floor, final_vis);
+
+    // Compute bent normal toward open unoccluded sky
+    const float unocc_len = length(unoccluded_dir_sum);
+    float3 bent = normal;
+    if (unocc_len > 1.0e-4f) {
+        const float2 bent_horiz = unoccluded_dir_sum / unocc_len;
+        const float bend_factor = (1.0f - final_vis) * 0.55f;
+        bent = normalize(normal + float3(bent_horiz.x, 0.0f, bent_horiz.y) * bend_factor);
+    }
+    out_bent_normal = normalize(lerp(normal, bent, edge_fade));
+
+    return lerp(1.0f, final_vis, edge_fade);
 }
 
 float4 ShadowMaskPS(FSOut input) : SV_Target {
@@ -678,13 +804,11 @@ float4 ShadowMaskPS(FSOut input) : SV_Target {
     const float csm = sample_sun_shadow(world_pos, n, view_z, no_l, rotation, cascade);
     float contact = 1.0f;
 #if CONTACT_SHADOW_STEPS > 0
-    contact = screen_space_shadow(world_pos, n, l, CONTACT_SHADOW_STEPS, ShadowParams1.y,
-                                  ShadowParams1.z, no_l, rotation);
+    contact = trace_contact_shadow(world_pos, n, l, CONTACT_SHADOW_STEPS, rotation);
 #endif
     float ssgs = 1.0f;
 #if SSGS_STEPS > 0
-    ssgs = screen_space_shadow(world_pos, n, l, SSGS_STEPS, ShadowParams1.w,
-                               ShadowParams2.x, no_l, rotation + 1.7f);
+    ssgs = trace_ssgs(world_pos, n, l, SSGS_STEPS, ShadowParams1.w, rotation + 1.7f);
 #endif
     float shadow = csm;
 #if CONTACT_SHADOW_STEPS > 0
@@ -701,10 +825,11 @@ float4 ShadowBlurPS(FSOut input) : SV_Target {
     const float4 center = ShadowMaskTex.SampleLevel(PointSampler, input.uv, 0);
     const float center_depth =
         linear_view_depth(DepthTex.SampleLevel(PointSampler, input.uv, 0).r);
+    const float3 center_normal = decode_octahedral(GB1Tex.SampleLevel(PointSampler, input.uv, 0).xy);
     float3 sum = center.rgb;
     float weight_sum = 1.0f;
-    const float depth_tolerance = max(center_depth * 0.035f, 0.06f);
-    const float blur_sigma = float(SHADOW_BLUR_RADIUS) * 0.5f;
+    const float depth_tolerance = max(center_depth * 0.025f, 0.04f);
+    const float blur_sigma = float(SHADOW_BLUR_RADIUS) * 0.45f;
     const float blur_falloff = 1.0f / (2.0f * blur_sigma * blur_sigma);
 
     [unroll]
@@ -721,10 +846,17 @@ float4 ShadowBlurPS(FSOut input) : SV_Target {
             ShadowMaskTex.SampleLevel(PointSampler, input.uv + offset, 0);
         const float sample_depth = linear_view_depth(
             DepthTex.SampleLevel(PointSampler, input.uv + offset, 0).r);
+        const float3 sample_normal = decode_octahedral(
+            GB1Tex.SampleLevel(PointSampler, input.uv + offset, 0).xy);
+
         const float ddiff = abs(sample_depth - center_depth) / depth_tolerance;
+        const float ndot = saturate(dot(center_normal, sample_normal));
+
         const float spatial_weight = exp(-float(i * i) * blur_falloff);
         const float depth_weight = exp(-ddiff * ddiff);
-        const float weight = spatial_weight * depth_weight;
+        const float normal_weight = ndot * ndot;
+        const float weight = spatial_weight * depth_weight * normal_weight;
+
         sum += sample_value.rgb * weight;
         weight_sum += weight;
     }
@@ -800,12 +932,13 @@ float4 LightingPS(FSOut input) : SV_Target {
 #endif
 
     float sky_visibility = 1.0f;
+    float3 bent_n = n;
 #if SKY_VISIBILITY_ENABLE > 0
-    sky_visibility = sample_sky_visibility(world_pos, n);
+    sky_visibility = sample_sky_visibility(world_pos, n, bent_n);
 #endif
-    const float hemisphere = saturate(n.y * 0.5f + 0.5f);
-    const float3 ambient = AmbientColor.rgb * base * (1.0f - metallic) *
-                           lerp(0.55f, 1.0f, hemisphere) * sky_visibility;
+    const float bent_hemi = saturate(bent_n.y * 0.5f + 0.5f);
+    const float3 ambient_tint = lerp(float3(0.40f, 0.40f, 0.45f), float3(1.0f, 1.0f, 1.0f), bent_hemi);
+    const float3 ambient = AmbientColor.rgb * ambient_tint * base * (1.0f - metallic) * sky_visibility;
 
     float3 color = sun_diffuse + sun_specular + ambient + emissive;
 #if DEBUG_VIEW == 8

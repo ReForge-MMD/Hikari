@@ -3,7 +3,7 @@
   "scene": "Synthetic chart",
   "width": 1280,
   "height": 720,
-  "frame_ms": 2010.42,
+  "frame_ms": 1052.33,
   "settings_hash": 3923671736552816596,
   "non_finite": 0,
   "mean": [0.426818, 0.454506, 0.479755],
