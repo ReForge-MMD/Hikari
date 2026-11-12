@@ -328,10 +328,12 @@ void GraphicsPanel::build_controls() {
     gi_enable_->addItems({QStringLiteral("Disabled"), QStringLiteral("SSGI"),
                           QStringLiteral("SSGI (wide)"),
                           QStringLiteral("SSPT / RTGI (multi-bounce)"),
-                          QStringLiteral("SSRC (Radiance Cascades)")});
+                          QStringLiteral("SSRC (Radiance Cascades)"),
+                          QStringLiteral("VXGI (Voxel Cone Tracing)")});
     gi_enable_->setToolTip(QStringLiteral(
         "SSGI traces short screen-space rays. SSPT follows longer paths with "
-        "thickness rejection and feeds the previous frame back in."));
+        "thickness rejection. SSRC uses spherical harmonics cascades. "
+        "VXGI builds a 3D voxel volume and traces multi-scale cones."));
 
     gi_quality_ = new QComboBox();
     gi_quality_->addItems({QStringLiteral("Low (4 rays)"), QStringLiteral("Medium (8 rays)"),
@@ -476,6 +478,8 @@ void GraphicsPanel::build_controls() {
                          static_cast<int>(gfx::DebugView::SsrConfidence));
     debug_view_->addItem(QStringLiteral("GI radiance"),
                          static_cast<int>(gfx::DebugView::GiRadiance));
+    debug_view_->addItem(QStringLiteral("VXGI voxels (Raymarch)"),
+                         static_cast<int>(gfx::DebugView::VxgiVoxels));
     debug_view_->setToolTip(QStringLiteral("Select a diagnostic pass to inspect isolated buffers or shadow masks."));
 
     auto* image = new QWidget();
@@ -864,7 +868,7 @@ void GraphicsPanel::refresh_from_state() {
     ssr_quality_->setCurrentIndex(std::clamp(graphics.ssr.quality, 0, 4));
     ssr_debug_->setChecked(graphics.ssr.debug);
     ssr_debug_mode_->setCurrentIndex(std::clamp(graphics.ssr.debug_mode, 0, 4));
-    gi_enable_->setCurrentIndex(std::clamp(graphics.gi.enable, 0, 4));
+    gi_enable_->setCurrentIndex(std::clamp(graphics.gi.enable, 0, 5));
     gi_quality_->setCurrentIndex(std::clamp(graphics.gi.quality, 1, 4) - 1);
     gi_filter_radius_->setValue(std::clamp(graphics.gi.filter_radius, 1, 8));
     gi_prefilter_radius_->setValue(std::clamp(graphics.gi.prefilter_radius, 1, 3));

@@ -97,6 +97,8 @@ cbuffer AoSsrGiParams : register(b6) {
     float4 GiParams0;  // x enable, y ray count, z steps, w filter radius
     float4 GiParams1;  // x prefilter radius, y sample radius, z thickness, w bounce weight
     float4 GiParams2;  // x il amount, y ao amount, z specular gi, w sensitivity
+    float4 VxgiParams0; // center.xyz, extent
+    float4 VxgiParams1; // voxel_size, inv_range, grid_dim, num_cones
 };
 
 // Phase 5 half-resolution chains. A register is reused across passes because
@@ -105,6 +107,7 @@ cbuffer AoSsrGiParams : register(b6) {
 Texture2D AoBlurTex : register(t20);
 Texture2D SsrTex : register(t21);
 Texture2D GiTex : register(t22);
+Texture3D<float4> VxgiRadianceLightingTex : register(t23);
 Texture2D SsrBlur0Tex : register(t23);
 Texture2D BlurSourceTex : register(t24);
 // Conservative farthest linear depth per tile, used by the Hi-Z trace.
@@ -113,6 +116,12 @@ Texture2D SsrDepth2Tex : register(t26);
 Texture2D SsrDepth3Tex : register(t27);
 RWTexture2D<float4> GiOutUAV : register(u0);
 RWTexture2D<float4> GiHistoryUAV : register(u2);
+
+// VXGI 3D volume targets
+RWTexture3D<uint> VxgiVolumeUav : register(u0);
+Texture3D<uint> VxgiVolumeTex : register(t24);
+Texture3D<float4> VxgiRadianceTex : register(t25);
+RWTexture3D<float4> VxgiRadianceMipUav : register(u0);
 
 #ifndef SUN_SHADOW_PCSS
 #define SUN_SHADOW_PCSS 1
@@ -2887,6 +2896,343 @@ void SsrcResolveCS(uint3 tid : SV_DispatchThreadID) {
     GiOutUAV[tid.xy] = float4(irradiance * max(GiParams2.x, 0.0f), 1.0f);
 }
 
+// -----------------------------------------------------------------------------
+// Voxel Cone Tracing (VXGI) Shaders
+// -----------------------------------------------------------------------------
+
+uint vxgi_encode_radiance(float3 color) {
+    const float kMaxRad = 8.0f;
+    float3 enc = sqrt(saturate(color / kMaxRad));
+    float lum = max(dot(enc, float3(0.299f, 0.587f, 0.114f)), 0.005f);
+    uint u_lum = (uint)clamp(lum * 255.0f, 1.0f, 255.0f);
+    uint u_r = (uint)clamp(enc.r * 255.0f, 0.0f, 255.0f);
+    uint u_g = (uint)clamp(enc.g * 255.0f, 0.0f, 255.0f);
+    uint u_b = (uint)clamp(enc.b * 255.0f, 0.0f, 255.0f);
+    return (u_lum << 24) | (u_r << 16) | (u_g << 8) | u_b;
+}
+
+float4 vxgi_decode_radiance(uint packed_val) {
+    if (packed_val == 0u) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float kMaxRad = 8.0f;
+    float r = float((packed_val >> 16) & 0xFF) / 255.0f;
+    float g = float((packed_val >> 8) & 0xFF) / 255.0f;
+    float b = float(packed_val & 0xFF) / 255.0f;
+    return float4(r * r * kMaxRad, g * g * kMaxRad, b * b * kMaxRad, 1.0f);
+}
+
+[numthreads(4, 4, 4)]
+void VxgiClearCS(uint3 tid : SV_DispatchThreadID) {
+    uint dim = (uint)VxgiParams1.z;
+    if (tid.x >= dim || tid.y >= dim || tid.z >= dim) {
+        return;
+    }
+    VxgiVolumeUav[tid] = 0u;
+}
+
+#ifndef VOXELIZE_AXIS
+#define VOXELIZE_AXIS 0
+#endif
+
+struct VoxelizeVSOut {
+    float4 pos_clip : SV_Position;
+    float3 pos_world : POSITION1;
+    float3 normal_world : NORMAL;
+    float2 uv : TEXCOORD0;
+};
+
+VoxelizeVSOut VoxelizeVS(VSIn input) {
+    VoxelizeVSOut output;
+    const float total_weight = input.bone_weights.x + input.bone_weights.y +
+                               input.bone_weights.z + input.bone_weights.w;
+    const float4 weights = (total_weight > 0.0001f)
+                               ? (input.bone_weights / total_weight)
+                               : float4(1.0f, 0.0f, 0.0f, 0.0f);
+    const float4x4 skin = load_bone(input.bone_indices.x) * weights.x +
+                          load_bone(input.bone_indices.y) * weights.y +
+                          load_bone(input.bone_indices.z) * weights.z +
+                          load_bone(input.bone_indices.w) * weights.w;
+    const float4 pos_world = mul(float4(input.position, 1.0f), skin);
+    output.pos_world = pos_world.xyz;
+    output.normal_world = normalize(mul(float4(input.normal, 0.0f), skin).xyz);
+    output.uv = input.uv * UvTransform.xy + UvTransform.zw;
+
+    float3 center = VxgiParams0.xyz;
+    float extent = max(VxgiParams0.w, 1.0f);
+    float3 p = (pos_world.xyz - center) / extent;
+
+#if VOXELIZE_AXIS == 0
+    // XY projection (looking down Z)
+    output.pos_clip = float4(p.x, p.y, 0.5f, 1.0f);
+#elif VOXELIZE_AXIS == 1
+    // YZ projection (looking down X)
+    output.pos_clip = float4(p.y, p.z, 0.5f, 1.0f);
+#else
+    // XZ projection (looking down Y)
+    output.pos_clip = float4(p.x, p.z, 0.5f, 1.0f);
+#endif
+    return output;
+}
+
+void VoxelizePS(VoxelizeVSOut input) {
+    float3 center = VxgiParams0.xyz;
+    float extent = VxgiParams0.w;
+    float3 min_b = center - extent;
+    float inv_range = VxgiParams1.y;
+    float grid_dim = VxgiParams1.z;
+
+    float3 uvw = (input.pos_world - min_b) * inv_range;
+    if (any(uvw < 0.0f) || any(uvw > 1.0f)) {
+        return;
+    }
+
+    float4 texel = DiffuseMap.Sample(LinearSampler, input.uv);
+    float alpha = texel.a * BaseColor.a;
+    if (alpha < 0.05f) {
+        discard;
+    }
+
+    float3 albedo = srgb_to_linear(texel.rgb) * BaseColor.rgb;
+    float3 n = normalize(input.normal_world);
+    float3 sun_dir = normalize(-SunDirection.xyz);
+    float n_dot_l = saturate(dot(n, sun_dir));
+    float3 direct = SunColor.rgb * n_dot_l + max(AmbientColor.rgb, float3(0.12f, 0.12f, 0.12f));
+    float3 radiance = max(albedo * direct + EmissiveMetallic.rgb, 0.0f);
+
+    uint packed_rad = vxgi_encode_radiance(radiance);
+    int3 coord = clamp(int3(uvw * grid_dim), 0, (int)grid_dim - 1);
+    InterlockedMax(VxgiVolumeUav[coord], packed_rad);
+}
+
+[numthreads(8, 8, 1)]
+void VxgiInjectGBufferCS(uint3 tid : SV_DispatchThreadID) {
+    uint screen_w, screen_h;
+    GB0Tex.GetDimensions(screen_w, screen_h);
+    if (tid.x >= screen_w || tid.y >= screen_h) {
+        return;
+    }
+    float2 uv = (float2(tid.xy) + 0.5f) / float2(screen_w, screen_h);
+    float depth = DepthTex.SampleLevel(PointSampler, uv, 0).r;
+    if (depth >= 0.99999f) {
+        return;
+    }
+    float3 world_pos = reconstruct_world(uv, depth);
+    float3 center = VxgiParams0.xyz;
+    float extent = VxgiParams0.w;
+    float3 min_b = center - extent;
+    float inv_range = VxgiParams1.y;
+    float grid_dim = VxgiParams1.z;
+
+    float3 uvw = (world_pos - min_b) * inv_range;
+    if (any(uvw < 0.0f) || any(uvw > 1.0f)) {
+        return;
+    }
+
+    float4 gb0 = GB0Tex.SampleLevel(PointSampler, uv, 0);
+    float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
+    float4 gb4 = GB4Tex.SampleLevel(PointSampler, uv, 0);
+    float3 n = normalize(decode_octahedral(gb1.xy));
+    float3 sun_dir = normalize(-SunDirection.xyz);
+    float shadow = ShadowMaskTex.SampleLevel(PointSampler, uv, 0).r;
+
+    float n_dot_l = saturate(dot(n, sun_dir));
+    float3 ambient = max(AmbientColor.rgb, float3(0.08f, 0.08f, 0.08f));
+    float3 direct = SunColor.rgb * (n_dot_l * shadow) + ambient;
+    float3 radiance = max(gb0.rgb * direct + gb4.rgb, 0.0f);
+
+    uint packed_rad = vxgi_encode_radiance(radiance);
+    int3 coord = clamp(int3(uvw * grid_dim), 0, (int)grid_dim - 1);
+    InterlockedMax(VxgiVolumeUav[coord], packed_rad);
+
+    // Thick injection: also inject 1 voxel step into interior along -n
+    // Ensures thin character geometry (hands, hair, limbs) has complete voxel coverage without cracks
+    float voxel_size = VxgiParams1.x;
+    float3 inner_pos = world_pos - n * (voxel_size * 0.45f);
+    float3 inner_uvw = (inner_pos - min_b) * inv_range;
+    if (!any(inner_uvw < 0.0f) && !any(inner_uvw > 1.0f)) {
+        int3 inner_coord = clamp(int3(inner_uvw * grid_dim), 0, (int)grid_dim - 1);
+        if (any(inner_coord != coord)) {
+            InterlockedMax(VxgiVolumeUav[inner_coord], packed_rad);
+        }
+    }
+}
+
+[numthreads(4, 4, 4)]
+void VxgiUnpackCS(uint3 tid : SV_DispatchThreadID) {
+    uint dim_x, dim_y, dim_z;
+    VxgiRadianceMipUav.GetDimensions(dim_x, dim_y, dim_z);
+    if (tid.x >= dim_x || tid.y >= dim_y || tid.z >= dim_z) {
+        return;
+    }
+    uint packed_val = VxgiVolumeTex.Load(int4(tid, 0));
+    VxgiRadianceMipUav[tid] = vxgi_decode_radiance(packed_val);
+}
+
+[numthreads(4, 4, 4)]
+void VxgiDownsampleCS(uint3 tid : SV_DispatchThreadID) {
+    uint dim_x, dim_y, dim_z;
+    VxgiRadianceMipUav.GetDimensions(dim_x, dim_y, dim_z);
+    if (tid.x >= dim_x || tid.y >= dim_y || tid.z >= dim_z) {
+        return;
+    }
+
+    int3 src_base = int3(tid * 2u);
+    float3 accum_rgb = 0.0f;
+    float max_a = 0.0f;
+    float sum_a = 0.0f;
+    [unroll]
+    for (int z = 0; z < 2; ++z) {
+        [unroll]
+        for (int y = 0; y < 2; ++y) {
+            [unroll]
+            for (int x = 0; x < 2; ++x) {
+                float4 s = VxgiRadianceTex.Load(int4(src_base + int3(x, y, z), 0));
+                accum_rgb += s.rgb;
+                max_a = max(max_a, s.a);
+                sum_a += s.a;
+            }
+        }
+    }
+    // Conserve wall opacity so thin geometry stays solid at lower mip levels
+    float combined_a = max(max_a * 0.9f, sum_a * 0.125f);
+    VxgiRadianceMipUav[tid] = float4(accum_rgb * 0.125f, combined_a);
+}
+
+float4 trace_vxgi_cone(float3 origin, float3 dir, float tan_half_angle, float max_dist) {
+    float3 center = VxgiParams0.xyz;
+    float extent = VxgiParams0.w;
+    float voxel_size = VxgiParams1.x;
+    float inv_range = VxgiParams1.y;
+    float3 min_b = center - extent;
+
+    float3 accum_rgb = 0.0f;
+    float accum_a = 0.0f;
+    float t = voxel_size * 1.5f;
+    int max_steps = int(max(GiParams0.z, 24.0f));
+
+    [loop]
+    for (int step = 0; step < max_steps; ++step) {
+        if (t >= max_dist || accum_a >= 0.95f) {
+            break;
+        }
+        float3 pos = origin + dir * t;
+        float3 uvw = (pos - min_b) * inv_range;
+        if (any(uvw < 0.0f) || any(uvw > 1.0f)) {
+            // Environment sky/ambient irradiance when exiting the voxel bounds
+            float3 sky_col = AmbientColor.rgb * 0.3f;
+#if SKY_ENABLE && IBL_QUALITY > 0
+            sky_col += max(sh_irradiance(dir), 0.0f) * (0.5f / PI);
+#endif
+            accum_rgb += (1.0f - accum_a) * sky_col;
+            accum_a = 1.0f;
+            break;
+        }
+
+        float diameter = 2.0f * t * tan_half_angle;
+        float mip = log2(max(diameter / voxel_size, 1.0f));
+        float4 vox = VxgiRadianceTex.SampleLevel(LinearSampler, uvw, mip);
+
+        float weight = 1.0f - accum_a;
+        accum_rgb += weight * vox.rgb;
+        accum_a += weight * vox.a;
+
+        t += max(diameter * 0.5f, voxel_size);
+    }
+
+    return float4(accum_rgb, accum_a);
+}
+
+[numthreads(8, 8, 1)]
+void VxgiConeTraceCS(uint3 tid : SV_DispatchThreadID) {
+    uint out_w, out_h;
+    GiOutUAV.GetDimensions(out_w, out_h);
+    if (tid.x >= out_w || tid.y >= out_h) {
+        return;
+    }
+    float2 uv = (float2(tid.xy) + 0.5f) / float2(out_w, out_h);
+    float depth_value = phase5_depth(uv);
+    if (depth_value >= 0.99999f) {
+        GiOutUAV[tid.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    float4 gb0 = GB0Tex.SampleLevel(PointSampler, uv, 0);
+    float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
+    float3 n = normalize(decode_octahedral(gb1.xy));
+    float3 world_pos = reconstruct_world(uv, depth_value);
+    float roughness = saturate(gb0.w);
+
+    float3 tangent;
+    float3 bitangent;
+    phase5_basis(n, tangent, bitangent);
+
+    // Quasi-Monte Carlo golden angle rotation per frame for temporal supersampling
+    float angle_offset = (Params1.w) * 2.3999632f;
+    float cos_r = cos(angle_offset);
+    float sin_r = sin(angle_offset);
+    float3 t_rot = tangent * cos_r + bitangent * sin_r;
+    float3 b_rot = -tangent * sin_r + bitangent * cos_r;
+
+    float extent = VxgiParams0.w;
+    float voxel_size = VxgiParams1.x;
+    float num_cones = VxgiParams1.w;
+    float max_dist = extent * 1.8f;
+    float3 ray_origin = world_pos + n * (voxel_size * 0.65f);
+
+    float3 diff_rad = 0.0f;
+    float diff_occ = 0.0f;
+
+    if (num_cones >= 8.5f) {
+        // High/Ultra: 9 Cones (1 central + 8 ring cones at 50 degrees)
+        float4 c0 = trace_vxgi_cone(ray_origin, n, 0.577f, max_dist);
+        diff_rad = c0.rgb * 0.22f;
+        diff_occ = c0.a * 0.22f;
+
+        const float ring_tilt = 0.766f;  // sin(50 deg)
+        const float ring_norm = 0.6428f; // cos(50 deg)
+        const float ring_weight = 0.0975f;
+        const float ring_tan = 0.52f;
+
+        [unroll]
+        for (int ci = 0; ci < 8; ++ci) {
+            float angle = float(ci) * (PI * 0.25f);
+            float3 dir = normalize(n * ring_norm + (t_rot * cos(angle) + b_rot * sin(angle)) * ring_tilt);
+            float4 c_ring = trace_vxgi_cone(ray_origin, dir, ring_tan, max_dist);
+            diff_rad += c_ring.rgb * ring_weight;
+            diff_occ += c_ring.a * ring_weight;
+        }
+    } else {
+        // Low/Medium: 5 Cones (1 normal + 4 diagonal cones at 45 degrees)
+        float4 c0 = trace_vxgi_cone(ray_origin, n, 0.577f, max_dist);
+        float3 d1 = normalize(n * 0.7071f + t_rot * 0.7071f);
+        float3 d2 = normalize(n * 0.7071f - t_rot * 0.7071f);
+        float3 d3 = normalize(n * 0.7071f + b_rot * 0.7071f);
+        float3 d4 = normalize(n * 0.7071f - b_rot * 0.7071f);
+
+        float4 c1 = trace_vxgi_cone(ray_origin, d1, 0.577f, max_dist);
+        float4 c2 = trace_vxgi_cone(ray_origin, d2, 0.577f, max_dist);
+        float4 c3 = trace_vxgi_cone(ray_origin, d3, 0.577f, max_dist);
+        float4 c4 = trace_vxgi_cone(ray_origin, d4, 0.577f, max_dist);
+
+        diff_rad = c0.rgb * 0.28f + (c1.rgb + c2.rgb + c3.rgb + c4.rgb) * 0.18f;
+        diff_occ = c0.a * 0.28f + (c1.a + c2.a + c3.a + c4.a) * 0.18f;
+    }
+
+    float gi_ao = saturate(1.0f - diff_occ);
+
+#if SSGI_SPECULAR_GI
+    float3 v = normalize(CameraPos.xyz - world_pos);
+    float3 refl = reflect(-v, n);
+    float spec_tan = max(roughness * 0.45f, 0.015f);
+    float4 spec_cone = trace_vxgi_cone(ray_origin, refl, spec_tan, max_dist);
+    diff_rad += spec_cone.rgb * (1.0f - roughness) * 0.4f;
+#endif
+
+    diff_rad *= max(GiParams2.x, 0.0f);
+    GiOutUAV[tid.xy] = float4(max(diff_rad, 0.0f), saturate(gi_ao * GiParams2.y));
+}
+
 // Plane-distance + depth + normal cross-bilateral weight shared by the GI spatial
 // prefilter and separable blur passes so tilted walls/floors smooth cleanly.
 float gi_bilateral_weight(float3 p_center, float3 n_center, float z_center,
@@ -3098,7 +3444,58 @@ float4 LightingPS(FSOut input) : SV_Target {
     const float4 gb4 = GB4Tex.Sample(LinearSampler, input.uv);
     const float depth_value = DepthTex.Sample(LinearSampler, input.uv).r;
     if (depth_value >= 0.99999f || gb0.a < 0.001f) {
-#if SKY_ENABLE
+#if DEBUG_VIEW == 7
+        return float4(1.0f, 1.0f, 1.0f, 1.0f);
+#elif DEBUG_VIEW >= 1 && DEBUG_VIEW <= 6
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+#elif DEBUG_VIEW == 23
+        float3 ray_origin = CameraPos.xyz;
+        float2 ndc = float2(input.uv.x * 2.0f - 1.0f, 1.0f - input.uv.y * 2.0f);
+        float3 view_dir_vs = normalize(float3(ndc.x / max(Params2.x, 1.0e-6f),
+                                              ndc.y / max(Params2.y, 1.0e-6f), 1.0f));
+        float3 ray_dir = normalize(mul(float4(view_dir_vs, 0.0f), InverseView).xyz);
+        float3 center = VxgiParams0.xyz;
+        float extent = VxgiParams0.w;
+        float3 bmin = center - extent;
+        float3 bmax = center + extent;
+
+        float3 inv_d = 1.0f / (abs(ray_dir) > 1.0e-5f ? ray_dir : 1.0e-5f);
+        float3 t0 = (bmin - ray_origin) * inv_d;
+        float3 t1 = (bmax - ray_origin) * inv_d;
+        float3 tmin_v = min(t0, t1);
+        float3 tmax_v = max(t0, t1);
+        float t_enter = max(max(tmin_v.x, tmin_v.y), tmin_v.z);
+        float t_exit = min(min(tmax_v.x, tmax_v.y), tmax_v.z);
+        t_enter = max(t_enter, 0.05f);
+
+        float4 accum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (t_exit > t_enter) {
+            float grid_dim = max(VxgiParams1.z, 128.0f);
+            float voxel_size = (extent * 2.0f) / grid_dim;
+            float step_sz = voxel_size * 0.5f;
+            int2 px = int2(input.uv * float2(1920.0f, 1080.0f));
+            float dither = float((px.x * 5 + px.y * 7) & 15) / 16.0f;
+            float travel = t_enter + step_sz * dither;
+            int max_steps = int(grid_dim * 1.5f);
+            [loop]
+            for (int rmi = 0; rmi < max_steps; ++rmi) {
+                if (travel >= t_exit || accum.a >= 0.98f) {
+                    break;
+                }
+                float3 p = ray_origin + ray_dir * travel;
+                float3 uvw = (p - bmin) / (extent * 2.0f);
+                float4 vox = VxgiRadianceLightingTex.SampleLevel(LinearSampler, uvw, 0);
+                if (vox.a > 0.001f) {
+                    float w = (1.0f - accum.a) * saturate(vox.a * 1.5f);
+                    accum.rgb += vox.rgb * w * 2.0f;
+                    accum.a += w;
+                }
+                travel += step_sz;
+            }
+        }
+        float3 bg = float3(0.04f, 0.04f, 0.05f);
+        return float4(lerp(bg, accum.rgb, accum.a), 1.0f);
+#elif SKY_ENABLE
         // The sky background pass already wrote this pixel.
         discard;
 #else
@@ -3261,7 +3658,23 @@ float4 LightingPS(FSOut input) : SV_Target {
 
     float3 color = sun_diffuse + sun_specular + moon_diffuse + moon_specular + ambient + emissive +
                    ibl_specular + indirect_diffuse * diffuse_base + indirect_specular;
-#if DEBUG_VIEW == 8
+#if DEBUG_VIEW == 1
+    color = base;
+#elif DEBUG_VIEW == 2
+    color = n * 0.5f + 0.5f;
+#elif DEBUG_VIEW == 3
+    color = roughness.xxx;
+#elif DEBUG_VIEW == 4
+    color = metallic.xxx;
+#elif DEBUG_VIEW == 5
+    color = specular;
+#elif DEBUG_VIEW == 6
+    color = emissive;
+#elif DEBUG_VIEW == 7
+    float lin_d = linear_view_depth(depth_value);
+    float d_vis = pow(saturate(lin_d / 50.0f), 0.5f);
+    color = d_vis.xxx;
+#elif DEBUG_VIEW == 8
     const float3 cascade_colors[4] = {float3(0.85f, 0.15f, 0.10f), float3(0.15f, 0.80f, 0.25f),
                                       float3(0.15f, 0.40f, 0.95f), float3(0.95f, 0.85f, 0.15f)};
     color = cascade_colors[(int)floor(shadow_mask.a * 4.0f)];
@@ -3290,6 +3703,54 @@ float4 LightingPS(FSOut input) : SV_Target {
     color = SsrTex.SampleLevel(LinearSampler, input.uv, 0).aaa;
 #elif DEBUG_VIEW == 22
     color = GiTex.SampleLevel(LinearSampler, input.uv, 0).rgb;
+#elif DEBUG_VIEW == 23
+    // Volume raymarch visualization of VxgiRadiance 3D texture
+    {
+        float3 ray_origin = CameraPos.xyz;
+        float3 ray_dir = normalize(world_pos - ray_origin);
+        float3 center = VxgiParams0.xyz;
+        float extent = VxgiParams0.w;
+        float3 bmin = center - extent;
+        float3 bmax = center + extent;
+
+        // Slab ray-box intersection
+        float3 inv_d = 1.0f / (abs(ray_dir) > 1.0e-5f ? ray_dir : 1.0e-5f);
+        float3 t0 = (bmin - ray_origin) * inv_d;
+        float3 t1 = (bmax - ray_origin) * inv_d;
+        float3 tmin_v = min(t0, t1);
+        float3 tmax_v = max(t0, t1);
+        float t_enter = max(max(tmin_v.x, tmin_v.y), tmin_v.z);
+        float t_exit = min(min(tmax_v.x, tmax_v.y), tmax_v.z);
+
+        t_enter = max(t_enter, 0.05f);
+
+        float4 accum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (t_exit > t_enter) {
+            float grid_dim = max(VxgiParams1.z, 128.0f);
+            float voxel_size = (extent * 2.0f) / grid_dim;
+            float step_sz = voxel_size * 0.5f;
+            int2 px = int2(input.uv * float2(1920.0f, 1080.0f));
+            float dither = float((px.x * 5 + px.y * 7) & 15) / 16.0f;
+            float travel = t_enter + step_sz * dither;
+            int max_steps = int(grid_dim * 1.5f);
+            [loop]
+            for (int rmi = 0; rmi < max_steps; ++rmi) {
+                if (travel >= t_exit || accum.a >= 0.98f) {
+                    break;
+                }
+                float3 p = ray_origin + ray_dir * travel;
+                float3 uvw = (p - bmin) / (extent * 2.0f);
+                float4 vox = VxgiRadianceLightingTex.SampleLevel(LinearSampler, uvw, 0);
+                if (vox.a > 0.001f) {
+                    float w = (1.0f - accum.a) * saturate(vox.a * 1.5f);
+                    accum.rgb += vox.rgb * w * 2.0f;
+                    accum.a += w;
+                }
+                travel += step_sz;
+            }
+        }
+        color = lerp(color * 0.20f, accum.rgb, accum.a);
+    }
 #endif
     return float4(max(color, 0.0f), 1.0f);
 }

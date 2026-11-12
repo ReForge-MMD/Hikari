@@ -376,6 +376,16 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
         targets_.create_target(context_.device.Get(), name, half_width * 4u, half_height * 2u,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT, true);
     }
+    // VXGI 3D volumes: raw voxel grid, radiance hierarchy, and downsample scratch buffer.
+    const std::uint32_t init_vxgi_dim = current_vxgi_dim_ > 0 ? current_vxgi_dim_ : 128u;
+    const std::uint32_t init_vxgi_mips = (init_vxgi_dim == 256u) ? 9u : 8u;
+    targets_.create_volume(context_.device.Get(), "VxgiVolume", init_vxgi_dim, init_vxgi_dim, init_vxgi_dim,
+                           DXGI_FORMAT_R32_UINT, 1);
+    targets_.create_volume(context_.device.Get(), "VxgiRadiance", init_vxgi_dim, init_vxgi_dim, init_vxgi_dim,
+                           DXGI_FORMAT_R16G16B16A16_FLOAT, init_vxgi_mips);
+    targets_.create_volume(context_.device.Get(), "VxgiScratch", init_vxgi_dim / 2u, init_vxgi_dim / 2u, init_vxgi_dim / 2u,
+                           DXGI_FORMAT_R16G16B16A16_FLOAT, init_vxgi_mips - 1u);
+    current_vxgi_dim_ = init_vxgi_dim;
     // Hi-Z pyramid for the SSR trace. Level 0 is half resolution and each later
     // level halves again, storing the nearest linear depth per tile.
     for (int level = 0; level < 4; ++level) {
@@ -406,6 +416,21 @@ void Renderer::ensure_shadow_map(int quality) {
     }
 }
 
+void Renderer::ensure_vxgi_volume(int quality) {
+    const std::uint32_t target_dim = (quality >= 3) ? 256u : 128u;
+    const std::uint32_t target_mips = (target_dim == 256u) ? 9u : 8u;
+    const VolumeTarget* existing = targets_.get_volume("VxgiVolume");
+    if (existing == nullptr || current_vxgi_dim_ != target_dim) {
+        targets_.create_volume(context_.device.Get(), "VxgiVolume", target_dim, target_dim, target_dim,
+                               DXGI_FORMAT_R32_UINT, 1);
+        targets_.create_volume(context_.device.Get(), "VxgiRadiance", target_dim, target_dim, target_dim,
+                               DXGI_FORMAT_R16G16B16A16_FLOAT, target_mips);
+        targets_.create_volume(context_.device.Get(), "VxgiScratch", target_dim / 2u, target_dim / 2u, target_dim / 2u,
+                               DXGI_FORMAT_R16G16B16A16_FLOAT, target_mips - 1u);
+        current_vxgi_dim_ = target_dim;
+    }
+}
+
 void Renderer::reload_shaders() {
     shaders_.reload();
 }
@@ -418,13 +443,14 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     resize(view.width, view.height);
     ensure_targets(width_, height_);
     ensure_shadow_map(settings.shadows.quality);
+    ensure_vxgi_volume(settings.gi.quality);
     ensure_sky_capture(settings);
     ensure_ibl_environment(settings);
     update_frame_constants(settings, view, !view.show_tonemap);
     update_shadow_constants(settings, view);
     update_sky_constants(settings, view);
     update_ibl_constants(settings);
-    update_ao_ssr_gi_constants(settings);
+    update_ao_ssr_gi_constants(settings, view);
     draw_shadow_cascades(settings, view);
     draw_sky_visibility(settings, view);
     draw_sun_transmittance(settings, view);
@@ -442,7 +468,9 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
         draw_sky_prefilter(settings, view);
         draw_sky_sh(settings);
     }
+    current_camera_pos_ = view.camera_position;
     update_frame_constants(settings, view, !view.show_tonemap);
+    update_ao_ssr_gi_constants(settings, view);
     draw_geometry(view);
     draw_shadow_mask(settings, view);
     draw_shadow_blur(settings, view);
@@ -450,7 +478,7 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     // skipped whenever lighting is off.
     if (view.show_lighting) {
         if (settings.gi.enable > 0) {
-            draw_gi(settings);
+            draw_gi(settings, view);
             draw_gi_filter(settings);
         }
         if (settings.ao.quality > 0) {
@@ -464,8 +492,6 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
             draw_ssr_resolve(settings);
         }
     }
-    ID3D11ShaderResourceView* null_half[5] = {};
-    context_.context->PSSetShaderResources(20, 5, null_half);
     draw_sky_background(settings, view);
     draw_lighting(settings, view);
     draw_transparent(view);
@@ -588,7 +614,7 @@ std::vector<ShaderDefine> Renderer::ao_ssr_gi_defines(const GraphicsSettings& se
     const int ao_type = std::clamp(settings.ao.type, 0, 2);
     const int ao_quality = std::clamp(settings.ao.quality, 0, 6);
     const int ssr_quality = std::clamp(settings.ssr.quality, 0, 4);
-    const int gi_enable = std::clamp(settings.gi.enable, 0, 4);
+    const int gi_enable = std::clamp(settings.gi.enable, 0, 5);
     const int gi_quality = std::clamp(settings.gi.quality, 1, 4);
 
     std::vector<ShaderDefine> defines;
@@ -1177,11 +1203,13 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
     const Target* ao_blur = targets_.get("AoBlur");
     const Target* ssr_color = targets_.get("SsrColor");
     const Target* gi_filtered = targets_.get("GiFiltered");
-    ID3D11ShaderResourceView* phase5[3] = {
+    const VolumeTarget* vxgi_rad = targets_.get_volume("VxgiRadiance");
+    ID3D11ShaderResourceView* phase5[4] = {
         ao_blur != nullptr ? ao_blur->srv.Get() : nullptr,
         ssr_color != nullptr ? ssr_color->srv.Get() : nullptr,
-        gi_filtered != nullptr ? gi_filtered->srv.Get() : nullptr};
-    context_.context->PSSetShaderResources(20, 3, phase5);
+        gi_filtered != nullptr ? gi_filtered->srv.Get() : nullptr,
+        (vxgi_rad != nullptr) ? vxgi_rad->srv.Get() : nullptr};
+    context_.context->PSSetShaderResources(20, 4, phase5);
     bind_shadow_constants();
     bind_sky_constants();
     bind_ibl_constants();
@@ -1606,6 +1634,7 @@ void Renderer::bind_shadow_constants() {
     ID3D11Buffer* buffers[] = {shadow_buffer_.Get()};
     context_.context->VSSetConstantBuffers(2, 1, buffers);
     context_.context->PSSetConstantBuffers(2, 1, buffers);
+    context_.context->CSSetConstantBuffers(2, 1, buffers);
 }
 
 SkyConstants Renderer::build_sky_constants(const GraphicsSettings& settings,
@@ -1657,6 +1686,7 @@ void Renderer::bind_sky_constants() {
     }
     ID3D11Buffer* buffers[] = {sky_buffer_.Get()};
     context_.context->PSSetConstantBuffers(4, 1, buffers);
+    context_.context->CSSetConstantBuffers(4, 1, buffers);
 }
 
 void Renderer::update_ibl_constants(const GraphicsSettings& settings) {
@@ -1689,6 +1719,18 @@ void Renderer::bind_ibl_constants() {
     context_.context->PSSetConstantBuffers(5, 1, buffers);
 }
 
+void Renderer::update_ao_ssr_gi_constants(const GraphicsSettings& settings, const FrameView& view) {
+    current_camera_pos_ = view.camera_position;
+    const float fx = view.inverse_view.m[2][0];
+    const float fy = view.inverse_view.m[2][1];
+    const float fz = view.inverse_view.m[2][2];
+    const Vec3 fwd(fx, fy, fz);
+    current_camera_forward_ = fwd.length_squared() > 1.0e-6f ? fwd.normalize() : Vec3(0.0f, 0.0f, 1.0f);
+    current_scene_center_ = view.scene_center;
+    current_scene_extent_ = view.scene_extent > 1.0f ? view.scene_extent : 64.0f;
+    update_ao_ssr_gi_constants(settings);
+}
+
 void Renderer::update_ao_ssr_gi_constants(const GraphicsSettings& settings) {
     if (ao_ssr_gi_buffer_ == nullptr) {
         return;
@@ -1696,7 +1738,7 @@ void Renderer::update_ao_ssr_gi_constants(const GraphicsSettings& settings) {
     const int ao_type = std::clamp(settings.ao.type, 0, 2);
     const int ao_quality = std::clamp(settings.ao.quality, 0, 6);
     const int ssr_quality = std::clamp(settings.ssr.quality, 0, 4);
-    const int gi_enable = std::clamp(settings.gi.enable, 0, 4);
+    const int gi_enable = std::clamp(settings.gi.enable, 0, 5);
     const int gi_quality = std::clamp(settings.gi.quality, 1, 4);
 
     AoSsrGiConstants constants;
@@ -1728,6 +1770,20 @@ void Renderer::update_ao_ssr_gi_constants(const GraphicsSettings& settings) {
                             settings.gi.specular_gi ? 1.0f : 0.0f,
                             settings.gi.filter_sensitivity};
 
+    const float kExtent = current_scene_extent_ > 1.0f ? current_scene_extent_ : 64.0f;
+    const float kGridDim = (settings.gi.quality >= 3) ? 256.0f : 128.0f;
+    const float voxel_size = (kExtent * 2.0f) / kGridDim;
+    const float snap = voxel_size * 2.0f;
+    // The voxel grid is anchored in world space to the scene center and extent,
+    // ensuring off-screen geometry (walls behind the camera, surrounding rooms, props)
+    // is permanently voxelized and bounces indirect light regardless of camera position/distance.
+    float cx = std::floor(current_scene_center_.x / snap) * snap;
+    float cy = std::floor(current_scene_center_.y / snap) * snap;
+    float cz = std::floor(current_scene_center_.z / snap) * snap;
+    constants.vxgi_params0 = {cx, cy, cz, kExtent};
+    constants.vxgi_params1 = {voxel_size, 1.0f / (kExtent * 2.0f), kGridDim,
+                              static_cast<float>(gi_ray_count(gi_enable, gi_quality))};
+
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context_.context->Map(ao_ssr_gi_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
                                      &mapped))) {
@@ -1742,6 +1798,7 @@ void Renderer::bind_ao_ssr_gi_constants() {
         return;
     }
     ID3D11Buffer* buffers[] = {ao_ssr_gi_buffer_.Get()};
+    context_.context->VSSetConstantBuffers(6, 1, buffers);
     context_.context->PSSetConstantBuffers(6, 1, buffers);
     context_.context->CSSetConstantBuffers(6, 1, buffers);
 }
@@ -1970,7 +2027,195 @@ void Renderer::draw_ssr_resolve(const GraphicsSettings& settings) {
     context_.context->PSSetShaderResources(24, 1, &null_srv);
 }
 
+void Renderer::draw_vxgi(const GraphicsSettings& settings, const FrameView& view) {
+    (void)view;
+    const VolumeTarget* volume = targets_.get_volume("VxgiVolume");
+    const VolumeTarget* radiance = targets_.get_volume("VxgiRadiance");
+    const VolumeTarget* scratch = targets_.get_volume("VxgiScratch");
+    const Target* raw = targets_.get("GiRaw");
+    const Target* gb0 = targets_.get("GB0");
+    const Target* gb1 = targets_.get("GB1");
+    const Target* gb4 = targets_.get("GB4");
+    const Target* shadow_mask = targets_.get("ShadowMask");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+
+    if (volume == nullptr || radiance == nullptr || scratch == nullptr ||
+        raw == nullptr || raw->uav == nullptr || gb0 == nullptr || gb1 == nullptr ||
+        depth == nullptr) {
+        return;
+    }
+
+    const auto defines = ao_ssr_gi_defines(settings);
+    ID3D11UnorderedAccessView* null_uav = nullptr;
+    ID3D11ShaderResourceView* null_srv = nullptr;
+
+    context_.context->OMSetRenderTargets(0, nullptr, nullptr);
+    auto* linear = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    ID3D11SamplerState* samplers[2] = {linear, point};
+    context_.context->CSSetSamplers(0, 2, samplers);
+    bind_frame_constants();
+    bind_shadow_constants();
+    bind_sky_constants();
+    bind_ao_ssr_gi_constants();
+
+    // 1. Clear VxgiVolume
+    const ComputeProgram& clear_cs =
+        shaders_.get_compute("vxgi_clear_cs", kShaderSource, "VxgiClearCS", defines);
+    ID3D11UnorderedAccessView* vol_uav = volume->uav.Get();
+    const std::uint32_t dim = volume->width;
+    const std::uint32_t group_dim = (dim + 3u) / 4u;
+    context_.context->CSSetUnorderedAccessViews(0, 1, &vol_uav, nullptr);
+    context_.context->CSSetShader(clear_cs.compute.Get(), nullptr, 0);
+    context_.context->Dispatch(group_dim, group_dim, group_dim);
+    context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+
+    // 2. Off-screen 3D Scene Voxelization:
+    // Rasterize all scene geometry (whether on-screen, off-screen, or behind the camera)
+    // from 3 orthographic axes (XY, YZ, XZ) directly into VxgiVolumeUav.
+    const std::vector<DrawItem>& items = view.vxgi_casters.empty() ? view.opaque : view.vxgi_casters;
+    if (!items.empty()) {
+        const D3D11_INPUT_ELEMENT_DESC layout[] = {
+            {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"BLENDINDICES", 0, DXGI_FORMAT_R32G32B32A32_UINT, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
+            {"BLENDWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        };
+        const std::vector<D3D11_INPUT_ELEMENT_DESC> layout_vector(std::begin(layout), std::end(layout));
+
+        context_.set_viewport(static_cast<float>(dim), static_cast<float>(dim));
+        context_.context->RSSetState(
+            context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+        context_.context->OMSetDepthStencilState(
+            context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+        context_.context->OMSetBlendState(
+            context_.state_manager->get_blend(core::BlendPreset::Opaque), nullptr, 0xFFFFFFFF);
+        auto* linear_wrap = context_.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
+        context_.context->PSSetSamplers(0, 1, &linear_wrap);
+
+        ID3D11UnorderedAccessView* uavs[1] = {vol_uav};
+        context_.context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 1, uavs, nullptr);
+        context_.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        bind_frame_constants();
+        bind_sky_constants();
+        bind_ao_ssr_gi_constants();
+
+        for (int axis = 0; axis < 3; ++axis) {
+            std::vector<ShaderDefine> axis_defines = defines;
+            axis_defines.push_back({"VOXELIZE_AXIS", std::to_string(axis)});
+            const ShaderProgram& prog = shaders_.get("voxelize_" + std::to_string(axis), kShaderSource,
+                                                     "VoxelizeVS", "VoxelizePS", axis_defines, &layout_vector);
+            context_.context->IASetInputLayout(prog.input_layout.Get());
+            context_.context->VSSetShader(prog.vertex.Get(), nullptr, 0);
+            context_.context->PSSetShader(prog.pixel.Get(), nullptr, 0);
+
+            for (const DrawItem& item : items) {
+                draw_item(item, false);
+            }
+        }
+        context_.context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 1, &null_uav, nullptr);
+    }
+
+    // 3. Inject G-Buffer into VxgiVolume
+    const ComputeProgram& inject_cs =
+        shaders_.get_compute("vxgi_inject_gbuffer_cs", kShaderSource, "VxgiInjectGBufferCS", defines);
+    ID3D11ShaderResourceView* inject_gb0 = gb0->srv.Get();
+    ID3D11ShaderResourceView* inject_gb1 = gb1->srv.Get();
+    ID3D11ShaderResourceView* inject_gb4 = gb4 ? gb4->srv.Get() : nullptr;
+    ID3D11ShaderResourceView* inject_depth = depth->srv.Get();
+    ID3D11ShaderResourceView* inject_shadow = shadow_mask ? shadow_mask->srv.Get() : nullptr;
+
+    context_.context->CSSetShaderResources(0, 1, &inject_gb0);
+    context_.context->CSSetShaderResources(1, 1, &inject_gb1);
+    context_.context->CSSetShaderResources(4, 1, &inject_gb4);
+    context_.context->CSSetShaderResources(5, 1, &inject_depth);
+    context_.context->CSSetShaderResources(10, 1, &inject_shadow);
+
+    context_.context->CSSetUnorderedAccessViews(0, 1, &vol_uav, nullptr);
+    context_.context->CSSetShader(inject_cs.compute.Get(), nullptr, 0);
+    context_.context->Dispatch((gb0->width + 7u) / 8u, (gb0->height + 7u) / 8u, 1u);
+    context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+
+    ID3D11ShaderResourceView* clear_srvs[16] = {};
+    context_.context->CSSetShaderResources(0, 16, clear_srvs);
+
+    // 4. Unpack VxgiVolume into VxgiRadiance Mip 0
+    const ComputeProgram& unpack_cs =
+        shaders_.get_compute("vxgi_unpack_cs", kShaderSource, "VxgiUnpackCS", defines);
+    ID3D11ShaderResourceView* vol_srv = volume->srv.Get();
+    ID3D11UnorderedAccessView* rad_mip0_uav = radiance->mip_uavs[0].Get();
+    context_.context->CSSetShaderResources(24, 1, &vol_srv);
+    context_.context->CSSetUnorderedAccessViews(0, 1, &rad_mip0_uav, nullptr);
+    context_.context->CSSetShader(unpack_cs.compute.Get(), nullptr, 0);
+    context_.context->Dispatch(group_dim, group_dim, group_dim);
+    context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+    context_.context->CSSetShaderResources(24, 1, &null_srv);
+
+    // 5. Downsample Mips 1..radiance->mip_levels - 1
+    const ComputeProgram& downsample_cs =
+        shaders_.get_compute("vxgi_downsample_cs", kShaderSource, "VxgiDownsampleCS", defines);
+    context_.context->CSSetShader(downsample_cs.compute.Get(), nullptr, 0);
+
+    for (std::uint32_t level = 1u; level < radiance->mip_levels; ++level) {
+        const std::uint32_t dst_dim = std::max(dim >> level, 1u);
+        const std::uint32_t gx = (dst_dim + 3u) / 4u;
+
+        ID3D11ShaderResourceView* src_srv = (level == 1u)
+            ? radiance->mip_srvs[0].Get()
+            : scratch->mip_srvs[level - 2u].Get();
+        ID3D11UnorderedAccessView* dst_uav = scratch->mip_uavs[level - 1u].Get();
+
+        context_.context->CSSetShaderResources(25, 1, &src_srv);
+        context_.context->CSSetUnorderedAccessViews(0, 1, &dst_uav, nullptr);
+        context_.context->Dispatch(gx, gx, gx);
+        context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+        context_.context->CSSetShaderResources(25, 1, &null_srv);
+
+        D3D11_BOX src_box{0, 0, 0, dst_dim, dst_dim, dst_dim};
+        context_.context->CopySubresourceRegion(
+            radiance->texture.Get(), level, 0, 0, 0,
+            scratch->texture.Get(), level - 1u, &src_box);
+    }
+
+    // 5. Voxel Cone Tracing into GiRaw
+    const ComputeProgram& cone_cs =
+        shaders_.get_compute("vxgi_cone_trace_cs", kShaderSource, "VxgiConeTraceCS", defines);
+
+    ID3D11ShaderResourceView* rad_all_srv = radiance->srv.Get();
+    context_.context->CSSetShaderResources(0, 1, &inject_gb0);
+    context_.context->CSSetShaderResources(1, 1, &inject_gb1);
+    context_.context->CSSetShaderResources(4, 1, &inject_gb4);
+    context_.context->CSSetShaderResources(5, 1, &inject_depth);
+    context_.context->CSSetShaderResources(25, 1, &rad_all_srv);
+    if (sky_sh_srv_ != nullptr) {
+        ID3D11ShaderResourceView* sh_srv = sky_sh_srv_.Get();
+        context_.context->CSSetShaderResources(16, 1, &sh_srv);
+    }
+
+    ID3D11UnorderedAccessView* raw_uav = raw->uav.Get();
+    context_.context->CSSetUnorderedAccessViews(0, 1, &raw_uav, nullptr);
+    context_.context->CSSetShader(cone_cs.compute.Get(), nullptr, 0);
+    context_.context->Dispatch((raw->width + 7u) / 8u, (raw->height + 7u) / 8u, 1u);
+    context_.context->CSSetShader(nullptr, nullptr, 0);
+    context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+
+    ID3D11ShaderResourceView* clean_all[27] = {};
+    context_.context->CSSetShaderResources(0, 27, clean_all);
+}
+
 void Renderer::draw_gi(const GraphicsSettings& settings) {
+    FrameView dummy_view;
+    dummy_view.camera_position = current_camera_pos_;
+    draw_gi(settings, dummy_view);
+}
+
+void Renderer::draw_gi(const GraphicsSettings& settings, const FrameView& view) {
+    if (settings.gi.enable == 5) {
+        draw_vxgi(settings, view);
+        return;
+    }
     const Target* raw = targets_.get("GiRaw");
     const Target* history = targets_.get("GiFiltered");
     const Target* gb0 = targets_.get("GB0");
@@ -1992,6 +2237,8 @@ void Renderer::draw_gi(const GraphicsSettings& settings) {
     ID3D11SamplerState* samplers[2] = {linear, point};
     context_.context->CSSetSamplers(0, 2, samplers);
     bind_frame_constants();
+    bind_shadow_constants();
+    bind_sky_constants();
     bind_ao_ssr_gi_constants();
 
     ID3D11ShaderResourceView* resources[6] = {gb0->srv.Get(), gb1->srv.Get(), gb3->srv.Get(),
@@ -2119,6 +2366,8 @@ void Renderer::draw_gi_filter(const GraphicsSettings& settings) {
     ID3D11SamplerState* samplers[2] = {linear, point};
     context_.context->CSSetSamplers(0, 2, samplers);
     bind_frame_constants();
+    bind_shadow_constants();
+    bind_sky_constants();
     bind_ao_ssr_gi_constants();
 
     ID3D11ShaderResourceView* gb1_srv = gb1->srv.Get();

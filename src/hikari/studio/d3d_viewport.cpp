@@ -3509,10 +3509,23 @@ void D3DViewport::render_scene_native() {
         render::Frustum::from_view_projection(camera_.view_projection_matrix());
     culled_models_ = 0;
     culled_subsets_ = 0;
+    Vec3 scene_bounds_min(1.0e9f, 1.0e9f, 1.0e9f);
+    Vec3 scene_bounds_max(-1.0e9f, -1.0e9f, -1.0e9f);
+    bool has_scene_bounds = false;
     for (const auto& model : models_) {
         if (!model->visible || model->mesh.subsets.empty()) {
             continue;
         }
+        const Vec3 c = model->model_point(model->bounds_center());
+        const float r = model->bounds_radius() * model->scale;
+        scene_bounds_min.x = std::min(scene_bounds_min.x, c.x - r);
+        scene_bounds_min.y = std::min(scene_bounds_min.y, c.y - r);
+        scene_bounds_min.z = std::min(scene_bounds_min.z, c.z - r);
+        scene_bounds_max.x = std::max(scene_bounds_max.x, c.x + r);
+        scene_bounds_max.y = std::max(scene_bounds_max.y, c.y + r);
+        scene_bounds_max.z = std::max(scene_bounds_max.z, c.z + r);
+        has_scene_bounds = true;
+
         render_palette_.resize(model->skeleton.skinning_palette.size());
         const Mat4 model_transform = model->model_matrix();
         for (std::size_t i = 0; i < render_palette_.size(); ++i) {
@@ -3556,13 +3569,27 @@ void D3DViewport::render_scene_native() {
                     draw.depth = (center - camera_.position).dot(view_forward);
                     view.transparent.push_back(draw);
                 }
+                if (subset.material_index < model->materials.size() &&
+                    model->materials[subset.material_index].constants.diffuse[3] > 0.15f) {
+                    view.vxgi_casters.push_back(draw);
+                }
             } else {
                 if (subset_in_camera) {
                     view.opaque.push_back(draw);
                 }
                 view.shadow_casters.push_back(draw);
+                view.vxgi_casters.push_back(draw);
             }
         }
+    }
+    if (has_scene_bounds) {
+        view.scene_center = (scene_bounds_min + scene_bounds_max) * 0.5f;
+        const Vec3 half_extent = (scene_bounds_max - scene_bounds_min) * 0.5f;
+        const float max_half = std::max({half_extent.x, half_extent.y, half_extent.z});
+        view.scene_extent = std::max(max_half * 1.05f, 16.0f);
+    } else {
+        view.scene_center = Vec3(0.0f, 8.0f, 0.0f);
+        view.scene_extent = 32.0f;
     }
     std::stable_sort(view.transparent.begin(), view.transparent.end(),
                      [](const gfx::DrawItem& a, const gfx::DrawItem& b) {

@@ -33,6 +33,19 @@ struct DepthTarget {
     std::uint32_t height = 0;
 };
 
+struct VolumeTarget {
+    Microsoft::WRL::ComPtr<ID3D11Texture3D> texture;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> uav;
+    std::vector<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>> mip_uavs;
+    std::vector<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> mip_srvs;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t depth = 0;
+    std::uint32_t mip_levels = 1;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
 class TargetPool {
 public:
     void create_target(ID3D11Device* device, const std::string& name, std::uint32_t width,
@@ -45,15 +58,20 @@ public:
                       std::uint32_t height);
     void create_array_depth(ID3D11Device* device, const std::string& name, std::uint32_t width,
                             std::uint32_t height, std::uint32_t array_size);
+    void create_volume(ID3D11Device* device, const std::string& name, std::uint32_t width,
+                       std::uint32_t height, std::uint32_t depth, DXGI_FORMAT format,
+                       std::uint32_t mip_levels = 1);
 
     const Target* get(const std::string& name) const;
     const DepthTarget* get_depth(const std::string& name) const;
+    const VolumeTarget* get_volume(const std::string& name) const;
     bool has(const std::string& name) const;
     void clear();
 
 private:
     std::unordered_map<std::string, Target> targets_;
     std::unordered_map<std::string, DepthTarget> depths_;
+    std::unordered_map<std::string, VolumeTarget> volumes_;
 };
 
 } // namespace hikari::gfx

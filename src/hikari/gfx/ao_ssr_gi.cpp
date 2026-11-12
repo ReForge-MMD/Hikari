@@ -61,6 +61,10 @@ int gi_ray_count(int enable, int quality) {
     if (enable <= 0) {
         return 0;
     }
+    if (enable == 5) {
+        static const int kCones[] = {5, 5, 9, 9};
+        return kCones[std::clamp(quality, 1, 4) - 1];
+    }
     // SSGI stays in the 4 to 16 ray range the phase plan budgets for. SSPT
     // spends the same ray budget on longer paths instead of more rays.
     static const int kRays[] = {4, 8, 12, 16};
@@ -70,6 +74,10 @@ int gi_ray_count(int enable, int quality) {
 int gi_step_count(int enable, int quality) {
     if (enable <= 0) {
         return 0;
+    }
+    if (enable == 5) {
+        static const int kConeSteps[] = {24, 32, 48, 64};
+        return kConeSteps[std::clamp(quality, 1, 4) - 1];
     }
     static const int kSsgi[] = {12, 13, 14, 16};
     static const int kSspt[] = {12, 16, 24, 32};

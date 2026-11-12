@@ -64,6 +64,9 @@ struct FrameView {
     std::vector<DrawItem> opaque;
     std::vector<DrawItem> transparent;
     std::vector<DrawItem> shadow_casters;
+    std::vector<DrawItem> vxgi_casters;
+    Vec3 scene_center{0.0f, 8.0f, 0.0f};
+    float scene_extent = 64.0f;
     // Stable storage for DrawItem::material_override pointers, indexed by
     // material index so one override applies to every subset of a material.
     std::vector<MaterialConstants> material_overrides;
@@ -127,6 +130,8 @@ struct AoSsrGiConstants {
     std::array<float, 4> gi_params0{};  // enable, ray count, steps, filter radius
     std::array<float, 4> gi_params1{};  // prefilter radius, sample radius, thickness, bounce
     std::array<float, 4> gi_params2{};  // il amount, ao amount, specular gi, sensitivity
+    std::array<float, 4> vxgi_params0{}; // center.x, center.y, center.z, extent
+    std::array<float, 4> vxgi_params1{}; // voxel_size, inv_range, grid_dim, num_cones
 };
 
 struct ShadowDrawConstants {
@@ -190,7 +195,10 @@ private:
     void draw_ssr_blur(const GraphicsSettings& settings);
     void draw_ssr_resolve(const GraphicsSettings& settings);
     void draw_gi(const GraphicsSettings& settings);
+    void draw_gi(const GraphicsSettings& settings, const FrameView& view);
+    void draw_vxgi(const GraphicsSettings& settings, const FrameView& view);
     void draw_gi_filter(const GraphicsSettings& settings);
+    void update_ao_ssr_gi_constants(const GraphicsSettings& settings, const FrameView& view);
     void update_ao_ssr_gi_constants(const GraphicsSettings& settings);
     void bind_ao_ssr_gi_constants();
     void bind_half_res_state();
@@ -221,6 +229,7 @@ private:
     void bind_sky_samplers();
     void ensure_sky_textures();
     void ensure_shadow_map(int quality);
+    void ensure_vxgi_volume(int quality);
     std::vector<ShaderDefine> shadow_defines(const GraphicsSettings& settings) const;
 
     core::D3D11Context& context_;
@@ -232,6 +241,7 @@ private:
     std::array<std::array<float, 4>, 4> prev_view_projection_{};
     bool has_prev_view_projection_ = false;
     std::uint32_t current_shadow_res_ = 0;
+    std::uint32_t current_vxgi_dim_ = 0;
     std::uint32_t sky_capture_size_ = 0;
     SkyConstants sky_capture_state_{};
     Vec3 sky_capture_sun_{};
@@ -245,6 +255,10 @@ private:
     IblImage ibl_cubemap_;
     std::uint32_t ibl_target_size_ = 0;
     bool ibl_custom_active_ = false;
+    Vec3 current_camera_pos_{0.0f, 0.0f, -10.0f};
+    Vec3 current_camera_forward_{0.0f, 0.0f, 1.0f};
+    Vec3 current_scene_center_{0.0f, 8.0f, 0.0f};
+    float current_scene_extent_ = 64.0f;
 
     Microsoft::WRL::ComPtr<ID3D11Buffer> frame_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> material_buffer_;

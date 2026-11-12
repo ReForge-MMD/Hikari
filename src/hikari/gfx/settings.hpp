@@ -50,6 +50,7 @@ enum class DebugView : std::uint8_t {
     SsrRadiance = 20,
     SsrConfidence = 21,
     GiRadiance = 22,
+    VxgiVoxels = 23,
 };
 
 struct SunSettings {

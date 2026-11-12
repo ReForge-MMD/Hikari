@@ -130,7 +130,7 @@ void print_help() {
         << "  --ao-quality <n>   AO quality, 0 disables (default 6).\n"
         << "  --ssr-quality <n>  SSR quality, 0 disables (default 4).\n"
         << "  --ssr-debug-mode <n> SSR trace debug output, 0 to 4.\n"
-        << "  --gi <n>           GI mode (0=off, 1=SSGI, 2=SSGI+, 3=SSPT).\n"
+        << "  --gi <n>           GI mode (0=off, 1=SSGI, 2=SSGI+, 3=SSPT, 4=SSRC, 5=VXGI).\n"
         << "  --gi-quality <n>   GI quality, 1 to 4.\n"
         << "  --expect-mean-min <v> Fail unless the capture mean is at least v (0..1).\n"
         << "  --expect-mean-max <v> Fail unless the capture mean is at most v (0..1).\n"
@@ -298,6 +298,12 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
         settings.gi.enable = 0;
     }
     if (options.phase == 5) {
+        settings.shadows.quality = 2;
+        settings.shadows.pcss = true;
+        settings.shadows.blur = true;
+        settings.shadows.contact_quality = 3;
+        settings.shadows.ssgs_quality = 3;
+        settings.ao.sky_visibility = 1;
         settings.ao.type = 2;
         settings.ao.quality = 6;
         settings.ao.radius = 1.5f;
@@ -347,7 +353,7 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
     if (options.moon_intensity >= 0.0f) {
         settings.sky.moon_intensity = options.moon_intensity;
     }
-    if (options.debug >= 0 && options.debug <= 22) {
+    if (options.debug >= 0 && options.debug <= 23) {
         settings.debug.view = static_cast<hikari::gfx::DebugView>(options.debug);
     }
     settings.validate();
@@ -491,6 +497,8 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
     if (!scene.material_overrides.empty()) {
         view.material_overrides = scene.material_overrides;
     }
+    view.scene_center = scene.center();
+    view.scene_extent = std::max(scene.radius() * 1.05f, 16.0f);
     for (std::size_t i = 0; i < scene.mesh.subsets.size(); ++i) {
         const hikari::render::MeshSubset& subset = scene.mesh.subsets[i];
         hikari::gfx::DrawItem item;
@@ -510,6 +518,7 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
             view.transparent.push_back(item);
         } else {
             view.opaque.push_back(item);
+            view.vxgi_casters.push_back(item);
         }
     }
     std::stable_sort(view.transparent.begin(), view.transparent.end(),

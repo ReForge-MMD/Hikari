@@ -213,6 +213,93 @@ void TargetPool::create_array_depth(ID3D11Device* device, const std::string& nam
     depths_[name] = std::move(target);
 }
 
+void TargetPool::create_volume(ID3D11Device* device, const std::string& name,
+                               std::uint32_t width, std::uint32_t height,
+                               std::uint32_t depth, DXGI_FORMAT format,
+                               std::uint32_t mip_levels) {
+    if (device == nullptr || width == 0 || height == 0 || depth == 0) {
+        throw std::runtime_error("invalid volume target description: " + name);
+    }
+    std::uint32_t max_dim = std::max({width, height, depth});
+    std::uint32_t available = 1;
+    for (std::uint32_t s = max_dim; s > 1; s >>= 1) {
+        ++available;
+    }
+    mip_levels = std::clamp(mip_levels, 1u, available);
+
+    VolumeTarget target;
+    target.width = width;
+    target.height = height;
+    target.depth = depth;
+    target.mip_levels = mip_levels;
+    target.format = format;
+
+    D3D11_TEXTURE3D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.Depth = depth;
+    desc.MipLevels = mip_levels;
+    desc.Format = format;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+    if (FAILED(device->CreateTexture3D(&desc, nullptr, target.texture.GetAddressOf()))) {
+        throw std::runtime_error("CreateTexture3D failed: " + name);
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+    srv_desc.Texture3D.MostDetailedMip = 0;
+    srv_desc.Texture3D.MipLevels = mip_levels;
+    if (FAILED(device->CreateShaderResourceView(target.texture.Get(), &srv_desc,
+                                                target.srv.GetAddressOf()))) {
+        throw std::runtime_error("CreateShaderResourceView volume failed: " + name);
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.Format = format;
+    uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
+    uav_desc.Texture3D.MipSlice = 0;
+    uav_desc.Texture3D.FirstWSlice = 0;
+    uav_desc.Texture3D.WSize = depth;
+    if (FAILED(device->CreateUnorderedAccessView(target.texture.Get(), &uav_desc,
+                                                target.uav.GetAddressOf()))) {
+        throw std::runtime_error("CreateUnorderedAccessView volume failed: " + name);
+    }
+
+    target.mip_uavs.resize(mip_levels);
+    target.mip_srvs.resize(mip_levels);
+    target.mip_uavs[0] = target.uav;
+
+    for (std::uint32_t mip = 0; mip < mip_levels; ++mip) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC msrv{};
+        msrv.Format = format;
+        msrv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
+        msrv.Texture3D.MostDetailedMip = mip;
+        msrv.Texture3D.MipLevels = 1;
+        if (FAILED(device->CreateShaderResourceView(target.texture.Get(), &msrv,
+                                                    target.mip_srvs[mip].GetAddressOf()))) {
+            throw std::runtime_error("CreateShaderResourceView volume mip failed: " + name);
+        }
+
+        if (mip > 0) {
+            D3D11_UNORDERED_ACCESS_VIEW_DESC muav{};
+            muav.Format = format;
+            muav.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE3D;
+            muav.Texture3D.MipSlice = mip;
+            muav.Texture3D.FirstWSlice = 0;
+            muav.Texture3D.WSize = std::max(1u, depth >> mip);
+            if (FAILED(device->CreateUnorderedAccessView(target.texture.Get(), &muav,
+                                                        target.mip_uavs[mip].GetAddressOf()))) {
+                throw std::runtime_error("CreateUnorderedAccessView volume mip failed: " + name);
+            }
+        }
+    }
+
+    volumes_[name] = std::move(target);
+}
+
 const Target* TargetPool::get(const std::string& name) const {
     const auto it = targets_.find(name);
     return it == targets_.end() ? nullptr : &it->second;
@@ -223,13 +310,20 @@ const DepthTarget* TargetPool::get_depth(const std::string& name) const {
     return it == depths_.end() ? nullptr : &it->second;
 }
 
+const VolumeTarget* TargetPool::get_volume(const std::string& name) const {
+    const auto it = volumes_.find(name);
+    return it == volumes_.end() ? nullptr : &it->second;
+}
+
 bool TargetPool::has(const std::string& name) const {
-    return targets_.find(name) != targets_.end() || depths_.find(name) != depths_.end();
+    return targets_.find(name) != targets_.end() || depths_.find(name) != depths_.end() ||
+           volumes_.find(name) != volumes_.end();
 }
 
 void TargetPool::clear() {
     targets_.clear();
     depths_.clear();
+    volumes_.clear();
 }
 
 } // namespace hikari::gfx

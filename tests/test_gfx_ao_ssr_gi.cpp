@@ -64,6 +64,8 @@ TEST_CASE("gi ray and step budgets follow enable and quality") {
     REQUIRE(gfx::gi_ray_count(1, 1) == 4);
     REQUIRE(gfx::gi_ray_count(2, 4) == 16);
     REQUIRE(gfx::gi_ray_count(3, 3) == 12);
+    REQUIRE(gfx::gi_ray_count(5, 1) == 5);
+    REQUIRE(gfx::gi_ray_count(5, 4) == 9);
 
     REQUIRE(gfx::gi_step_count(1, 1) == 12);
     REQUIRE(gfx::gi_step_count(2, 4) == 16);
@@ -71,6 +73,9 @@ TEST_CASE("gi ray and step budgets follow enable and quality") {
     REQUIRE(gfx::gi_step_count(3, 1) == 12);
     REQUIRE(gfx::gi_step_count(3, 4) == 32);
     REQUIRE(gfx::gi_step_count(3, 4) > gfx::gi_step_count(2, 4));
+    // VXGI cone marching steps
+    REQUIRE(gfx::gi_step_count(5, 1) == 24);
+    REQUIRE(gfx::gi_step_count(5, 4) == 64);
 }
 
 TEST_CASE("gi filter taps clamp to the unroll budget") {
@@ -114,7 +119,7 @@ TEST_CASE("gi settings validate into range") {
     settings.gi.bounce_weight = 4.0f;
     settings = validated(settings);
 
-    REQUIRE(settings.gi.enable == 3);
+    REQUIRE(settings.gi.enable == 5);
     REQUIRE(settings.gi.quality == 1);
     REQUIRE(settings.gi.filter_radius == 1);
     REQUIRE(settings.gi.prefilter_radius == 4);
@@ -128,11 +133,13 @@ TEST_CASE("gi settings validate into range") {
 
 TEST_CASE("phase 5 debug views keep their identifiers") {
     using gfx::DebugView;
+    REQUIRE(static_cast<int>(DebugView::Depth) == 7);
     REQUIRE(static_cast<int>(DebugView::Ao) == 18);
     REQUIRE(static_cast<int>(DebugView::AoBentNormal) == 19);
     REQUIRE(static_cast<int>(DebugView::SsrRadiance) == 20);
     REQUIRE(static_cast<int>(DebugView::SsrConfidence) == 21);
     REQUIRE(static_cast<int>(DebugView::GiRadiance) == 22);
+    REQUIRE(static_cast<int>(DebugView::VxgiVoxels) == 23);
 }
 
 TEST_CASE("pmx materials receive ao, ssr, and gi by default") {
