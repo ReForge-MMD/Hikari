@@ -315,6 +315,7 @@ int GraphicsSettings::validate() {
     clamp_float(ao.intensity, 0.0f, 10.0f);
 
     clamp_int(ssr.quality, 0, 4);
+    clamp_int(ssr.debug_mode, 0, 4);
     clamp_int(ssr.glass_refraction, 0, 1);
     clamp_float(ssr.water_surface_y, -10000.0f, 10000.0f);
     clamp_float(ssr.caustics_intensity, 0.0f, 100.0f);
@@ -394,12 +395,16 @@ std::uint64_t GraphicsSettings::permutation_key() const {
     mix(hash, skin.ssss_texspace);
     mix(hash, toon.enable);
     mix(hash, ao.type);
+    mix(hash, ao.quality);
     mix(hash, ao.sky_visibility);
     mix(hash, ssr.quality);
     mix(hash, ssr.debug);
+    mix(hash, ssr.debug_mode);
     mix(hash, ssr.glass_refraction);
     mix(hash, gi.enable);
     mix(hash, gi.quality);
+    mix(hash, gi.filter_radius);
+    mix(hash, gi.prefilter_radius);
     mix(hash, gi.bounces);
     mix(hash, gi.specular_gi);
     mix(hash, bloom.bokeh_mode);
@@ -517,6 +522,7 @@ std::string GraphicsSettings::to_json() const {
     put_float(out, "ao.intensity", ao.intensity, true);
     put_int(out, "ssr.quality", ssr.quality, true);
     put_bool(out, "ssr.debug", ssr.debug, true);
+    put_int(out, "ssr.debug_mode", ssr.debug_mode, true);
     put_int(out, "ssr.glass_refraction", ssr.glass_refraction, true);
     put_bool(out, "ssr.water_caustics", ssr.water_caustics, true);
     put_float(out, "ssr.water_surface_y", ssr.water_surface_y, true);
@@ -683,6 +689,7 @@ bool GraphicsSettings::from_json(const std::string& json) {
     ao.intensity = read_float(values, "ao.intensity", ao.intensity);
     ssr.quality = read_int(values, "ssr.quality", ssr.quality);
     ssr.debug = read_bool(values, "ssr.debug", ssr.debug);
+    ssr.debug_mode = read_int(values, "ssr.debug_mode", ssr.debug_mode);
     ssr.glass_refraction = read_int(values, "ssr.glass_refraction", ssr.glass_refraction);
     ssr.water_caustics = read_bool(values, "ssr.water_caustics", ssr.water_caustics);
     ssr.water_surface_y = read_float(values, "ssr.water_surface_y", ssr.water_surface_y);

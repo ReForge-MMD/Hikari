@@ -28,6 +28,9 @@ struct DrawItem {
     const std::vector<render::GpuMaterial>* materials = nullptr;
     const std::vector<std::optional<render::GpuTexture>>* textures = nullptr;
     const render::GpuSkinningBuffer* skinning = nullptr;
+    // Full native material override, used by scenes that need emissive or
+    // metallic values the PMX material format cannot express.
+    const MaterialConstants* material_override = nullptr;
     std::size_t subset = 0;
     float depth = 0.0f;
 };
@@ -61,6 +64,9 @@ struct FrameView {
     std::vector<DrawItem> opaque;
     std::vector<DrawItem> transparent;
     std::vector<DrawItem> shadow_casters;
+    // Stable storage for DrawItem::material_override pointers, indexed by
+    // material index so one override applies to every subset of a material.
+    std::vector<MaterialConstants> material_overrides;
 };
 
 // Must match FrameParams in shaders/gfx_core.hlsl.
@@ -108,6 +114,18 @@ struct SkyConstants {
 // Must match IblParams in shaders/gfx_core.hlsl.
 struct IblConstants {
     std::array<float, 4> ibl_params0{};  // intensity, last prefilter mip, rotation, sky ambient
+};
+
+// Must match AoSsrGiParams in shaders/gfx_core.hlsl. The quality-to-sample
+// mappings come from ao_ssr_gi.hpp, so the renderer and tests agree.
+struct AoSsrGiConstants {
+    std::array<float, 4> ao_params0{};  // radius, intensity, blur radius, ao type
+    std::array<float, 4> ao_params1{};  // slices, steps, samples, sky visibility
+    std::array<float, 4> ssr_params0{};  // max steps, max distance, thickness, fade start
+    std::array<float, 4> ssr_params1{};  // debug mode, debug enable, step scale, roughness
+    std::array<float, 4> gi_params0{};  // enable, ray count, steps, filter radius
+    std::array<float, 4> gi_params1{};  // prefilter radius, sample radius, thickness, bounce
+    std::array<float, 4> gi_params2{};  // il amount, ao amount, specular gi, sensitivity
 };
 
 struct ShadowDrawConstants {
@@ -162,6 +180,19 @@ private:
     void draw_sky_sh(const GraphicsSettings& settings);
     void draw_sky_background(const GraphicsSettings& settings, const FrameView& view);
     void draw_lighting(const GraphicsSettings& settings, const FrameView& view);
+    // Phase 5 chains. Each helper writes its half-resolution targets and leaves
+    // the shader resource slots unbound for the next pass.
+    void draw_ao(const GraphicsSettings& settings);
+    void draw_ao_blur(const GraphicsSettings& settings);
+    void draw_ssr(const GraphicsSettings& settings);
+    void draw_ssr_depth(const GraphicsSettings& settings);
+    void draw_ssr_blur(const GraphicsSettings& settings);
+    void draw_ssr_resolve(const GraphicsSettings& settings);
+    void draw_gi(const GraphicsSettings& settings);
+    void draw_gi_filter(const GraphicsSettings& settings);
+    void update_ao_ssr_gi_constants(const GraphicsSettings& settings);
+    void bind_ao_ssr_gi_constants();
+    void bind_half_res_state();
     void draw_transparent(const FrameView& view);
     void draw_tonemap(const GraphicsSettings& settings, const FrameView& view,
                       ID3D11RenderTargetView* final_rtv, bool linear);
@@ -170,6 +201,7 @@ private:
     void draw_item(const DrawItem& item, bool transparent);
     std::vector<ShaderDefine> lighting_defines(const GraphicsSettings& settings,
                                                bool linear_tonemap) const;
+    std::vector<ShaderDefine> ao_ssr_gi_defines(const GraphicsSettings& settings) const;
 
     // Shadow pass methods
     void draw_shadow_cascades(const GraphicsSettings& settings, const FrameView& view);
@@ -217,6 +249,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> shadow_draw_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> sky_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> ibl_buffer_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> ao_ssr_gi_buffer_;
     // Nine diffuse irradiance coefficients, three floats each, written by the
     // sky SH compute pass and read by the lighting pass.
     Microsoft::WRL::ComPtr<ID3D11Buffer> sky_sh_buffer_;

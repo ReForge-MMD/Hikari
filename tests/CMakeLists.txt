@@ -4,6 +4,7 @@ add_executable(hikari_tests
   test_effect.cpp
   test_formats.cpp
   test_gfx_frame_graph.cpp
+  test_gfx_ao_ssr_gi.cpp
   test_gfx_ibl.cpp
   test_gfx_material.cpp
   test_gfx_settings.cpp
@@ -92,4 +93,83 @@ if(TARGET hikari_gfx_lab)
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase4_custom_ibl PROPERTIES TIMEOUT 120)
+
+  # Phase 5 goldens. Three frames let the GI feedback equilibrium settle, and
+  # captures go to the build tree so the committed goldens stay inputs.
+  add_test(NAME gfx_phase5_ao
+    COMMAND hikari_gfx_lab
+      --phase 5 --scene phase5 --frames 3 --debug 18
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase5_ao.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase5_ao.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase5_ao.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase5_ao PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase5_reflection
+    COMMAND hikari_gfx_lab
+      --phase 5 --scene phase5 --frames 3
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase5_reflection.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase5_reflection.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase5_reflection.bmp
+      --expect-mean-min 0.24 --expect-mean-max 0.34
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase5_reflection PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase5_reflection_parallax
+    COMMAND hikari_gfx_lab
+      --phase 5 --scene phase5 --frames 3 --camera-azimuth 20
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase5_reflection_parallax.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase5_reflection_parallax.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase5_reflection_parallax.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase5_reflection_parallax PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase5_gi_bleed
+    COMMAND hikari_gfx_lab
+      --phase 5 --scene phase5 --frames 3 --debug 22
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase5_gi_bleed.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase5_gi_bleed.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase5_gi_bleed.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase5_gi_bleed PROPERTIES TIMEOUT 120)
+
+  # GI off must remove the indirect energy instead of merely dimming it.
+  add_test(NAME gfx_phase5_gi_off
+    COMMAND hikari_gfx_lab
+      --phase 5 --scene phase5 --frames 3 --gi 0
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase5_gi_off.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase5_gi_off.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase5_gi_off.bmp
+      --expect-mean-max 0.21
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase5_gi_off PROPERTIES TIMEOUT 120)
+
+  # The confidence view exposes the SSR depth-discontinuity rejection.
+  add_test(NAME gfx_phase5_ssr_edges
+    COMMAND hikari_gfx_lab
+      --phase 5 --scene phase5 --frames 3 --debug 21
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase5_ssr_edges.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase5_ssr_edges.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase5_ssr_edges.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase5_ssr_edges PROPERTIES TIMEOUT 120)
+
+  # One-tap single-bounce SSPT is the noisiest configuration; the prefilter and
+  # denoiser must keep fireflies from dominating the image.
+  add_test(NAME gfx_phase5_firefly
+    COMMAND hikari_gfx_lab
+      --phase 5 --scene phase5 --frames 3 --gi-quality 1
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase5_firefly.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase5_firefly.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase5_firefly.bmp
+      --expect-mean-min 0.22 --expect-mean-max 0.31
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase5_firefly PROPERTIES TIMEOUT 120)
 endif()

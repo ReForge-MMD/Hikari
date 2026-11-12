@@ -14,6 +14,7 @@
 #include <windows.h>
 #endif
 
+#include "hikari/gfx/ao_ssr_gi.hpp"
 #include "hikari/gfx/ibl.hpp"
 #include "hikari/gfx/sky.hpp"
 #include "hikari/gfx/sky_assets.hpp"
@@ -260,6 +261,17 @@ void Renderer::create_buffers() {
     if (FAILED(context_.device->CreateBuffer(&ibl_desc, nullptr, ibl_buffer_.GetAddressOf()))) {
         throw std::runtime_error("CreateBuffer IBL constants failed");
     }
+
+    // AoSsrGiParams buffer (b6)
+    D3D11_BUFFER_DESC ao_desc{};
+    ao_desc.ByteWidth = sizeof(AoSsrGiConstants);
+    ao_desc.Usage = D3D11_USAGE_DYNAMIC;
+    ao_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ao_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(context_.device->CreateBuffer(&ao_desc, nullptr,
+                                             ao_ssr_gi_buffer_.GetAddressOf()))) {
+        throw std::runtime_error("CreateBuffer AO/SSR/GI constants failed");
+    }
 }
 
 void Renderer::build_grid() {
@@ -342,6 +354,31 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
     // Sun transmittance by altitude: one texel per atmosphere sample step.
     targets_.create_target(context_.device.Get(), "SunTransmittance", 64, 1,
                             DXGI_FORMAT_R16G16B16A16_FLOAT);
+    // Phase 5 chains run at half resolution. The lighting pass reconstructs the
+    // full image by sampling these with LinearClamp.
+    const std::uint32_t half_width = std::max(width / 2u, 1u);
+    const std::uint32_t half_height = std::max(height / 2u, 1u);
+    for (const char* name : {"AoRaw", "AoBlurTmp", "AoBlur", "SsrTrace", "SsrBlurTmp",
+                             "SsrBlur0", "SsrBlur1", "SsrColor", "GiRaw", "GiPrefilter",
+                             "GiBlurTmp", "GiFiltered"}) {
+        targets_.create_target(context_.device.Get(), name, half_width, half_height,
+                                DXGI_FORMAT_R16G16B16A16_FLOAT);
+    }
+    // Hi-Z pyramid for the SSR trace. Level 0 is half resolution and each later
+    // level halves again, storing the nearest linear depth per tile.
+    for (int level = 0; level < 4; ++level) {
+        const std::uint32_t divisor = 1u << level;
+        targets_.create_target(context_.device.Get(), "SsrDepth" + std::to_string(level),
+                                std::max(half_width / divisor, 1u),
+                                std::max(half_height / divisor, 1u), DXGI_FORMAT_R32_FLOAT);
+    }
+    // The GI history buffer feeds bounce radiance into the next frame, so it
+    // must not start from uninitialised memory.
+    const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const Target* gi_history = targets_.get("GiFiltered");
+    if (gi_history != nullptr) {
+        context_.context->ClearRenderTargetView(gi_history->rtv.Get(), clear);
+    }
 }
 
 void Renderer::ensure_shadow_map(int quality) {
@@ -374,6 +411,7 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     update_shadow_constants(settings, view);
     update_sky_constants(settings, view);
     update_ibl_constants(settings);
+    update_ao_ssr_gi_constants(settings);
     draw_shadow_cascades(settings, view);
     draw_sky_visibility(settings, view);
     draw_sun_transmittance(settings, view);
@@ -395,6 +433,26 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     draw_geometry(view);
     draw_shadow_mask(settings, view);
     draw_shadow_blur(settings, view);
+    // AO, SSR, and GI only contribute through the lighting pass, so they are
+    // skipped whenever lighting is off.
+    if (view.show_lighting) {
+        if (settings.ao.quality > 0) {
+            draw_ao(settings);
+            draw_ao_blur(settings);
+        }
+        if (settings.ssr.quality > 0) {
+            draw_ssr_depth(settings);
+            draw_ssr(settings);
+            draw_ssr_blur(settings);
+            draw_ssr_resolve(settings);
+        }
+        if (settings.gi.enable > 0) {
+            draw_gi(settings);
+            draw_gi_filter(settings);
+        }
+    }
+    ID3D11ShaderResourceView* null_half[5] = {};
+    context_.context->PSSetShaderResources(20, 5, null_half);
     draw_sky_background(settings, view);
     draw_lighting(settings, view);
     draw_transparent(view);
@@ -500,6 +558,47 @@ std::vector<ShaderDefine> Renderer::lighting_defines(const GraphicsSettings& set
     // Selects the custom environment background, which is a different pixel
     // shader path rather than a parameter, so it belongs in the permutation.
     defines.push_back({"SKY_SOURCE_CUSTOM", ibl_custom_active_ ? "1" : "0"});
+    for (const ShaderDefine& define : ao_ssr_gi_defines(settings)) {
+        defines.push_back(define);
+    }
+    return defines;
+}
+
+std::vector<ShaderDefine> Renderer::ao_ssr_gi_defines(const GraphicsSettings& settings) const {
+    const int ao_type = std::clamp(settings.ao.type, 0, 2);
+    const int ao_quality = std::clamp(settings.ao.quality, 0, 6);
+    const int ssr_quality = std::clamp(settings.ssr.quality, 0, 4);
+    const int gi_enable = std::clamp(settings.gi.enable, 0, 3);
+    const int gi_quality = std::clamp(settings.gi.quality, 1, 4);
+
+    std::vector<ShaderDefine> defines;
+    defines.push_back({"AO_ENABLE", ao_quality > 0 ? "1" : "0"});
+    defines.push_back({"AO_TYPE", std::to_string(ao_type)});
+    defines.push_back({"AO_SAMPLES",
+                       std::to_string(std::max(ao_sample_count(ao_type, ao_quality), 1))});
+    defines.push_back({"AO_SLICES",
+                       std::to_string(std::max(ao_slice_count(ao_type, ao_quality), 1))});
+    defines.push_back({"AO_STEPS",
+                       std::to_string(std::max(ao_step_count(ao_type, ao_quality), 1))});
+    defines.push_back({"AO_BLUR_RADIUS",
+                       std::to_string(std::max(ao_blur_radius(ao_quality), 1))});
+    defines.push_back({"SSR_ENABLE", ssr_quality > 0 ? "1" : "0"});
+    defines.push_back({"SSR_MAX_STEPS",
+                       std::to_string(std::max(ssr_tap_budget(ssr_quality), 4))});
+    defines.push_back({"SSR_DEBUG", settings.ssr.debug ? "1" : "0"});
+    defines.push_back(
+        {"SSR_DEBUG_MODE", std::to_string(std::clamp(settings.ssr.debug_mode, 0, 4))});
+    defines.push_back({"GI_ENABLE", std::to_string(gi_enable)});
+    defines.push_back(
+        {"GI_RAY_COUNT", std::to_string(std::max(gi_ray_count(gi_enable, gi_quality), 1))});
+    defines.push_back(
+        {"GI_STEPS", std::to_string(std::max(gi_step_count(gi_enable, gi_quality), 1))});
+    defines.push_back({"GI_FILTER_RADIUS",
+                       std::to_string(gi_filter_taps(settings.gi.filter_radius))});
+    defines.push_back({"GI_PREFILTER_RADIUS",
+                       std::to_string(std::clamp(settings.gi.prefilter_radius, 1, 3))});
+    defines.push_back({"SSGI_SPECULAR_GI", settings.gi.specular_gi ? "1" : "0"});
+    defines.push_back({"GI_BOUNCES", settings.gi.bounces ? "1" : "0"});
     return defines;
 }
 
@@ -573,7 +672,9 @@ void Renderer::draw_item(const DrawItem& item, bool transparent) {
     const render::MeshSubset& subset = item.mesh->subsets[item.subset];
     MaterialConstants constants;
     ID3D11ShaderResourceView* srv = white_texture_.srv.Get();
-    if (subset.material_index < item.materials->size()) {
+    if (item.material_override != nullptr) {
+        constants = *item.material_override;
+    } else if (subset.material_index < item.materials->size()) {
         const render::GpuMaterial& material = (*item.materials)[subset.material_index];
         constants = material_from_gpu(material.constants);
         if (material.texture_index >= 0 &&
@@ -986,6 +1087,9 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
     }
     ID3D11RenderTargetView* views[] = {hdr->rtv.Get()};
     context_.context->OMSetRenderTargets(1, views, nullptr);
+    // The half-resolution Phase 5 chains leave their own viewport behind, and
+    // the sky background skips its viewport call when sky is disabled.
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
     if (!view.show_lighting) {
         return;
     }
@@ -1048,9 +1152,20 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
             context_.context->PSSetShaderResources(17, 1, &prefilter_srv);
         }
     }
+    // Phase 5 outputs. The shader defines gate the sampling, so the targets stay
+    // bound even when a chain was skipped.
+    const Target* ao_blur = targets_.get("AoBlur");
+    const Target* ssr_color = targets_.get("SsrColor");
+    const Target* gi_filtered = targets_.get("GiFiltered");
+    ID3D11ShaderResourceView* phase5[3] = {
+        ao_blur != nullptr ? ao_blur->srv.Get() : nullptr,
+        ssr_color != nullptr ? ssr_color->srv.Get() : nullptr,
+        gi_filtered != nullptr ? gi_filtered->srv.Get() : nullptr};
+    context_.context->PSSetShaderResources(20, 3, phase5);
     bind_shadow_constants();
     bind_sky_constants();
     bind_ibl_constants();
+    bind_ao_ssr_gi_constants();
 
     auto* sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
     context_.context->PSSetSamplers(0, 1, &sampler);
@@ -1552,6 +1667,367 @@ void Renderer::bind_ibl_constants() {
     }
     ID3D11Buffer* buffers[] = {ibl_buffer_.Get()};
     context_.context->PSSetConstantBuffers(5, 1, buffers);
+}
+
+void Renderer::update_ao_ssr_gi_constants(const GraphicsSettings& settings) {
+    if (ao_ssr_gi_buffer_ == nullptr) {
+        return;
+    }
+    const int ao_type = std::clamp(settings.ao.type, 0, 2);
+    const int ao_quality = std::clamp(settings.ao.quality, 0, 6);
+    const int ssr_quality = std::clamp(settings.ssr.quality, 0, 4);
+    const int gi_enable = std::clamp(settings.gi.enable, 0, 3);
+    const int gi_quality = std::clamp(settings.gi.quality, 1, 4);
+
+    AoSsrGiConstants constants;
+    constants.ao_params0 = {settings.ao.radius, settings.ao.intensity,
+                            static_cast<float>(ao_blur_radius(ao_quality)),
+                            static_cast<float>(ao_type)};
+    constants.ao_params1 = {static_cast<float>(ao_slice_count(ao_type, ao_quality)),
+                            static_cast<float>(ao_step_count(ao_type, ao_quality)),
+                            static_cast<float>(ao_sample_count(ao_type, ao_quality)),
+                            static_cast<float>(settings.ao.sky_visibility)};
+    // The SSR range and thickness are fixed scene-scale defaults: MMD stages and
+    // characters live in the tens of world units, where a one unit thickness is
+    // already generous.
+    constexpr float kSsrMaxDistance = 200.0f;
+    constexpr float kSsrThickness = 1.0f;
+    constexpr float kSsrFadeStart = 0.72f;
+    constants.ssr_params0 = {static_cast<float>(ssr_tap_budget(ssr_quality)), kSsrMaxDistance,
+                             kSsrThickness, kSsrFadeStart};
+    constants.ssr_params1 = {static_cast<float>(std::clamp(settings.ssr.debug_mode, 0, 4)),
+                             settings.ssr.debug ? 1.0f : 0.0f, 1.0f, 0.0f};
+    constants.gi_params0 = {static_cast<float>(gi_enable),
+                            static_cast<float>(gi_ray_count(gi_enable, gi_quality)),
+                            static_cast<float>(gi_step_count(gi_enable, gi_quality)),
+                            static_cast<float>(gi_filter_taps(settings.gi.filter_radius))};
+    constants.gi_params1 = {static_cast<float>(std::clamp(settings.gi.prefilter_radius, 1, 3)),
+                            settings.gi.sample_radius, settings.gi.z_thickness,
+                            settings.gi.bounce_weight};
+    constants.gi_params2 = {settings.gi.il_amount, settings.gi.ao_amount,
+                            settings.gi.specular_gi ? 1.0f : 0.0f,
+                            settings.gi.filter_sensitivity};
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_.context->Map(ao_ssr_gi_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                     &mapped))) {
+        throw std::runtime_error("Map AO/SSR/GI constants failed");
+    }
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context_.context->Unmap(ao_ssr_gi_buffer_.Get(), 0);
+}
+
+void Renderer::bind_ao_ssr_gi_constants() {
+    if (ao_ssr_gi_buffer_ == nullptr) {
+        return;
+    }
+    ID3D11Buffer* buffers[] = {ao_ssr_gi_buffer_.Get()};
+    context_.context->PSSetConstantBuffers(6, 1, buffers);
+}
+
+// Common state for the half-resolution Phase 5 chains. Depth testing is off
+// because every pass writes a full screen quad over its own target.
+void Renderer::bind_half_res_state() {
+    const Target* ao = targets_.get("AoRaw");
+    if (ao == nullptr) {
+        return;
+    }
+    context_.set_viewport(static_cast<float>(ao->width), static_cast<float>(ao->height));
+    auto* linear = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    context_.context->PSSetSamplers(0, 1, &linear);
+    auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    context_.context->PSSetSamplers(1, 1, &point);
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+    context_.context->RSSetState(
+        context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+    bind_frame_constants();
+    bind_ao_ssr_gi_constants();
+}
+
+void Renderer::draw_ao(const GraphicsSettings& settings) {
+    const Target* raw = targets_.get("AoRaw");
+    const Target* gb1 = targets_.get("GB1");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (raw == nullptr || gb1 == nullptr || depth == nullptr) {
+        return;
+    }
+    const auto defines = ao_ssr_gi_defines(settings);
+    const ShaderProgram& program =
+        shaders_.get("ao", kShaderSource, "FullscreenVS", "AoPS", defines, nullptr);
+
+    ID3D11RenderTargetView* views[] = {raw->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    ID3D11ShaderResourceView* resources[2] = {gb1->srv.Get(), depth->srv.Get()};
+    context_.context->PSSetShaderResources(1, 1, &resources[0]);
+    context_.context->PSSetShaderResources(5, 1, &resources[1]);
+    bind_half_res_state();
+    draw_fullscreen(program);
+}
+
+void Renderer::draw_ao_blur(const GraphicsSettings& settings) {
+    const Target* raw = targets_.get("AoRaw");
+    const Target* temp = targets_.get("AoBlurTmp");
+    const Target* blurred = targets_.get("AoBlur");
+    const Target* gb1 = targets_.get("GB1");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (raw == nullptr || temp == nullptr || blurred == nullptr || gb1 == nullptr ||
+        depth == nullptr) {
+        return;
+    }
+    auto defines = ao_ssr_gi_defines(settings);
+    defines.push_back({"AO_BLUR_DIR", "0"});
+    const ShaderProgram& horizontal =
+        shaders_.get("ao_blur_x", kShaderSource, "FullscreenVS", "AoBlurPS", defines, nullptr);
+    defines.back().value = "1";
+    const ShaderProgram& vertical =
+        shaders_.get("ao_blur_y", kShaderSource, "FullscreenVS", "AoBlurPS", defines, nullptr);
+
+    ID3D11ShaderResourceView* gb1_srv = gb1->srv.Get();
+    ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+    context_.context->PSSetShaderResources(1, 1, &gb1_srv);
+    context_.context->PSSetShaderResources(5, 1, &depth_srv);
+
+    ID3D11RenderTargetView* temp_view[] = {temp->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, temp_view, nullptr);
+    ID3D11ShaderResourceView* source = raw->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &source);
+    bind_half_res_state();
+    draw_fullscreen(horizontal);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(24, 1, &null_srv);
+
+    ID3D11RenderTargetView* blurred_view[] = {blurred->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, blurred_view, nullptr);
+    source = temp->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &source);
+    bind_half_res_state();
+    draw_fullscreen(vertical);
+    context_.context->PSSetShaderResources(24, 1, &null_srv);
+}
+
+void Renderer::draw_ssr_depth(const GraphicsSettings& settings) {
+    const Target* levels[4] = {targets_.get("SsrDepth0"), targets_.get("SsrDepth1"),
+                               targets_.get("SsrDepth2"), targets_.get("SsrDepth3")};
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (levels[0] == nullptr || levels[1] == nullptr || levels[2] == nullptr ||
+        levels[3] == nullptr || depth == nullptr) {
+        return;
+    }
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    for (int level = 0; level < 4; ++level) {
+        auto defines = ao_ssr_gi_defines(settings);
+        defines.push_back({"SSR_DEPTH_LEVEL", std::to_string(level)});
+        const ShaderProgram& program = shaders_.get("ssr_depth_" + std::to_string(level),
+                                                    kShaderSource, "FullscreenVS", "SsrDepthPS",
+                                                    defines, nullptr);
+        ID3D11RenderTargetView* views[] = {levels[level]->rtv.Get()};
+        context_.context->OMSetRenderTargets(1, views, nullptr);
+        if (level == 0) {
+            ID3D11ShaderResourceView* source = depth->srv.Get();
+            context_.context->PSSetShaderResources(5, 1, &source);
+        } else {
+            ID3D11ShaderResourceView* source = levels[level - 1]->srv.Get();
+            context_.context->PSSetShaderResources(24, 1, &source);
+        }
+        bind_half_res_state();
+        context_.set_viewport(static_cast<float>(levels[level]->width),
+                              static_cast<float>(levels[level]->height));
+        draw_fullscreen(program);
+        if (level > 0) {
+            context_.context->PSSetShaderResources(24, 1, &null_srv);
+        }
+    }
+}
+
+void Renderer::draw_ssr(const GraphicsSettings& settings) {
+    const Target* trace = targets_.get("SsrTrace");
+    const Target* gb0 = targets_.get("GB0");
+    const Target* gb1 = targets_.get("GB1");
+    const Target* gb4 = targets_.get("GB4");
+    const Target* depth1 = targets_.get("SsrDepth1");
+    const Target* depth2 = targets_.get("SsrDepth2");
+    const Target* depth3 = targets_.get("SsrDepth3");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (trace == nullptr || gb0 == nullptr || gb1 == nullptr || gb4 == nullptr ||
+        depth1 == nullptr || depth2 == nullptr || depth3 == nullptr || depth == nullptr) {
+        return;
+    }
+    const auto defines = ao_ssr_gi_defines(settings);
+    const ShaderProgram& program =
+        shaders_.get("ssr_trace", kShaderSource, "FullscreenVS", "SsrTracePS", defines, nullptr);
+
+    ID3D11RenderTargetView* views[] = {trace->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    ID3D11ShaderResourceView* resources[4] = {gb0->srv.Get(), gb1->srv.Get(), gb4->srv.Get(),
+                                              depth->srv.Get()};
+    context_.context->PSSetShaderResources(0, 1, &resources[0]);
+    context_.context->PSSetShaderResources(1, 1, &resources[1]);
+    context_.context->PSSetShaderResources(4, 1, &resources[2]);
+    context_.context->PSSetShaderResources(5, 1, &resources[3]);
+    ID3D11ShaderResourceView* pyramid[3] = {depth1->srv.Get(), depth2->srv.Get(),
+                                            depth3->srv.Get()};
+    context_.context->PSSetShaderResources(25, 3, pyramid);
+    bind_half_res_state();
+    draw_fullscreen(program);
+}
+
+void Renderer::draw_ssr_blur(const GraphicsSettings& settings) {
+    const Target* trace = targets_.get("SsrTrace");
+    const Target* temp = targets_.get("SsrBlurTmp");
+    const Target* level0 = targets_.get("SsrBlur0");
+    const Target* level1 = targets_.get("SsrBlur1");
+    const Target* gb1 = targets_.get("GB1");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (trace == nullptr || temp == nullptr || level0 == nullptr || level1 == nullptr ||
+        gb1 == nullptr || depth == nullptr) {
+        return;
+    }
+    auto defines = ao_ssr_gi_defines(settings);
+    defines.push_back({"SSR_BLUR_DIR", "0"});
+    const ShaderProgram& horizontal =
+        shaders_.get("ssr_blur_x", kShaderSource, "FullscreenVS", "SsrBlurPS", defines, nullptr);
+    defines.back().value = "1";
+    const ShaderProgram& vertical =
+        shaders_.get("ssr_blur_y", kShaderSource, "FullscreenVS", "SsrBlurPS", defines, nullptr);
+
+    ID3D11ShaderResourceView* gb1_srv = gb1->srv.Get();
+    ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+    context_.context->PSSetShaderResources(1, 1, &gb1_srv);
+    context_.context->PSSetShaderResources(5, 1, &depth_srv);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    const auto run = [&](const Target* source, const Target* destination,
+                         const ShaderProgram& program) {
+        ID3D11RenderTargetView* views[] = {destination->rtv.Get()};
+        context_.context->OMSetRenderTargets(1, views, nullptr);
+        ID3D11ShaderResourceView* srv = source->srv.Get();
+        context_.context->PSSetShaderResources(24, 1, &srv);
+        bind_half_res_state();
+        draw_fullscreen(program);
+        context_.context->PSSetShaderResources(24, 1, &null_srv);
+    };
+    run(trace, temp, horizontal);
+    run(temp, level0, vertical);
+    run(level0, temp, horizontal);
+    run(temp, level1, vertical);
+}
+
+void Renderer::draw_ssr_resolve(const GraphicsSettings& settings) {
+    const Target* trace = targets_.get("SsrTrace");
+    const Target* level0 = targets_.get("SsrBlur0");
+    const Target* level1 = targets_.get("SsrBlur1");
+    const Target* resolved = targets_.get("SsrColor");
+    const Target* gb1 = targets_.get("GB1");
+    const Target* gb2 = targets_.get("GB2");
+    if (trace == nullptr || level0 == nullptr || level1 == nullptr || resolved == nullptr ||
+        gb1 == nullptr || gb2 == nullptr) {
+        return;
+    }
+    const auto defines = ao_ssr_gi_defines(settings);
+    const ShaderProgram& program = shaders_.get("ssr_resolve", kShaderSource, "FullscreenVS",
+                                                "SsrResolvePS", defines, nullptr);
+
+    ID3D11RenderTargetView* views[] = {resolved->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    ID3D11ShaderResourceView* resources[5] = {trace->srv.Get(), level0->srv.Get(),
+                                              level1->srv.Get(), gb1->srv.Get(), gb2->srv.Get()};
+    context_.context->PSSetShaderResources(21, 1, &resources[0]);
+    context_.context->PSSetShaderResources(23, 1, &resources[1]);
+    context_.context->PSSetShaderResources(24, 1, &resources[2]);
+    context_.context->PSSetShaderResources(1, 1, &resources[3]);
+    context_.context->PSSetShaderResources(2, 1, &resources[4]);
+    bind_half_res_state();
+    draw_fullscreen(program);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(21, 1, &null_srv);
+    context_.context->PSSetShaderResources(23, 1, &null_srv);
+    context_.context->PSSetShaderResources(24, 1, &null_srv);
+}
+
+void Renderer::draw_gi(const GraphicsSettings& settings) {
+    const Target* raw = targets_.get("GiRaw");
+    const Target* history = targets_.get("GiFiltered");
+    const Target* gb0 = targets_.get("GB0");
+    const Target* gb1 = targets_.get("GB1");
+    const Target* gb3 = targets_.get("GB3");
+    const Target* gb4 = targets_.get("GB4");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (raw == nullptr || history == nullptr || gb0 == nullptr || gb1 == nullptr ||
+        gb3 == nullptr || gb4 == nullptr || depth == nullptr) {
+        return;
+    }
+    const auto defines = ao_ssr_gi_defines(settings);
+    const ShaderProgram& program =
+        shaders_.get("gi_trace", kShaderSource, "FullscreenVS", "GiTracePS", defines, nullptr);
+
+    ID3D11RenderTargetView* views[] = {raw->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    ID3D11ShaderResourceView* resources[6] = {gb0->srv.Get(), gb1->srv.Get(), gb3->srv.Get(),
+                                              gb4->srv.Get(), depth->srv.Get(),
+                                              history->srv.Get()};
+    context_.context->PSSetShaderResources(0, 1, &resources[0]);
+    context_.context->PSSetShaderResources(1, 1, &resources[1]);
+    context_.context->PSSetShaderResources(3, 1, &resources[2]);
+    context_.context->PSSetShaderResources(4, 1, &resources[3]);
+    context_.context->PSSetShaderResources(5, 1, &resources[4]);
+    context_.context->PSSetShaderResources(22, 1, &resources[5]);
+    if (sky_sh_srv_ != nullptr) {
+        ID3D11ShaderResourceView* sh_srv = sky_sh_srv_.Get();
+        context_.context->PSSetShaderResources(16, 1, &sh_srv);
+    }
+    bind_half_res_state();
+    draw_fullscreen(program);
+
+    // The history buffer becomes a render target in the final denoise pass.
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(22, 1, &null_srv);
+}
+
+void Renderer::draw_gi_filter(const GraphicsSettings& settings) {
+    const Target* raw = targets_.get("GiRaw");
+    const Target* prefiltered = targets_.get("GiPrefilter");
+    const Target* temp = targets_.get("GiBlurTmp");
+    const Target* filtered = targets_.get("GiFiltered");
+    const Target* gb1 = targets_.get("GB1");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (raw == nullptr || prefiltered == nullptr || temp == nullptr || filtered == nullptr ||
+        gb1 == nullptr || depth == nullptr) {
+        return;
+    }
+    auto defines = ao_ssr_gi_defines(settings);
+    const ShaderProgram& prefilter = shaders_.get("gi_prefilter", kShaderSource, "FullscreenVS",
+                                                  "GiPrefilterPS", defines, nullptr);
+    defines.push_back({"GI_FILTER_DIR", "0"});
+    const ShaderProgram& horizontal = shaders_.get("gi_denoise_x", kShaderSource, "FullscreenVS",
+                                                   "GiDenoisePS", defines, nullptr);
+    defines.back().value = "1";
+    const ShaderProgram& vertical = shaders_.get("gi_denoise_y", kShaderSource, "FullscreenVS",
+                                                 "GiDenoisePS", defines, nullptr);
+
+    ID3D11ShaderResourceView* gb1_srv = gb1->srv.Get();
+    ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+    context_.context->PSSetShaderResources(1, 1, &gb1_srv);
+    context_.context->PSSetShaderResources(5, 1, &depth_srv);
+    ID3D11ShaderResourceView* null_srv = nullptr;
+
+    const auto run = [&](const Target* source, const Target* destination,
+                         const ShaderProgram& program) {
+        ID3D11RenderTargetView* views[] = {destination->rtv.Get()};
+        context_.context->OMSetRenderTargets(1, views, nullptr);
+        ID3D11ShaderResourceView* srv = source->srv.Get();
+        context_.context->PSSetShaderResources(24, 1, &srv);
+        bind_half_res_state();
+        draw_fullscreen(program);
+        context_.context->PSSetShaderResources(24, 1, &null_srv);
+    };
+    run(raw, prefiltered, prefilter);
+    run(prefiltered, temp, horizontal);
+    run(temp, filtered, vertical);
 }
 
 // Every sky entry point samples the transmittance LUT through PointSampler and

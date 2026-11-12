@@ -27,8 +27,9 @@ std::optional<CaptureData> read_capture(const std::string& path, std::string* er
 bool write_probe(const std::string& path, const CaptureData& capture,
                  const hikari::gfx::GraphicsSettings& settings, const std::string& scene,
                  const std::string& phase, double frame_ms, std::string* error);
-
 // Mean absolute channel difference in the 0..1 range.
 float mean_channel_difference(const CaptureData& a, const CaptureData& b);
+// Mean of the three channel averages, in the 0..1 range.
+float mean_luminance(const CaptureData& capture);
 
 } // namespace hikari::gfx_lab

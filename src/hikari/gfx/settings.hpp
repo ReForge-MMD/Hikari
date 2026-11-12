@@ -45,6 +45,11 @@ enum class DebugView : std::uint8_t {
     SkyPrefilter = 15,
     SkyPrefilterRoughness = 16,
     IblSpecular = 17,
+    Ao = 18,
+    AoBentNormal = 19,
+    SsrRadiance = 20,
+    SsrConfidence = 21,
+    GiRadiance = 22,
 };
 
 struct SunSettings {
@@ -169,6 +174,8 @@ struct AoSettings {
 struct SsrSettings {
     int quality = 4;
     bool debug = false;
+    // 0 hit mask, 1 confidence, 2 travel distance, 3 hit normal, 4 roughness.
+    int debug_mode = 0;
     int glass_refraction = 1;
     bool water_caustics = true;
     float water_surface_y = 0.0f;

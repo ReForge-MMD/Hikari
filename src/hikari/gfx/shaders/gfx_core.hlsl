@@ -88,6 +88,29 @@ cbuffer IblParams : register(b5) {
     float4 IblParams0; // x intensity, y last prefilter mip, z rotation radians, w sky ambient strength
 };
 
+cbuffer AoSsrGiParams : register(b6) {
+    float4 AoParams0;  // x radius, y intensity, z blur radius, w ao type
+    float4 AoParams1;  // x slices, y steps, z samples, w sky visibility
+    float4 SsrParams0; // x max steps, y max distance, z thickness, w fade start
+    float4 SsrParams1; // x debug mode, y debug enable, z step scale, w roughness
+    float4 GiParams0;  // x enable, y ray count, z steps, w filter radius
+    float4 GiParams1;  // x prefilter radius, y sample radius, z thickness, w bounce weight
+    float4 GiParams2;  // x il amount, y ao amount, z specular gi, w sensitivity
+};
+
+// Phase 5 half-resolution chains. A register is reused across passes because
+// each pass has its own shader and bindings: t21 is the raw SSR trace while the
+// resolve runs and the resolved colour when lighting reads it.
+Texture2D AoBlurTex : register(t20);
+Texture2D SsrTex : register(t21);
+Texture2D GiTex : register(t22);
+Texture2D SsrBlur0Tex : register(t23);
+Texture2D BlurSourceTex : register(t24);
+// Conservative farthest linear depth per tile, used by the Hi-Z trace.
+Texture2D SsrDepth1Tex : register(t25);
+Texture2D SsrDepth2Tex : register(t26);
+Texture2D SsrDepth3Tex : register(t27);
+
 #ifndef SUN_SHADOW_PCSS
 #define SUN_SHADOW_PCSS 1
 #endif
@@ -123,6 +146,69 @@ cbuffer IblParams : register(b5) {
 #endif
 #ifndef DEBUG_VIEW
 #define DEBUG_VIEW 0
+#endif
+#ifndef AO_ENABLE
+#define AO_ENABLE 0
+#endif
+#ifndef AO_TYPE
+#define AO_TYPE 2
+#endif
+#ifndef AO_SAMPLES
+#define AO_SAMPLES 16
+#endif
+#ifndef AO_SLICES
+#define AO_SLICES 4
+#endif
+#ifndef AO_STEPS
+#define AO_STEPS 6
+#endif
+#ifndef AO_BLUR_RADIUS
+#define AO_BLUR_RADIUS 4
+#endif
+#ifndef AO_BLUR_DIR
+#define AO_BLUR_DIR 0
+#endif
+#ifndef SSR_ENABLE
+#define SSR_ENABLE 0
+#endif
+#ifndef SSR_MAX_STEPS
+#define SSR_MAX_STEPS 128
+#endif
+#ifndef SSR_DEBUG
+#define SSR_DEBUG 0
+#endif
+#ifndef SSR_DEBUG_MODE
+#define SSR_DEBUG_MODE 0
+#endif
+#ifndef SSR_BLUR_DIR
+#define SSR_BLUR_DIR 0
+#endif
+#ifndef SSR_DEPTH_LEVEL
+#define SSR_DEPTH_LEVEL 0
+#endif
+#ifndef GI_ENABLE
+#define GI_ENABLE 0
+#endif
+#ifndef GI_RAY_COUNT
+#define GI_RAY_COUNT 8
+#endif
+#ifndef GI_STEPS
+#define GI_STEPS 12
+#endif
+#ifndef GI_FILTER_RADIUS
+#define GI_FILTER_RADIUS 4
+#endif
+#ifndef GI_PREFILTER_RADIUS
+#define GI_PREFILTER_RADIUS 2
+#endif
+#ifndef GI_FILTER_DIR
+#define GI_FILTER_DIR 0
+#endif
+#ifndef SSGI_SPECULAR_GI
+#define SSGI_SPECULAR_GI 0
+#endif
+#ifndef GI_BOUNCES
+#define GI_BOUNCES 0
 #endif
 
 static const float PI = 3.14159265358979323846;
@@ -1707,6 +1793,658 @@ float2 env_brdf_approx(float roughness, float no_v) {
     return float2(-1.04f, 1.04f) * a004 + r.zw;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 5: ambient occlusion, screen space reflections, and global illumination.
+// Every pass in this block runs at half resolution and writes a target that only
+// LightingPS consumes.
+// ---------------------------------------------------------------------------
+
+float phase5_luminance(float3 color) {
+    return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// Depth at a half-resolution pixel. Point sampling keeps the depth test from
+// blending across silhouette edges.
+float phase5_depth(float2 uv) {
+    return DepthTex.SampleLevel(PointSampler, uv, 0).r;
+}
+
+// Tangent frame around `n`, stable for every orientation including poles.
+void phase5_basis(float3 n, out float3 tangent, out float3 bitangent) {
+    const float3 up = abs(n.z) < 0.999f ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+    tangent = normalize(cross(up, n));
+    bitangent = cross(n, tangent);
+}
+
+// Projects a world position into the viewport and returns its linear view
+// depth. False when the point is behind the camera or outside the unit square.
+bool phase5_project(float3 world, out float2 uv, out float view_z) {
+    const float4 clip = mul(float4(world, 1.0f), ViewProjection);
+    view_z = mul(float4(world, 1.0f), View).z;
+    if (clip.w <= 1.0e-5f) {
+        uv = float2(0.0f, 0.0f);
+        return false;
+    }
+    const float2 ndc = clip.xy / clip.w;
+    uv = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+    return all(uv >= 0.0f) && all(uv <= 1.0f);
+}
+
+float phase5_hash(float2 pixel) {
+    return frac(52.9829189f * frac(0.06711056f * pixel.x + 0.00583715f * pixel.y));
+}
+
+// Screen space directional occlusion. Writes the bent normal in RGB and the
+// visibility in A. AO_TYPE 0 traces a hemisphere per pixel (SSDO), 1 uses HBAO
+// style horizon slices, and 2 uses GTAO slices plus a multi-bounce lift.
+float4 AoPS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float depth_value = phase5_depth(uv);
+    if (depth_value >= 0.99999f) {
+        return float4(0.0f, 0.0f, 1.0f, 1.0f);
+    }
+    const float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
+    const float3 n = normalize(decode_octahedral(gb1.xy));
+    const float3 world_pos = reconstruct_world(uv, depth_value);
+    const float radius = max(AoParams0.x, 0.01f);
+    const float dither = phase5_hash(input.pos.xy);
+
+    float visibility = 1.0f;
+    float3 bent = n;
+
+#if AO_TYPE == 0
+    {
+        float3 tangent;
+        float3 bitangent;
+        phase5_basis(n, tangent, bitangent);
+        float open = 0.0f;
+        float3 accum = float3(0.0f, 0.0f, 0.0f);
+        [loop] for (int i = 0; i < AO_SAMPLES; ++i) {
+            const float2 disc = vogel_disc_sample(i, AO_SAMPLES, dither * 6.2831853f);
+            const float3 dir = normalize(tangent * disc.x + bitangent * disc.y +
+                                         n * sqrt(max(1.0f - dot(disc, disc), 0.0f)));
+            bool occluded = false;
+            [unroll] for (int step_index = 0; step_index < 4; ++step_index) {
+                const float t = radius * (float(step_index) + 0.5f) * 0.25f;
+                float2 suv;
+                float view_z;
+                if (!phase5_project(world_pos + dir * t, suv, view_z)) {
+                    break;
+                }
+                const float delta = view_z - linear_view_depth(phase5_depth(suv));
+                if (delta > 0.02f * radius && delta < radius) {
+                    occluded = true;
+                    break;
+                }
+            }
+            if (!occluded) {
+                open += 1.0f;
+                accum += dir;
+            }
+        }
+        visibility = open / float(AO_SAMPLES);
+        if (open > 0.5f) {
+            bent = normalize(accum);
+        }
+    }
+#else
+    {
+        float3 tangent;
+        float3 bitangent;
+        phase5_basis(n, tangent, bitangent);
+        float total = 0.0f;
+        float3 accum = float3(0.0f, 0.0f, 0.0f);
+        [loop] for (int slice = 0; slice < AO_SLICES; ++slice) {
+            const float phi = (float(slice) + dither) * (PI / float(AO_SLICES));
+            const float3 axis = tangent * cos(phi) + bitangent * sin(phi);
+            // The horizon starts at the tangent plane on both sides, so a fully
+            // open slice integrates to one.
+            float horizon[2] = {0.0f, 0.0f};
+            float3 horizon_dir[2] = {n, n};
+            [unroll] for (int side = 0; side < 2; ++side) {
+                const float sign = side == 0 ? 1.0f : -1.0f;
+                [loop] for (int step_index = 1; step_index <= AO_STEPS; ++step_index) {
+                    const float t = radius * float(step_index) / float(AO_STEPS);
+                    float2 suv;
+                    float view_z;
+                    if (!phase5_project(world_pos + axis * (sign * t), suv, view_z)) {
+                        continue;
+                    }
+                    const float delta = view_z - linear_view_depth(phase5_depth(suv));
+                    if (delta <= 0.0f || delta >= radius) {
+                        continue;
+                    }
+                    const float3 occluder = reconstruct_world(suv, phase5_depth(suv));
+                    const float3 to_occluder = occluder - world_pos;
+                    const float len = length(to_occluder);
+                    if (len < 1.0e-4f) {
+                        continue;
+                    }
+                    const float3 to_occ = to_occluder / len;
+                    const float cos_h = dot(to_occ, n);
+                    if (cos_h > horizon[side]) {
+                        horizon[side] = cos_h;
+                        horizon_dir[side] = to_occ;
+                    }
+                }
+            }
+            // Angle from the normal. The two visible arcs are the slice
+            // visibility, and their centroid tilts the bent normal away from the
+            // occluded side.
+            const float arc0 = acos(saturate(horizon[0]));
+            const float arc1 = acos(saturate(horizon[1]));
+            total += (arc0 + arc1) / PI;
+            accum += (n + horizon_dir[0]) * arc0 + (n + horizon_dir[1]) * arc1;
+        }
+        visibility = total / float(AO_SLICES);
+        bent = normalize(accum + n * 0.001f);
+    }
+#endif
+
+    visibility = saturate(visibility);
+#if AO_TYPE == 2
+    // GTSO multi-bounce: light reflected off nearby surfaces re-enters the
+    // hemisphere. A geometric series with a 0.3 albedo is a stable first order
+    // approximation and keeps contact regions from collapsing to black.
+    visibility = saturate(visibility / max(1.0f - 0.3f * (1.0f - visibility), 0.1f));
+#endif
+    return float4(bent, visibility);
+}
+
+// Separable bilateral blur of the bent normal and visibility. Depth and normal
+// weights keep silhouettes and creases sharp.
+float4 AoBlurPS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
+    const float2 dir = AO_BLUR_DIR == 0 ? float2(texel.x, 0.0f) : float2(0.0f, texel.y);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f) {
+        return float4(0.0f, 0.0f, 1.0f, 1.0f);
+    }
+    const float3 n = decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy);
+    const float center_linear = linear_view_depth(center_depth);
+    const int radius = AO_BLUR_RADIUS;
+    float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float weight_sum = 0.0f;
+    [loop] for (int i = -radius; i <= radius; ++i) {
+        const float2 suv = uv + dir * float(i);
+        if (any(suv < 0.0f) || any(suv > 1.0f)) {
+            continue;
+        }
+        const float sd = phase5_depth(suv);
+        if (sd >= 0.99999f) {
+            continue;
+        }
+        const float3 sn = decode_octahedral(GB1Tex.SampleLevel(PointSampler, suv, 0).xy);
+        const float depth_w = exp(-abs(linear_view_depth(sd) - center_linear) * 8.0f /
+                                  max(AoParams0.x, 0.01f));
+        const float normal_w = pow(saturate(dot(n, sn)), 8.0f);
+        const float w = exp(-float(i * i) / float(radius * radius + 1)) * depth_w * normal_w;
+        sum += BlurSourceTex.SampleLevel(PointSampler, suv, 0) * w;
+        weight_sum += w;
+    }
+    if (weight_sum <= 0.0f) {
+        return BlurSourceTex.SampleLevel(PointSampler, uv, 0);
+    }
+    float4 result = sum / weight_sum;
+    result.rgb = normalize(result.rgb + float3(0.0f, 0.0f, 1.0e-5f));
+    result.a = saturate(result.a);
+    return result;
+}
+
+// Conservative nearest linear depth of the 2x2 source block. Level 0
+// linearizes the scene depth at half resolution; each later level halves the
+// previous one. The trace skips a tile while the ray is in front of this depth,
+// which is the Hi-Z acceleration structure.
+float4 SsrDepthPS(FSOut input) : SV_Target {
+#if SSR_DEPTH_LEVEL == 0
+    const float2 texel = 1.0f / float2(Params1.y, Params1.z);
+    float nearest = 0.0f;
+    [unroll] for (int y = 0; y < 2; ++y) {
+        [unroll] for (int x = 0; x < 2; ++x) {
+            const float2 suv = input.uv + (float2(float(x), float(y)) - 0.5f) * texel;
+            const float d = DepthTex.SampleLevel(PointSampler, suv, 0).r;
+            if (d < 0.99999f) {
+                const float scene_depth = linear_view_depth(d);
+                nearest = nearest <= 0.0f ? scene_depth : min(nearest, scene_depth);
+            }
+        }
+    }
+#else
+    const float2 texel = exp2(float(SSR_DEPTH_LEVEL)) / float2(Params1.y, Params1.z);
+    float nearest = 0.0f;
+    [unroll] for (int y = 0; y < 2; ++y) {
+        [unroll] for (int x = 0; x < 2; ++x) {
+            const float2 suv = input.uv + (float2(float(x), float(y)) - 0.5f) * texel;
+            const float d = BlurSourceTex.SampleLevel(PointSampler, suv, 0).r;
+            if (d > 0.0f) {
+                nearest = nearest <= 0.0f ? d : min(nearest, d);
+            }
+        }
+    }
+#endif
+    return float4(nearest, 0.0f, 0.0f, 1.0f);
+}
+
+// Screen space reflection trace. The ray walks the depth hierarchy one tile at a
+// time and only refines where a tile can contain a crossing, so the tap budget
+// covers a much longer ray than a fixed step march.
+float4 SsrTracePS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float depth_value = phase5_depth(uv);
+    if (depth_value >= 0.99999f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
+    const float roughness = saturate(gb1.z);
+    const float3 n = normalize(decode_octahedral(gb1.xy));
+    const float3 world_pos = reconstruct_world(uv, depth_value);
+    const float3 v = normalize(CameraPos.xyz - world_pos);
+    const float3 r = reflect(-v, n);
+    if (roughness > 0.92f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    const float max_distance = max(SsrParams0.y, 1.0f);
+    const float thickness = max(SsrParams0.z, 0.01f);
+    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
+
+    // Screen-space rate of change along the ray, used to turn a tile size into a
+    // world step. The per-tile depth test keeps the estimate safe.
+    float2 start_uv;
+    float2 end_uv;
+    float scratch_z;
+    phase5_project(world_pos, start_uv, scratch_z);
+    phase5_project(world_pos + r * max_distance, end_uv, scratch_z);
+    const float rate = max(length((end_uv - start_uv) / max_distance), 1.0e-5f);
+
+    bool hit = false;
+    float2 hit_uv = float2(0.0f, 0.0f);
+    float hit_travel = 0.0f;
+    float prev_travel = 0.0f;
+    int level = 3;
+    // One constant half-texel offset decorrelates the first tile test from the
+    // pixel grid. A per-pixel hash would be temporal dithering, and with no TAA
+    // in this pipeline it only adds speckle to the resolved reflection.
+    float travel = texel.x * 0.5f / rate;
+    [loop] for (int guard = 0; guard < SSR_MAX_STEPS; ++guard) {
+        if (travel >= max_distance) {
+            break;
+        }
+        float2 suv;
+        float view_z;
+        if (!phase5_project(world_pos + r * travel, suv, view_z)) {
+            break;
+        }
+        const float2 tile = texel * exp2(float(level));
+        const float2 cell = (floor(suv / tile) + 0.5f) * tile;
+        float tile_depth;
+        if (level >= 3) {
+            tile_depth = SsrDepth3Tex.SampleLevel(PointSampler, cell, 0).r;
+        } else if (level == 2) {
+            tile_depth = SsrDepth2Tex.SampleLevel(PointSampler, cell, 0).r;
+        } else if (level == 1) {
+            tile_depth = SsrDepth1Tex.SampleLevel(PointSampler, cell, 0).r;
+        } else {
+            tile_depth = linear_view_depth(phase5_depth(cell));
+        }
+        const float step_world =
+            clamp(min(tile.x, tile.y) / rate, max_distance * 1.0e-4f, max_distance * 0.25f);
+        if (tile_depth <= 0.0f) {
+            // Empty tile at a coarse level: no surface can reflect the ray.
+            prev_travel = travel;
+            travel += step_world;
+        } else if (view_z < tile_depth - 0.05f) {
+            // In front of every surface in this tile: nothing to cross here.
+            prev_travel = travel;
+            travel += step_world;
+        } else if (level > 0) {
+            level -= 1;
+        } else {
+            const float delta = view_z - tile_depth;
+            if (delta > 0.0f) {
+                if (delta < thickness + step_world) {
+                    hit = true;
+                    hit_travel = travel;
+                    hit_uv = cell;
+                    break;
+                }
+                // A coarse step can jump past a surface by more than the
+                // thickness, which happens constantly for rays that graze the
+                // floor. Bisecting back from the last in-front sample recovers
+                // the crossing instead of dropping the reflection.
+                float lo = prev_travel;
+                float hi = travel;
+                bool crossed = false;
+                [unroll] for (int b = 0; b < 6; ++b) {
+                    const float mid = 0.5f * (lo + hi);
+                    float2 mid_uv;
+                    float mid_z;
+                    if (!phase5_project(world_pos + r * mid, mid_uv, mid_z)) {
+                        break;
+                    }
+                    if (mid_z > linear_view_depth(phase5_depth(mid_uv))) {
+                        hi = mid;
+                        crossed = true;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                if (crossed) {
+                    float2 mid_uv;
+                    float mid_z;
+                    if (phase5_project(world_pos + r * hi, mid_uv, mid_z)) {
+                        hit = true;
+                        hit_travel = hi;
+                        hit_uv = mid_uv;
+                    }
+                }
+                break;
+            }
+            prev_travel = travel;
+            travel += step_world;
+        }
+    }
+
+    float3 hit_normal = n;
+    if (hit) {
+        float lo = prev_travel;
+        float hi = hit_travel;
+        [unroll] for (int b = 0; b < 4; ++b) {
+            const float mid = 0.5f * (lo + hi);
+            float2 suv;
+            float view_z;
+            if (!phase5_project(world_pos + r * mid, suv, view_z)) {
+                break;
+            }
+            const float sd = phase5_depth(suv);
+            if (sd < 0.99999f && view_z > linear_view_depth(sd)) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        float2 suv;
+        float view_z;
+        if (phase5_project(world_pos + r * hi, suv, view_z)) {
+            hit_uv = suv;
+        }
+        hit_normal = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, hit_uv, 0).xy));
+    }
+
+    float confidence = 0.0f;
+    float3 radiance = float3(0.0f, 0.0f, 0.0f);
+    if (hit) {
+        const float4 h0 = GB0Tex.SampleLevel(PointSampler, hit_uv, 0);
+        const float4 h4 = GB4Tex.SampleLevel(PointSampler, hit_uv, 0);
+        const float3 l = normalize(-SunDirection.xyz);
+        const float no_l = saturate(dot(hit_normal, l));
+        // The G-buffer is the only radiance source available before lighting
+        // runs, so the hit is shaded with the same direct plus ambient split.
+        const float3 direct = SunColor.rgb * no_l + AmbientColor.rgb * 0.6f;
+        radiance = max(h0.rgb * direct + h4.rgb, 0.0f);
+        const float edge = smoothstep(0.0f, 0.08f,
+                                      min(min(hit_uv.x, 1.0f - hit_uv.x),
+                                          min(hit_uv.y, 1.0f - hit_uv.y)));
+        const float distance_fade =
+            1.0f - smoothstep(SsrParams0.w * max_distance, max_distance, hit_travel);
+        const float roughness_fade = 1.0f - smoothstep(0.6f, 0.92f, roughness);
+        const float facing = saturate(dot(n, -v));
+        confidence = edge * distance_fade * roughness_fade * (0.4f + 0.6f * facing);
+    }
+
+#if SSR_DEBUG
+    float3 debug = float3(0.0f, 0.0f, 0.0f);
+#if SSR_DEBUG_MODE == 0
+    debug = hit ? float3(1.0f, 1.0f, 1.0f) : float3(0.0f, 0.0f, 0.0f);
+#elif SSR_DEBUG_MODE == 1
+    debug = confidence.xxx;
+#elif SSR_DEBUG_MODE == 2
+    debug = hit ? saturate(hit_travel / max_distance).xxx : float3(0.0f, 0.0f, 0.0f);
+#elif SSR_DEBUG_MODE == 3
+    debug = hit ? hit_normal * 0.5f + 0.5f : float3(0.0f, 0.0f, 0.0f);
+#else
+    debug = roughness.xxx;
+#endif
+    return float4(debug * (hit ? 1.0f : 0.0f), 1.0f);
+#else
+    // Premultiplied by confidence so a plain bilateral filter and the resolve
+    // blend both behave as normalized convolution.
+    return float4(radiance * confidence, confidence);
+#endif
+}
+
+// Separable bilateral blur used to build the SSR roughness pyramid. The input
+// is already premultiplied, so both colour and confidence blur together.
+float4 SsrBlurPS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
+    const float2 dir = SSR_BLUR_DIR == 0 ? float2(texel.x, 0.0f) : float2(0.0f, texel.y);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float3 n = decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy);
+    const float center_linear = linear_view_depth(center_depth);
+    const int radius = 3;
+    float4 sum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float weight_sum = 0.0f;
+    [loop] for (int i = -radius; i <= radius; ++i) {
+        const float2 suv = uv + dir * float(i);
+        if (any(suv < 0.0f) || any(suv > 1.0f)) {
+            continue;
+        }
+        const float sd = phase5_depth(suv);
+        const float3 sn = decode_octahedral(GB1Tex.SampleLevel(PointSampler, suv, 0).xy);
+        const float depth_w = exp(-abs(linear_view_depth(sd) - center_linear) * 4.0f);
+        const float normal_w = pow(saturate(dot(n, sn)), 16.0f);
+        const float w = exp(-float(i * i) / 9.0f) * depth_w * normal_w;
+        sum += BlurSourceTex.SampleLevel(PointSampler, suv, 0) * w;
+        weight_sum += w;
+    }
+    if (weight_sum <= 0.0f) {
+        return BlurSourceTex.SampleLevel(PointSampler, uv, 0);
+    }
+    return sum / weight_sum;
+}
+
+// Selects the roughness level, applies the environment BRDF scale, and hands
+// the result to the lighting pass. With SSR_DEBUG the trace output is forwarded
+// unchanged so the debug views can inspect it.
+float4 SsrResolvePS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float4 trace = SsrTex.SampleLevel(PointSampler, uv, 0);
+#if SSR_DEBUG
+    return float4(trace.rgb, 1.0f);
+#else
+    const float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
+    const float4 gb2 = GB2Tex.SampleLevel(PointSampler, uv, 0);
+    const float4 level0 = SsrBlur0Tex.SampleLevel(PointSampler, uv, 0);
+    const float4 level1 = BlurSourceTex.SampleLevel(PointSampler, uv, 0);
+    const float roughness = saturate(gb1.z);
+    const float t = saturate((roughness - 0.08f) / 0.55f) * 2.0f;
+    float4 color = t < 1.0f ? lerp(trace, level0, t) : lerp(level0, level1, t - 1.0f);
+    const float metallic = saturate(gb1.w);
+    const float3 specular = gb2.rgb;
+    const float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), specular, metallic);
+    const float3 n = normalize(decode_octahedral(gb1.xy));
+    const float depth_value = phase5_depth(uv);
+    const float3 world_pos = reconstruct_world(uv, depth_value);
+    const float3 v = normalize(CameraPos.xyz - world_pos);
+    const float no_v = saturate(dot(n, v));
+    const float2 ab = env_brdf_approx(max(roughness, 0.04f), max(no_v, 1.0e-4f));
+    color.rgb *= f0 * ab.x + ab.y;
+    return float4(max(color.rgb, 0.0f), saturate(color.a));
+#endif
+}
+
+// Diffuse global illumination. GI_ENABLE 1 and 2 trace short SSGI paths;
+// GI_ENABLE 3 uses longer SSPT paths and feeds last frame's denoised radiance
+// back in as the next bounce.
+float4 GiTracePS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float depth_value = phase5_depth(uv);
+    if (depth_value >= 0.99999f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
+    const float3 n = normalize(decode_octahedral(gb1.xy));
+    const float3 world_pos = reconstruct_world(uv, depth_value);
+    const int rays = GI_RAY_COUNT;
+    const float radius = max(GiParams1.y, 0.1f);
+    const float thickness = max(GiParams1.z, 0.05f);
+    const float dither = phase5_hash(input.pos.xy);
+    const float3 l = normalize(-SunDirection.xyz);
+
+    float3 tangent;
+    float3 bitangent;
+    phase5_basis(n, tangent, bitangent);
+
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float occluded = 0.0f;
+    [loop] for (int i = 0; i < rays; ++i) {
+        const float2 disc = vogel_disc_sample(i, rays, dither * 6.2831853f);
+        const float3 dir = normalize(tangent * disc.x + bitangent * disc.y +
+                                     n * sqrt(max(1.0f - dot(disc, disc), 0.0f)));
+        float3 radiance = float3(0.0f, 0.0f, 0.0f);
+        bool escaped = true;
+        float travel = 0.0f;
+        [loop] for (int step_index = 0; step_index < GI_STEPS; ++step_index) {
+            // Steps grow with the index so contact detail stays dense while the
+            // tail still reaches the sample radius.
+            const float step_len =
+                radius * (0.08f + 0.92f * float(step_index + 1) / float(GI_STEPS)) /
+                float(GI_STEPS);
+            travel += step_len;
+            if (travel > radius) {
+                break;
+            }
+            float2 suv;
+            float view_z;
+            if (!phase5_project(world_pos + dir * travel, suv, view_z)) {
+                break;
+            }
+            const float sd = phase5_depth(suv);
+            if (sd >= 0.99999f) {
+                continue;
+            }
+            const float delta = view_z - linear_view_depth(sd);
+            if (delta <= 0.0f || delta >= thickness) {
+                continue;
+            }
+            const float4 h0 = GB0Tex.SampleLevel(PointSampler, suv, 0);
+            const float4 h1 = GB1Tex.SampleLevel(PointSampler, suv, 0);
+            const float4 h4 = GB4Tex.SampleLevel(PointSampler, suv, 0);
+            const float3 hn = normalize(decode_octahedral(h1.xy));
+            const float no_l = saturate(dot(hn, l));
+            const float3 direct = SunColor.rgb * no_l + AmbientColor.rgb * 0.5f;
+            radiance = max(h0.rgb * direct + h4.rgb, 0.0f);
+#if GI_ENABLE >= 3 && GI_BOUNCES
+            // SSPT bounce feedback. The history already carries albedo, so it is
+            // the next bounce radiance rather than a second direct term.
+            const float3 history = max(GiTex.SampleLevel(LinearSampler, suv, 0).rgb, 0.0f);
+            radiance += history * saturate(GiParams1.w);
+#endif
+            escaped = false;
+            occluded += 1.0f;
+            break;
+        }
+        if (escaped) {
+#if SKY_ENABLE && IBL_QUALITY > 0
+            // A ray that leaves the screen samples the sky dome, which keeps the
+            // indirect term from going black in open scenes.
+            radiance = max(sh_irradiance(dir), 0.0f) * (1.0f / PI);
+#endif
+        }
+        sum += radiance;
+    }
+
+    // Cosine-weighted sampling already estimates irradiance / PI, which is the
+    // scale the Lambertian composite expects.
+    sum /= float(rays);
+    sum *= max(GiParams2.x, 0.0f);
+    return float4(max(sum, 0.0f), occluded / float(rays));
+}
+
+// Outlier rejection before the separable denoiser. Karis luminance weighting
+// keeps single-pixel fireflies from dominating the neighbourhood.
+float4 GiPrefilterPS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float3 n = decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy);
+    const float center_linear = linear_view_depth(center_depth);
+    const int radius = GI_PREFILTER_RADIUS;
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float weight_sum = 0.0f;
+    [loop] for (int y = -radius; y <= radius; ++y) {
+        [loop] for (int x = -radius; x <= radius; ++x) {
+            const float2 suv = uv + float2(float(x), float(y)) * texel;
+            if (any(suv < 0.0f) || any(suv > 1.0f)) {
+                continue;
+            }
+            const float sd = phase5_depth(suv);
+            if (sd >= 0.99999f) {
+                continue;
+            }
+            const float3 sn = decode_octahedral(GB1Tex.SampleLevel(PointSampler, suv, 0).xy);
+            const float depth_w = exp(-abs(linear_view_depth(sd) - center_linear) * 4.0f);
+            const float normal_w = pow(saturate(dot(n, sn)), 16.0f);
+            const float4 c = BlurSourceTex.SampleLevel(PointSampler, suv, 0);
+            const float karis = 1.0f / (1.0f + max(phase5_luminance(c.rgb), 0.0f));
+            const float w = depth_w * normal_w * karis;
+            sum += c.rgb * w;
+            weight_sum += w;
+        }
+    }
+    if (weight_sum <= 0.0f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    return float4(sum / weight_sum, 1.0f);
+}
+
+// Separable bilateral denoise. GI_FILTER_RADIUS controls the tap count and
+// GiParams2.w scales how aggressively depth separates the neighbourhood.
+float4 GiDenoisePS(FSOut input) : SV_Target {
+    const float2 uv = input.uv;
+    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
+    const float2 dir = GI_FILTER_DIR == 0 ? float2(texel.x, 0.0f) : float2(0.0f, texel.y);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float3 n = decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy);
+    const float center_linear = linear_view_depth(center_depth);
+    const int radius = GI_FILTER_RADIUS;
+    const float sensitivity = max(GiParams2.w, 0.05f);
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float weight_sum = 0.0f;
+    [loop] for (int i = -radius; i <= radius; ++i) {
+        const float2 suv = uv + dir * float(i);
+        if (any(suv < 0.0f) || any(suv > 1.0f)) {
+            continue;
+        }
+        const float sd = phase5_depth(suv);
+        if (sd >= 0.99999f) {
+            continue;
+        }
+        const float3 sn = decode_octahedral(GB1Tex.SampleLevel(PointSampler, suv, 0).xy);
+        const float depth_w =
+            exp(-abs(linear_view_depth(sd) - center_linear) * sensitivity * 2.0f);
+        const float normal_w = pow(saturate(dot(n, sn)), 16.0f);
+        const float w = exp(-float(i * i) / float(radius * radius + 1)) * depth_w * normal_w;
+        sum += BlurSourceTex.SampleLevel(PointSampler, suv, 0).rgb * w;
+        weight_sum += w;
+    }
+    if (weight_sum <= 0.0f) {
+        return BlurSourceTex.SampleLevel(PointSampler, uv, 0);
+    }
+    return float4(sum / weight_sum, 1.0f);
+}
+
 float4 LightingPS(FSOut input) : SV_Target {
     const float4 gb0 = GB0Tex.Sample(LinearSampler, input.uv);
     const float4 gb1 = GB1Tex.Sample(LinearSampler, input.uv);
@@ -1729,6 +2467,12 @@ float4 LightingPS(FSOut input) : SV_Target {
     const float metallic = saturate(gb1.w);
     const float3 specular = gb2.rgb;
     const float3 emissive = gb4.rgb;
+    // GB4.a packs shading_model + flags / 256; the receive masks gate the
+    // Phase 5 composites per material.
+    const int material_flags = (int)floor(frac(gb4.a) * 256.0f + 0.5f);
+    const bool receive_ao = (material_flags & 8) != 0;
+    const bool receive_ssr = (material_flags & 16) != 0;
+    const bool receive_gi = (material_flags & 32) != 0;
     const float3 world_pos = reconstruct_world(input.uv, depth_value);
     const float3 n = normalize(normal);
     const float3 v = normalize(CameraPos.xyz - world_pos);
@@ -1835,8 +2579,41 @@ float4 LightingPS(FSOut input) : SV_Target {
     ibl_specular = prefiltered * (f0 * ab.x + ab.y) * (IblParams0.x * 0.35f) * sky_visibility;
 #endif
 
-    float3 color =
-        sun_diffuse + sun_specular + moon_diffuse + moon_specular + ambient + emissive + ibl_specular;
+    float ao = 1.0f;
+    float3 indirect_diffuse = float3(0.0f, 0.0f, 0.0f);
+    float3 indirect_specular = float3(0.0f, 0.0f, 0.0f);
+#if AO_ENABLE
+    {
+        const float4 ao_sample = AoBlurTex.SampleLevel(LinearSampler, input.uv, 0);
+        ao = saturate(lerp(1.0f, ao_sample.a, saturate(AoParams0.y)));
+        if (!receive_ao) {
+            ao = 1.0f;
+        }
+        ao = saturate(ao * gb3.a);
+    }
+#endif
+    ambient *= ao;
+#if SSR_ENABLE && !SSR_DEBUG
+    {
+        const float4 ssr = SsrTex.SampleLevel(LinearSampler, input.uv, 0);
+        const float confidence = receive_ssr ? saturate(ssr.a) : 0.0f;
+        ibl_specular = ibl_specular * (1.0f - confidence) + max(ssr.rgb, 0.0f);
+    }
+#endif
+#if GI_ENABLE > 0
+    {
+        const float3 gi_radiance = max(GiTex.SampleLevel(LinearSampler, input.uv, 0).rgb, 0.0f);
+        if (receive_gi) {
+            indirect_diffuse = gi_radiance * ao;
+#if SSGI_SPECULAR_GI
+            indirect_specular = gi_radiance * f0 * saturate(1.0f - roughness) * ao;
+#endif
+        }
+    }
+#endif
+
+    float3 color = sun_diffuse + sun_specular + moon_diffuse + moon_specular + ambient + emissive +
+                   ibl_specular + indirect_diffuse * diffuse_base + indirect_specular;
 #if DEBUG_VIEW == 8
     const float3 cascade_colors[4] = {float3(0.85f, 0.15f, 0.10f), float3(0.15f, 0.80f, 0.25f),
                                       float3(0.15f, 0.40f, 0.95f), float3(0.95f, 0.85f, 0.15f)};
@@ -1856,6 +2633,16 @@ float4 LightingPS(FSOut input) : SV_Target {
     // Specular image based lighting alone, so the prefiltered cube and the
     // analytic environment BRDF can be inspected without the direct term.
     color = ibl_specular;
+#elif DEBUG_VIEW == 18
+    color = ao.xxx;
+#elif DEBUG_VIEW == 19
+    color = AoBlurTex.SampleLevel(LinearSampler, input.uv, 0).rgb * 0.5f + 0.5f;
+#elif DEBUG_VIEW == 20
+    color = SsrTex.SampleLevel(LinearSampler, input.uv, 0).rgb;
+#elif DEBUG_VIEW == 21
+    color = SsrTex.SampleLevel(LinearSampler, input.uv, 0).aaa;
+#elif DEBUG_VIEW == 22
+    color = GiTex.SampleLevel(LinearSampler, input.uv, 0).rgb;
 #endif
     return float4(max(color, 0.0f), 1.0f);
 }

@@ -31,7 +31,7 @@ struct Options {
     std::string target = "Final";
     float exposure = 0.35f;
     float sun = 1.5f;
-    float ambient = 0.10f;
+    float ambient = -1.0f;
     int debug = 0;
     float sun_elevation = -1.0f;
     float sun_azimuth = 180.0f;
@@ -47,6 +47,9 @@ struct Options {
     float ibl_rotation = 0.0f;
     float ibl_intensity = -1.0f;
     int frames = 1;
+    // Optional energy band for the captured frame mean; -1 disables the check.
+    float expect_mean_min = -1.0f;
+    float expect_mean_max = -1.0f;
     bool animate_sun = false;
     std::string camera = "default";
     float camera_azimuth = 0.0f;
@@ -54,6 +57,13 @@ struct Options {
     bool validate = false;
     bool list_targets = false;
     bool dump_materials = false;
+    // Phase 5 overrides. Negative means "use the phase default".
+    int ao_type = -1;
+    int ao_quality = -1;
+    int ssr_quality = -1;
+    int ssr_debug_mode = -1;
+    int gi_enable = -1;
+    int gi_quality = -1;
     bool help = false;
 };
 
@@ -85,8 +95,8 @@ void print_help() {
         << "  hikari_gfx_lab --phase 2 --scene room --pmx <stage.pmx>\n"
         << "  hikari_gfx_lab --phase 2 --scene character --pmx <model.pmx>\n\n"
         << "Options:\n"
-        << "  --phase <n>        Phase scenario. This build implements phase 1 to 4.\n"
-        << "  --scene <name>     synthetic, room, or character.\n"
+        << "  --phase <n>        Phase scenario. This build implements phase 1 to 5.\n"
+        << "  --scene <name>     synthetic, phase5, room, or character.\n"
         << "  --pmx <path>       Override the scene PMX path.\n"
         << "  --capture <path>   Headless BMP capture.\n"
         << "  --probe <path>     Headless JSON probe.\n"
@@ -94,7 +104,7 @@ void print_help() {
         << "  --exposure <n>     Tonemap exposure (default 0.6).\n"
         << "  --sun <n>          Sun intensity multiplier (default 1.2).\n"
         << "  --ambient <n>      Ambient intensity (default 0.10).\n"
-        << "  --debug <n>        Debug view (0=Off, 8=Cascades, 9=PCSS, 10=Contact, 11=SSGS, 12=SkyVis, 13=SkyCube, 14=SkyIrradiance, 15=SkyPrefilter, 16=SkyPrefilterRough, 17=IblSpecular).\n"
+        << "  --debug <n>        Debug view (0=Off, 8=Cascades, 9=PCSS, 10=Contact, 11=SSGS, 12=SkyVis, 13=SkyCube, 14=SkyIrradiance, 15=SkyPrefilter, 16=SkyPrefilterRough, 17=IblSpecular, 18=Ao, 19=AoBentNormal, 20=SsrRadiance, 21=SsrConfidence, 22=GiRadiance).\n"
         << "  --sun-elevation <n> Sun elevation angle in degrees.\n"
         << "  --sun-azimuth <n>   Sun azimuth angle in degrees.\n"
         << "  --sky-coupling <n>  Fade the direct sun into the sky at low elevation (0/1).\n"
@@ -116,6 +126,14 @@ void print_help() {
         << "  --validate-shaders Compile and run the default shader set.\n"
         << "  --list-targets     List render target names.\n"
         << "  --dump-materials   Print PMX material names, colors and texture slots.\n"
+        << "  --ao <type>        AO algorithm (0=SSDO, 1=HBAO, 2=GTAO).\n"
+        << "  --ao-quality <n>   AO quality, 0 disables (default 6).\n"
+        << "  --ssr-quality <n>  SSR quality, 0 disables (default 4).\n"
+        << "  --ssr-debug-mode <n> SSR trace debug output, 0 to 4.\n"
+        << "  --gi <n>           GI mode (0=off, 1=SSGI, 2=SSGI+, 3=SSPT).\n"
+        << "  --gi-quality <n>   GI quality, 1 to 4.\n"
+        << "  --expect-mean-min <v> Fail unless the capture mean is at least v (0..1).\n"
+        << "  --expect-mean-max <v> Fail unless the capture mean is at most v (0..1).\n"
         << "  --help             Show this text.\n\n"
         << "Environment:\n"
         << "  HIKARI_GFX_ROOM_PMX       Default room stage PMX.\n"
@@ -198,6 +216,22 @@ Options parse_options(int argc, char** argv) {
             options.list_targets = true;
         } else if (argument == "--dump-materials") {
             options.dump_materials = true;
+        } else if (argument == "--ao") {
+            options.ao_type = std::stoi(next("--ao"));
+        } else if (argument == "--ao-quality") {
+            options.ao_quality = std::stoi(next("--ao-quality"));
+        } else if (argument == "--ssr-quality") {
+            options.ssr_quality = std::stoi(next("--ssr-quality"));
+        } else if (argument == "--ssr-debug-mode") {
+            options.ssr_debug_mode = std::stoi(next("--ssr-debug-mode"));
+        } else if (argument == "--gi") {
+            options.gi_enable = std::stoi(next("--gi"));
+        } else if (argument == "--gi-quality") {
+            options.gi_quality = std::stoi(next("--gi-quality"));
+        } else if (argument == "--expect-mean-min") {
+            options.expect_mean_min = std::stof(next("--expect-mean-min"));
+        } else if (argument == "--expect-mean-max") {
+            options.expect_mean_max = std::stof(next("--expect-mean-max"));
         } else if (argument == "--help" || argument == "-h") {
             options.help = true;
         } else {
@@ -235,7 +269,8 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
     if (options.sky_coupling >= 0) {
         settings.sun.sky_coupling = options.sky_coupling != 0;
     }
-    settings.sky.ambient_intensity = options.ambient;
+    settings.sky.ambient_intensity = options.ambient >= 0.0f ? options.ambient
+                                                            : settings.sky.ambient_intensity;
     settings.post.exposure = options.exposure;
     settings.post.tonemap = options.linear_tonemap
                                 ? hikari::gfx::TonemapOperator::Linear
@@ -255,6 +290,46 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
         settings.sky.enabled = true;
         settings.sky.quality = 3;
     }
+    // AO, SSR, and GI are Phase 5 chains. Earlier phases must stay comparable
+    // with their goldens, so the chains are switched off there.
+    if (options.phase < 5) {
+        settings.ao.quality = 0;
+        settings.ssr.quality = 0;
+        settings.gi.enable = 0;
+    }
+    if (options.phase == 5) {
+        settings.ao.type = 2;
+        settings.ao.quality = 6;
+        settings.ao.radius = 1.5f;
+        settings.ssr.quality = 4;
+        settings.gi.enable = 3;
+        settings.gi.quality = 2;
+        settings.gi.filter_radius = 12;
+        // The ceiling blocks direct sunlight, so the room is lit by a stronger
+        // ambient fill plus the emitter; otherwise it reads as a black frame.
+        if (options.ambient < 0.0f) {
+            settings.sky.ambient_intensity = 0.55f;
+        }
+    }
+    if (options.ao_type >= 0) {
+        settings.ao.type = options.ao_type;
+    }
+    if (options.ao_quality >= 0) {
+        settings.ao.quality = options.ao_quality;
+    }
+    if (options.ssr_quality >= 0) {
+        settings.ssr.quality = options.ssr_quality;
+    }
+    if (options.ssr_debug_mode >= 0) {
+        settings.ssr.debug = true;
+        settings.ssr.debug_mode = options.ssr_debug_mode;
+    }
+    if (options.gi_enable >= 0) {
+        settings.gi.enable = options.gi_enable;
+    }
+    if (options.gi_quality >= 0) {
+        settings.gi.quality = options.gi_quality;
+    }
     if (options.ibl >= 0) {
         settings.ibl.quality = options.ibl;
     }
@@ -272,7 +347,7 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
     if (options.moon_intensity >= 0.0f) {
         settings.sky.moon_intensity = options.moon_intensity;
     }
-    if (options.debug >= 0 && options.debug <= 17) {
+    if (options.debug >= 0 && options.debug <= 22) {
         settings.debug.view = static_cast<hikari::gfx::DebugView>(options.debug);
     }
     settings.validate();
@@ -289,7 +364,19 @@ hikari::render::Camera frame_camera(const hikari::gfx_lab::LabScene& scene,
     const float fov = 0.5235987756f;
     const float distance = radius / std::tan(fov * 0.5f) * 1.12f;
     float sky_fov = fov;
-    if (options.camera == "close") {
+    const bool room_view =
+        options.camera == "room" || (options.phase == 5 && options.camera == "default");
+    if (room_view) {
+        // Inside the Phase 5 room, low enough to see the metal floor and its
+        // reflections with the emitter and the coloured walls in frame.
+        const float room_height = scene.bounds_max.y - scene.bounds_min.y;
+        const float room_depth = scene.bounds_max.z - scene.bounds_min.z;
+        camera.position = center + hikari::Vec3(0.0f, -room_height * 0.05f, -room_depth * 0.42f);
+        camera.target = center + hikari::Vec3(0.0f, -room_height * 0.18f, room_depth * 0.20f);
+        // A room interior needs more field of view than a model on a stage:
+        // 30 degrees only shows the far wall from the room centre.
+        sky_fov = 0.7853982f;
+    } else if (options.camera == "close") {
         camera.position = center + hikari::Vec3(0.0f, radius * 0.1f, -radius * 0.45f);
         camera.target = center + hikari::Vec3(0.0f, radius * 0.1f, 0.0f);
     } else if (options.camera == "inside") {
@@ -401,6 +488,9 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
     view.height = height;
 
     const hikari::Vec3 forward = (camera.target - camera.position).normalize();
+    if (!scene.material_overrides.empty()) {
+        view.material_overrides = scene.material_overrides;
+    }
     for (std::size_t i = 0; i < scene.mesh.subsets.size(); ++i) {
         const hikari::render::MeshSubset& subset = scene.mesh.subsets[i];
         hikari::gfx::DrawItem item;
@@ -409,6 +499,9 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
         item.textures = &scene.textures;
         item.skinning = &scene.skinning;
         item.subset = i;
+        if (subset.material_index < view.material_overrides.size()) {
+            item.material_override = &view.material_overrides[subset.material_index];
+        }
         item.depth = (subset_center(scene, subset) - camera.position).dot(forward);
         const bool transparent =
             subset.material_index < scene.materials.size() &&
@@ -427,7 +520,7 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
 }
 
 int run_headless(const Options& options) {
-    if (options.phase < 1 || options.phase > 4) {
+    if (options.phase < 1 || options.phase > 5) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -438,6 +531,8 @@ int run_headless(const Options& options) {
         hikari::gfx_lab::LabScene scene;
         if (options.scene == "synthetic") {
             scene = hikari::gfx_lab::LabScene::synthetic(context);
+        } else if (options.scene == "phase5") {
+            scene = hikari::gfx_lab::LabScene::phase5_room(context);
         } else {
             const std::string path = scene_path(options);
             if (path.empty()) {
@@ -533,6 +628,18 @@ int run_headless(const Options& options) {
                   << width << 'x' << height << " in " << frame_ms << " ms (warm " << warm_ms
                   << " ms, max " << max_ms << " ms), sky updates "
                   << renderer.sky_update_count() << '/' << options.frames << '\n';
+        const float mean = hikari::gfx_lab::mean_luminance(capture);
+        std::cout << "capture mean " << mean << '\n';
+        if (options.expect_mean_min >= 0.0f && mean < options.expect_mean_min) {
+            std::cerr << "energy check failed: mean " << mean << " is below "
+                      << options.expect_mean_min << '\n';
+            return 1;
+        }
+        if (options.expect_mean_max >= 0.0f && mean > options.expect_mean_max) {
+            std::cerr << "energy check failed: mean " << mean << " is above "
+                      << options.expect_mean_max << '\n';
+            return 1;
+        }
         if (!settings.ibl.custom_path.empty()) {
             std::cout << "ibl source: " << (renderer.ibl_custom_active() ? "loaded " : "rejected ")
                       << settings.ibl.custom_path;
@@ -610,7 +717,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 }
 
 int run_window(const Options& options) {
-    if (options.phase < 1 || options.phase > 4) {
+    if (options.phase < 1 || options.phase > 5) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -638,6 +745,8 @@ int run_window(const Options& options) {
         hikari::gfx_lab::LabScene scene;
         if (options.scene == "synthetic") {
             scene = hikari::gfx_lab::LabScene::synthetic(context);
+        } else if (options.scene == "phase5") {
+            scene = hikari::gfx_lab::LabScene::phase5_room(context);
         } else {
             const std::string path = scene_path(options);
             if (path.empty()) {
@@ -733,7 +842,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (options.list_targets) {
-        std::cout << "GB0\nGB1\nGB2\nGB3\nGB4\nDepth\nHdr\nFinalLdr\n";
+        std::cout << "GB0\nGB1\nGB2\nGB3\nGB4\nDepth\nHdr\nFinalLdr\n"
+                     "AoBlur\nSsrTrace\nSsrColor\nGiFiltered\n";
         return 0;
     }
     if (options.validate) {

@@ -62,6 +62,25 @@ private:
     QComboBox* contact_shadow_quality_ = nullptr;
     QComboBox* ssgs_quality_ = nullptr;
     QComboBox* sky_visibility_ = nullptr;
+    QComboBox* ao_type_ = nullptr;
+    QComboBox* ao_quality_ = nullptr;
+    QDoubleSpinBox* ao_radius_ = nullptr;
+    QDoubleSpinBox* ao_intensity_ = nullptr;
+    QComboBox* ssr_quality_ = nullptr;
+    QCheckBox* ssr_debug_ = nullptr;
+    QComboBox* ssr_debug_mode_ = nullptr;
+    QComboBox* gi_enable_ = nullptr;
+    QComboBox* gi_quality_ = nullptr;
+    QSpinBox* gi_filter_radius_ = nullptr;
+    QSpinBox* gi_prefilter_radius_ = nullptr;
+    QDoubleSpinBox* gi_sample_radius_ = nullptr;
+    QDoubleSpinBox* gi_thickness_ = nullptr;
+    QDoubleSpinBox* gi_bounce_weight_ = nullptr;
+    QDoubleSpinBox* gi_il_amount_ = nullptr;
+    QDoubleSpinBox* gi_ao_amount_ = nullptr;
+    QDoubleSpinBox* gi_sensitivity_ = nullptr;
+    QCheckBox* gi_bounces_ = nullptr;
+    QCheckBox* gi_specular_ = nullptr;
     QComboBox* debug_view_ = nullptr;
     QCheckBox* wireframe_ = nullptr;
 

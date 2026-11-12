@@ -190,4 +190,19 @@ float mean_channel_difference(const CaptureData& a, const CaptureData& b) {
     return count > 0.0 ? static_cast<float>(sum / count / 255.0) : 0.0f;
 }
 
+float mean_luminance(const CaptureData& capture) {
+    double sum[3] = {0.0, 0.0, 0.0};
+    const std::size_t pixels = static_cast<std::size_t>(capture.width) * capture.height;
+    for (std::size_t i = 0; i + 3 < capture.rgba.size(); i += 4) {
+        for (int channel = 0; channel < 3; ++channel) {
+            sum[channel] += static_cast<double>(capture.rgba[i + channel]);
+        }
+    }
+    if (pixels == 0) {
+        return 0.0f;
+    }
+    const double total = (sum[0] + sum[1] + sum[2]) / (3.0 * static_cast<double>(pixels));
+    return static_cast<float>(total / 255.0);
+}
+
 } // namespace hikari::gfx_lab

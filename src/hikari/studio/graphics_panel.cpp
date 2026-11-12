@@ -266,6 +266,129 @@ void GraphicsPanel::build_controls() {
     shadows_form->addRow(QStringLiteral("Sky visibility"), sky_visibility_);
     layout->addWidget(make_group(QStringLiteral("Shadows"), shadows));
 
+    ao_type_ = new QComboBox();
+    ao_type_->addItems({QStringLiteral("SSDO (bent normal)"), QStringLiteral("HBAO (horizon)"),
+                        QStringLiteral("GTAO / GTSO (multi-bounce)")});
+    ao_type_->setToolTip(QStringLiteral(
+        "SSDO traces a hemisphere per pixel. HBAO and GTAO integrate the horizon in "
+        "screen space; GTAO adds the multi-bounce term."));
+
+    ao_quality_ = new QComboBox();
+    ao_quality_->addItem(QStringLiteral("Disabled"));
+    for (int level = 1; level <= 6; ++level) {
+        ao_quality_->addItem(QString::number(level));
+    }
+    ao_quality_->setToolTip(QStringLiteral(
+        "Sample budget: 8 to 28 hemisphere rays for SSDO, or 4 to 8 slice directions "
+        "times 4 to 8 horizon steps for HBAO and GTAO."));
+
+    ao_radius_ = make_spin(0.05, 20.0, 0.05, 2);
+    ao_radius_->setToolTip(QStringLiteral("Sampling radius in world units."));
+    ao_intensity_ = make_spin(0.0, 4.0, 0.05, 2);
+    ao_intensity_->setToolTip(
+        QStringLiteral("Blend between the unoccluded and the traced ambient occlusion."));
+
+    auto* ao = new QWidget();
+    auto* ao_form = new QFormLayout(ao);
+    ao_form->setContentsMargins(0, 0, 0, 0);
+    ao_form->addRow(QStringLiteral("Algorithm"), ao_type_);
+    ao_form->addRow(QStringLiteral("Quality"), ao_quality_);
+    ao_form->addRow(QStringLiteral("Radius"), ao_radius_);
+    ao_form->addRow(QStringLiteral("Intensity"), ao_intensity_);
+    layout->addWidget(make_group(QStringLiteral("Ambient occlusion"), ao));
+
+    ssr_quality_ = new QComboBox();
+    ssr_quality_->addItems({QStringLiteral("Disabled"), QStringLiteral("128 taps"),
+                            QStringLiteral("256 taps"), QStringLiteral("384 taps"),
+                            QStringLiteral("512 taps")});
+    ssr_quality_->setToolTip(QStringLiteral(
+        "Half-resolution trace budget through the depth hierarchy. Higher budgets "
+        "reach further before the ray gives up."));
+
+    ssr_debug_ = new QCheckBox(QStringLiteral("Trace debug output"));
+    ssr_debug_->setToolTip(QStringLiteral(
+        "Writes the raw trace value into the SSR resolve target and drops the "
+        "composite. Inspect it with the SSR radiance debug view."));
+
+    ssr_debug_mode_ = new QComboBox();
+    ssr_debug_mode_->addItems({QStringLiteral("Hit mask"), QStringLiteral("Confidence"),
+                               QStringLiteral("Travel distance"), QStringLiteral("Hit normal"),
+                               QStringLiteral("Roughness")});
+    ssr_debug_mode_->setToolTip(QStringLiteral("Value forwarded by the trace debug path."));
+
+    auto* ssr = new QWidget();
+    auto* ssr_form = new QFormLayout(ssr);
+    ssr_form->setContentsMargins(0, 0, 0, 0);
+    ssr_form->addRow(QStringLiteral("Quality"), ssr_quality_);
+    ssr_form->addRow(ssr_debug_);
+    ssr_form->addRow(QStringLiteral("Debug mode"), ssr_debug_mode_);
+    layout->addWidget(make_group(QStringLiteral("Screen-space reflections"), ssr));
+
+    gi_enable_ = new QComboBox();
+    gi_enable_->addItems({QStringLiteral("Disabled"), QStringLiteral("SSGI"),
+                          QStringLiteral("SSGI (wide)"),
+                          QStringLiteral("SSPT / RTGI (multi-bounce)")});
+    gi_enable_->setToolTip(QStringLiteral(
+        "SSGI traces short screen-space rays. SSPT follows longer paths with "
+        "thickness rejection and feeds the previous frame back in."));
+
+    gi_quality_ = new QComboBox();
+    gi_quality_->addItems({QStringLiteral("Low (4 rays)"), QStringLiteral("Medium (8 rays)"),
+                           QStringLiteral("High (12 rays)"),
+                           QStringLiteral("Very high (16 rays)")});
+    gi_quality_->setToolTip(QStringLiteral(
+        "Rays per pixel. SSPT spends the same budget on longer paths instead."));
+
+    gi_filter_radius_ = new QSpinBox();
+    gi_filter_radius_->setRange(1, 8);
+    gi_filter_radius_->setKeyboardTracking(false);
+    gi_filter_radius_->setToolTip(
+        QStringLiteral("Taps per side of the separable GI denoiser."));
+
+    gi_prefilter_radius_ = new QSpinBox();
+    gi_prefilter_radius_->setRange(1, 3);
+    gi_prefilter_radius_->setKeyboardTracking(false);
+    gi_prefilter_radius_->setToolTip(
+        QStringLiteral("Neighbourhood radius of the firefly and outlier prefilter."));
+
+    gi_sample_radius_ = make_spin(0.5, 200.0, 1.0, 1);
+    gi_sample_radius_->setToolTip(QStringLiteral("Maximum GI ray length in world units."));
+    gi_thickness_ = make_spin(0.05, 20.0, 0.05, 2);
+    gi_thickness_->setToolTip(
+        QStringLiteral("Depth a ray may pass behind a surface before it is rejected."));
+    gi_bounce_weight_ = make_spin(0.0, 1.0, 0.05, 2);
+    gi_bounce_weight_->setToolTip(QStringLiteral("Weight of the previous-frame feedback."));
+    gi_il_amount_ = make_spin(0.0, 10.0, 0.1, 2);
+    gi_il_amount_->setToolTip(QStringLiteral("Scales the traced indirect radiance."));
+    gi_ao_amount_ = make_spin(0.0, 4.0, 0.05, 2);
+    gi_ao_amount_->setToolTip(QStringLiteral("Scales the ambient occlusion applied to GI."));
+    gi_sensitivity_ = make_spin(0.05, 8.0, 0.05, 2);
+    gi_sensitivity_->setToolTip(
+        QStringLiteral("How aggressively the denoiser separates across depth edges."));
+    gi_bounces_ = new QCheckBox(QStringLiteral("Previous-frame feedback"));
+    gi_bounces_->setToolTip(
+        QStringLiteral("Adds the last denoised frame to the trace so light bounces."));
+    gi_specular_ = new QCheckBox(QStringLiteral("Specular GI"));
+    gi_specular_->setToolTip(
+        QStringLiteral("Adds the traced radiance to the specular term of smooth materials."));
+
+    auto* gi = new QWidget();
+    auto* gi_form = new QFormLayout(gi);
+    gi_form->setContentsMargins(0, 0, 0, 0);
+    gi_form->addRow(QStringLiteral("Mode"), gi_enable_);
+    gi_form->addRow(QStringLiteral("Quality"), gi_quality_);
+    gi_form->addRow(QStringLiteral("Denoise taps"), gi_filter_radius_);
+    gi_form->addRow(QStringLiteral("Prefilter radius"), gi_prefilter_radius_);
+    gi_form->addRow(QStringLiteral("Ray length"), gi_sample_radius_);
+    gi_form->addRow(QStringLiteral("Thickness"), gi_thickness_);
+    gi_form->addRow(QStringLiteral("Feedback weight"), gi_bounce_weight_);
+    gi_form->addRow(QStringLiteral("Radiance scale"), gi_il_amount_);
+    gi_form->addRow(QStringLiteral("AO scale"), gi_ao_amount_);
+    gi_form->addRow(QStringLiteral("Edge sensitivity"), gi_sensitivity_);
+    gi_form->addRow(gi_bounces_);
+    gi_form->addRow(gi_specular_);
+    layout->addWidget(make_group(QStringLiteral("Global illumination"), gi));
+
     ibl_quality_ = new QComboBox();
     ibl_quality_->addItems({QStringLiteral("Off"), QStringLiteral("Low (128 px)"),
                             QStringLiteral("High (256 px)")});
@@ -343,6 +466,15 @@ void GraphicsPanel::build_controls() {
     debug_view_->addItem(QStringLiteral("Roughness"), static_cast<int>(gfx::DebugView::Roughness));
     debug_view_->addItem(QStringLiteral("Metalness"), static_cast<int>(gfx::DebugView::Metalness));
     debug_view_->addItem(QStringLiteral("Depth"), static_cast<int>(gfx::DebugView::Depth));
+    debug_view_->addItem(QStringLiteral("Ambient occlusion"), static_cast<int>(gfx::DebugView::Ao));
+    debug_view_->addItem(QStringLiteral("AO bent normal"),
+                         static_cast<int>(gfx::DebugView::AoBentNormal));
+    debug_view_->addItem(QStringLiteral("SSR radiance"),
+                         static_cast<int>(gfx::DebugView::SsrRadiance));
+    debug_view_->addItem(QStringLiteral("SSR confidence"),
+                         static_cast<int>(gfx::DebugView::SsrConfidence));
+    debug_view_->addItem(QStringLiteral("GI radiance"),
+                         static_cast<int>(gfx::DebugView::GiRadiance));
     debug_view_->setToolTip(QStringLiteral("Select a diagnostic pass to inspect isolated buffers or shadow masks."));
 
     auto* image = new QWidget();
@@ -358,8 +490,8 @@ void GraphicsPanel::build_controls() {
     auto* reset = new QPushButton(QStringLiteral("Reset to Medium"));
     layout->addWidget(reset);
     status_ = new QLabel(QStringLiteral(
-        "Phase 4: analytic sky, day and night, clouds, image based lighting, and a "
-        "custom environment, on top of the phase 3 shadows."));
+        "Phase 5: ambient occlusion, screen-space reflections, and global "
+        "illumination on top of the phase 4 sky and image based lighting."));
     status_->setWordWrap(true);
 
     auto bind_sky_spin = [this](QDoubleSpinBox* spin, float gfx::SkySettings::*member) {
@@ -478,6 +610,87 @@ void GraphicsPanel::build_controls() {
         push_edit();
         state_.graphics.ao.sky_visibility = index;
     });
+    connect(ao_type_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.ao.type = index;
+        refresh_from_state();
+    });
+    connect(ao_quality_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.ao.quality = index;
+        refresh_from_state();
+    });
+    connect(ao_radius_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.ao.radius = static_cast<float>(value);
+    });
+    connect(ao_intensity_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.ao.intensity = static_cast<float>(value);
+    });
+    connect(ssr_quality_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.ssr.quality = index;
+        refresh_from_state();
+    });
+    connect(ssr_debug_, &QCheckBox::toggled, this, [this](bool checked) {
+        push_edit();
+        state_.graphics.ssr.debug = checked;
+        refresh_from_state();
+    });
+    connect(ssr_debug_mode_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.ssr.debug_mode = index;
+    });
+    connect(gi_enable_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.gi.enable = index;
+        refresh_from_state();
+    });
+    connect(gi_quality_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.gi.quality = index + 1;
+    });
+    connect(gi_filter_radius_, &QSpinBox::valueChanged, this, [this](int value) {
+        push_edit();
+        state_.graphics.gi.filter_radius = value;
+    });
+    connect(gi_prefilter_radius_, &QSpinBox::valueChanged, this, [this](int value) {
+        push_edit();
+        state_.graphics.gi.prefilter_radius = value;
+    });
+    connect(gi_sample_radius_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.gi.sample_radius = static_cast<float>(value);
+    });
+    connect(gi_thickness_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.gi.z_thickness = static_cast<float>(value);
+    });
+    connect(gi_bounce_weight_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.gi.bounce_weight = static_cast<float>(value);
+    });
+    connect(gi_il_amount_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.gi.il_amount = static_cast<float>(value);
+    });
+    connect(gi_ao_amount_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.gi.ao_amount = static_cast<float>(value);
+    });
+    connect(gi_sensitivity_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
+        push_edit();
+        state_.graphics.gi.filter_sensitivity = static_cast<float>(value);
+    });
+    connect(gi_bounces_, &QCheckBox::toggled, this, [this](bool checked) {
+        push_edit();
+        state_.graphics.gi.bounces = checked;
+    });
+    connect(gi_specular_, &QCheckBox::toggled, this, [this](bool checked) {
+        push_edit();
+        state_.graphics.gi.specular_gi = checked;
+    });
     connect(ambient_intensity_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
         push_edit();
         state_.graphics.sky.ambient_intensity = static_cast<float>(value);
@@ -588,6 +801,25 @@ void GraphicsPanel::refresh_from_state() {
     const QSignalBlocker block_contact(contact_shadow_quality_);
     const QSignalBlocker block_ssgs(ssgs_quality_);
     const QSignalBlocker block_sky_vis(sky_visibility_);
+    const QSignalBlocker block_ao_type(ao_type_);
+    const QSignalBlocker block_ao_quality(ao_quality_);
+    const QSignalBlocker block_ao_radius(ao_radius_);
+    const QSignalBlocker block_ao_intensity(ao_intensity_);
+    const QSignalBlocker block_ssr_quality(ssr_quality_);
+    const QSignalBlocker block_ssr_debug(ssr_debug_);
+    const QSignalBlocker block_ssr_debug_mode(ssr_debug_mode_);
+    const QSignalBlocker block_gi_enable(gi_enable_);
+    const QSignalBlocker block_gi_quality(gi_quality_);
+    const QSignalBlocker block_gi_filter(gi_filter_radius_);
+    const QSignalBlocker block_gi_prefilter(gi_prefilter_radius_);
+    const QSignalBlocker block_gi_sample_radius(gi_sample_radius_);
+    const QSignalBlocker block_gi_thickness(gi_thickness_);
+    const QSignalBlocker block_gi_bounce_weight(gi_bounce_weight_);
+    const QSignalBlocker block_gi_il_amount(gi_il_amount_);
+    const QSignalBlocker block_gi_ao_amount(gi_ao_amount_);
+    const QSignalBlocker block_gi_sensitivity(gi_sensitivity_);
+    const QSignalBlocker block_gi_bounces(gi_bounces_);
+    const QSignalBlocker block_gi_specular(gi_specular_);
     const QSignalBlocker block_wireframe(wireframe_);
     const QSignalBlocker block_debug_view(debug_view_);
     const QSignalBlocker block_sky_enabled(sky_enabled_);
@@ -624,6 +856,25 @@ void GraphicsPanel::refresh_from_state() {
     contact_shadow_quality_->setCurrentIndex(std::clamp(graphics.shadows.contact_quality, 0, 3));
     ssgs_quality_->setCurrentIndex(std::clamp(graphics.shadows.ssgs_quality, 0, 3));
     sky_visibility_->setCurrentIndex(std::clamp(graphics.ao.sky_visibility, 0, 2));
+    ao_type_->setCurrentIndex(std::clamp(graphics.ao.type, 0, 2));
+    ao_quality_->setCurrentIndex(std::clamp(graphics.ao.quality, 0, 6));
+    ao_radius_->setValue(graphics.ao.radius);
+    ao_intensity_->setValue(graphics.ao.intensity);
+    ssr_quality_->setCurrentIndex(std::clamp(graphics.ssr.quality, 0, 4));
+    ssr_debug_->setChecked(graphics.ssr.debug);
+    ssr_debug_mode_->setCurrentIndex(std::clamp(graphics.ssr.debug_mode, 0, 4));
+    gi_enable_->setCurrentIndex(std::clamp(graphics.gi.enable, 0, 3));
+    gi_quality_->setCurrentIndex(std::clamp(graphics.gi.quality, 1, 4) - 1);
+    gi_filter_radius_->setValue(std::clamp(graphics.gi.filter_radius, 1, 8));
+    gi_prefilter_radius_->setValue(std::clamp(graphics.gi.prefilter_radius, 1, 3));
+    gi_sample_radius_->setValue(graphics.gi.sample_radius);
+    gi_thickness_->setValue(graphics.gi.z_thickness);
+    gi_bounce_weight_->setValue(graphics.gi.bounce_weight);
+    gi_il_amount_->setValue(graphics.gi.il_amount);
+    gi_ao_amount_->setValue(graphics.gi.ao_amount);
+    gi_sensitivity_->setValue(graphics.gi.filter_sensitivity);
+    gi_bounces_->setChecked(graphics.gi.bounces);
+    gi_specular_->setChecked(graphics.gi.specular_gi);
 
     sky_enabled_->setChecked(graphics.sky.enabled);
     sky_quality_->setCurrentIndex(std::clamp(graphics.sky.quality, 0, 4));
@@ -653,6 +904,27 @@ void GraphicsPanel::refresh_from_state() {
     contact_shadow_quality_->setEnabled(shadows_enabled);
     ssgs_quality_->setEnabled(shadows_enabled);
     sky_visibility_->setEnabled(shadows_enabled);
+
+    const bool ao_on = graphics.ao.quality > 0;
+    gate_control(ao_radius_, ao_on,
+                 QStringLiteral("Raise the AO quality above Disabled to sample."));
+    gate_control(ao_intensity_, ao_on,
+                 QStringLiteral("Raise the AO quality above Disabled to sample."));
+
+    const bool ssr_on = graphics.ssr.quality > 0;
+    gate_control(ssr_debug_, ssr_on,
+                 QStringLiteral("Raise the SSR quality above Disabled to trace."));
+    gate_control(ssr_debug_mode_, ssr_on && graphics.ssr.debug,
+                 QStringLiteral("Enable the trace debug output to choose a value."));
+
+    const bool gi_on = graphics.gi.enable > 0;
+    const QString gi_reason = QStringLiteral("Choose a GI mode to edit the trace settings.");
+    for (QWidget* widget : std::array<QWidget*, 11>{
+             gi_quality_, gi_filter_radius_, gi_prefilter_radius_, gi_sample_radius_,
+             gi_thickness_, gi_bounce_weight_, gi_il_amount_, gi_ao_amount_, gi_sensitivity_,
+             gi_bounces_, gi_specular_}) {
+        gate_control(widget, gi_on, gi_reason);
+    }
 
     const bool sky_on = graphics.sky.enabled;
     const QString sky_reason = QStringLiteral("Enable the analytic sky to edit this value.");
