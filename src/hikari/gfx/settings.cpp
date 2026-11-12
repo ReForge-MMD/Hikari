@@ -320,7 +320,7 @@ int GraphicsSettings::validate() {
     clamp_float(ssr.water_surface_y, -10000.0f, 10000.0f);
     clamp_float(ssr.caustics_intensity, 0.0f, 100.0f);
 
-    clamp_int(gi.enable, 0, 3);
+    clamp_int(gi.enable, 0, 4);
     clamp_int(gi.quality, 1, 4);
     clamp_int(gi.filter_radius, 1, 64);
     clamp_int(gi.prefilter_radius, 1, 4);

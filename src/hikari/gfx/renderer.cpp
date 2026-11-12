@@ -322,6 +322,8 @@ void Renderer::resize(std::uint32_t width, std::uint32_t height) {
     width_ = width;
     height_ = height;
     sky_capture_size_ = 0;
+    frame_index_ = 0;
+    has_prev_view_projection_ = false;
     targets_.clear();
     ensure_targets(width, height);
 }
@@ -359,10 +361,20 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
     const std::uint32_t half_width = std::max(width / 2u, 1u);
     const std::uint32_t half_height = std::max(height / 2u, 1u);
     for (const char* name : {"AoRaw", "AoBlurTmp", "AoBlur", "SsrTrace", "SsrBlurTmp",
-                             "SsrBlur0", "SsrBlur1", "SsrColor", "GiRaw", "GiPrefilter",
-                             "GiBlurTmp", "GiFiltered"}) {
+                             "SsrBlur0", "SsrBlur1", "SsrColor"}) {
         targets_.create_target(context_.device.Get(), name, half_width, half_height,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT);
+    }
+    for (const char* name : {"GiRaw", "GiPrefilter", "GiBlurTmp", "GiFiltered", "GiHistory"}) {
+        targets_.create_target(context_.device.Get(), name, half_width, half_height,
+                                DXGI_FORMAT_R16G16B16A16_FLOAT, true);
+    }
+    targets_.create_target(context_.device.Get(), "SsrcMinMaxDepth",
+                           std::max(half_width / 2u, 1u), std::max(half_height / 2u, 1u),
+                           DXGI_FORMAT_R32G32_FLOAT, true);
+    for (const char* name : {"SsrcCascadeA", "SsrcCascadeB"}) {
+        targets_.create_target(context_.device.Get(), name, half_width * 4u, half_height * 2u,
+                                DXGI_FORMAT_R16G16B16A16_FLOAT, true);
     }
     // Hi-Z pyramid for the SSR trace. Level 0 is half resolution and each later
     // level halves again, storing the nearest linear depth per tile.
@@ -372,12 +384,13 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
                                 std::max(half_width / divisor, 1u),
                                 std::max(half_height / divisor, 1u), DXGI_FORMAT_R32_FLOAT);
     }
-    // The GI history buffer feeds bounce radiance into the next frame, so it
-    // must not start from uninitialised memory.
+    // The GI history buffer feeds bounce radiance and temporal reprojection
+    // into the next frame, so it must not start from uninitialised memory.
     const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    const Target* gi_history = targets_.get("GiFiltered");
-    if (gi_history != nullptr) {
-        context_.context->ClearRenderTargetView(gi_history->rtv.Get(), clear);
+    for (const char* name : {"GiFiltered", "GiHistory"}) {
+        if (const Target* target = targets_.get(name)) {
+            context_.context->ClearRenderTargetView(target->rtv.Get(), clear);
+        }
     }
 }
 
@@ -436,6 +449,10 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     // AO, SSR, and GI only contribute through the lighting pass, so they are
     // skipped whenever lighting is off.
     if (view.show_lighting) {
+        if (settings.gi.enable > 0) {
+            draw_gi(settings);
+            draw_gi_filter(settings);
+        }
         if (settings.ao.quality > 0) {
             draw_ao(settings);
             draw_ao_blur(settings);
@@ -445,10 +462,6 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
             draw_ssr(settings);
             draw_ssr_blur(settings);
             draw_ssr_resolve(settings);
-        }
-        if (settings.gi.enable > 0) {
-            draw_gi(settings);
-            draw_gi_filter(settings);
         }
     }
     ID3D11ShaderResourceView* null_half[5] = {};
@@ -468,6 +481,9 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     context_.context->VSSetShaderResources(0, 1, null_views);
     ID3D11ShaderResourceView* null_diffuse = nullptr;
     context_.context->VSSetShaderResources(8, 1, &null_diffuse);
+    prev_view_projection_ = to_array(view.view_projection);
+    has_prev_view_projection_ = true;
+    ++frame_index_;
 }
 
 void Renderer::update_frame_constants(const GraphicsSettings& settings, const FrameView& view,
@@ -485,13 +501,16 @@ FrameConstants Renderer::build_frame_constants(const GraphicsSettings& settings,
     constants.projection = to_array(view.projection);
     constants.view_projection = to_array(view.view_projection);
     constants.inverse_view = to_array(view.inverse_view);
+    constants.prev_view_projection =
+        has_prev_view_projection_ ? prev_view_projection_ : constants.view_projection;
     constants.camera_pos = to_array4(view.camera_position, 1.0f);
     constants.sun_direction = to_array4(view.sun_direction.normalize(), view.is_night ? 1.0f : 0.0f);
     constants.sun_color = to_array4(view.sun_color, 0.0f);
     constants.ambient_color = to_array4(view.ambient_color, 0.0f);
     constants.params0 = {view.near_z, view.far_z, settings.post.exposure, view.time_seconds};
     constants.params1 = {view.orthographic ? 1.0f : 0.0f, static_cast<float>(width_),
-                         static_cast<float>(height_), 0.0f};
+                         static_cast<float>(height_),
+                         static_cast<float>(has_prev_view_projection_ ? frame_index_ : 0u)};
     const float ortho_width =
         view.orthographic ? 2.0f / std::max(view.projection.m[0][0], 1.0e-6f) : 0.0f;
     const float ortho_height =
@@ -526,6 +545,7 @@ void Renderer::bind_frame_constants() {
     ID3D11Buffer* buffers[] = {frame_buffer_.Get()};
     context_.context->VSSetConstantBuffers(0, 1, buffers);
     context_.context->PSSetConstantBuffers(0, 1, buffers);
+    context_.context->CSSetConstantBuffers(0, 1, buffers);
 }
 
 void Renderer::bind_material_constants() {
@@ -568,7 +588,7 @@ std::vector<ShaderDefine> Renderer::ao_ssr_gi_defines(const GraphicsSettings& se
     const int ao_type = std::clamp(settings.ao.type, 0, 2);
     const int ao_quality = std::clamp(settings.ao.quality, 0, 6);
     const int ssr_quality = std::clamp(settings.ssr.quality, 0, 4);
-    const int gi_enable = std::clamp(settings.gi.enable, 0, 3);
+    const int gi_enable = std::clamp(settings.gi.enable, 0, 4);
     const int gi_quality = std::clamp(settings.gi.quality, 1, 4);
 
     std::vector<ShaderDefine> defines;
@@ -1676,7 +1696,7 @@ void Renderer::update_ao_ssr_gi_constants(const GraphicsSettings& settings) {
     const int ao_type = std::clamp(settings.ao.type, 0, 2);
     const int ao_quality = std::clamp(settings.ao.quality, 0, 6);
     const int ssr_quality = std::clamp(settings.ssr.quality, 0, 4);
-    const int gi_enable = std::clamp(settings.gi.enable, 0, 3);
+    const int gi_enable = std::clamp(settings.gi.enable, 0, 4);
     const int gi_quality = std::clamp(settings.gi.quality, 1, 4);
 
     AoSsrGiConstants constants;
@@ -1723,6 +1743,7 @@ void Renderer::bind_ao_ssr_gi_constants() {
     }
     ID3D11Buffer* buffers[] = {ao_ssr_gi_buffer_.Get()};
     context_.context->PSSetConstantBuffers(6, 1, buffers);
+    context_.context->CSSetConstantBuffers(6, 1, buffers);
 }
 
 // Common state for the half-resolution Phase 5 chains. Depth testing is off
@@ -1957,35 +1978,119 @@ void Renderer::draw_gi(const GraphicsSettings& settings) {
     const Target* gb3 = targets_.get("GB3");
     const Target* gb4 = targets_.get("GB4");
     const DepthTarget* depth = targets_.get_depth("Depth");
-    if (raw == nullptr || history == nullptr || gb0 == nullptr || gb1 == nullptr ||
-        gb3 == nullptr || gb4 == nullptr || depth == nullptr) {
+    if (raw == nullptr || raw->uav == nullptr || history == nullptr || gb0 == nullptr ||
+        gb1 == nullptr || gb3 == nullptr || gb4 == nullptr || depth == nullptr) {
         return;
     }
     const auto defines = ao_ssr_gi_defines(settings);
-    const ShaderProgram& program =
-        shaders_.get("gi_trace", kShaderSource, "FullscreenVS", "GiTracePS", defines, nullptr);
+    const ComputeProgram& program =
+        shaders_.get_compute("gi_trace_cs", kShaderSource, "GiTraceCS", defines);
 
-    ID3D11RenderTargetView* views[] = {raw->rtv.Get()};
-    context_.context->OMSetRenderTargets(1, views, nullptr);
+    context_.context->OMSetRenderTargets(0, nullptr, nullptr);
+    auto* linear = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    ID3D11SamplerState* samplers[2] = {linear, point};
+    context_.context->CSSetSamplers(0, 2, samplers);
+    bind_frame_constants();
+    bind_ao_ssr_gi_constants();
+
     ID3D11ShaderResourceView* resources[6] = {gb0->srv.Get(), gb1->srv.Get(), gb3->srv.Get(),
                                               gb4->srv.Get(), depth->srv.Get(),
                                               history->srv.Get()};
-    context_.context->PSSetShaderResources(0, 1, &resources[0]);
-    context_.context->PSSetShaderResources(1, 1, &resources[1]);
-    context_.context->PSSetShaderResources(3, 1, &resources[2]);
-    context_.context->PSSetShaderResources(4, 1, &resources[3]);
-    context_.context->PSSetShaderResources(5, 1, &resources[4]);
-    context_.context->PSSetShaderResources(22, 1, &resources[5]);
+    context_.context->CSSetShaderResources(0, 1, &resources[0]);
+    context_.context->CSSetShaderResources(1, 1, &resources[1]);
+    context_.context->CSSetShaderResources(3, 1, &resources[2]);
+    context_.context->CSSetShaderResources(4, 1, &resources[3]);
+    context_.context->CSSetShaderResources(5, 1, &resources[4]);
+    context_.context->CSSetShaderResources(22, 1, &resources[5]);
     if (sky_sh_srv_ != nullptr) {
         ID3D11ShaderResourceView* sh_srv = sky_sh_srv_.Get();
-        context_.context->PSSetShaderResources(16, 1, &sh_srv);
+        context_.context->CSSetShaderResources(16, 1, &sh_srv);
     }
-    bind_half_res_state();
-    draw_fullscreen(program);
 
-    // The history buffer becomes a render target in the final denoise pass.
+    ID3D11UnorderedAccessView* null_uav = nullptr;
     ID3D11ShaderResourceView* null_srv = nullptr;
-    context_.context->PSSetShaderResources(22, 1, &null_srv);
+    if (settings.gi.enable >= 4) {
+        const Target* minmax = targets_.get("SsrcMinMaxDepth");
+        const Target* cascade_a = targets_.get("SsrcCascadeA");
+        const Target* cascade_b = targets_.get("SsrcCascadeB");
+        if (minmax != nullptr && minmax->uav != nullptr && cascade_a != nullptr &&
+            cascade_a->uav != nullptr && cascade_b != nullptr && cascade_b->uav != nullptr) {
+            const ComputeProgram& minmax_cs =
+                shaders_.get_compute("ssrc_minmax_cs", kShaderSource, "SsrcMinMaxDepthCS", defines);
+            ID3D11UnorderedAccessView* mm_uav = minmax->uav.Get();
+            context_.context->CSSetUnorderedAccessViews(0, 1, &mm_uav, nullptr);
+            context_.context->CSSetShader(minmax_cs.compute.Get(), nullptr, 0);
+            context_.context->Dispatch((minmax->width + 7u) / 8u, (minmax->height + 7u) / 8u, 1u);
+            context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+
+            ID3D11ShaderResourceView* mm_srv = minmax->srv.Get();
+            context_.context->CSSetShaderResources(23, 1, &mm_srv);
+
+            const std::uint32_t cas_gx = (cascade_a->width + 7u) / 8u;
+            const std::uint32_t cas_gy = (cascade_a->height + 7u) / 8u;
+            const Target* prev_cascade = nullptr;
+            const Target* out_cascade = cascade_a;
+            for (int level = 3; level >= 0; --level) {
+                auto lvl_defines = defines;
+                lvl_defines.push_back({"SSRC_LEVEL", std::to_string(level)});
+                const ComputeProgram& cascade_cs = shaders_.get_compute(
+                    "ssrc_cascade_" + std::to_string(level), kShaderSource, "SsrcCascadeCS",
+                    lvl_defines);
+                if (prev_cascade != nullptr) {
+                    ID3D11ShaderResourceView* prev_srv = prev_cascade->srv.Get();
+                    context_.context->CSSetShaderResources(24, 1, &prev_srv);
+                }
+                ID3D11UnorderedAccessView* cas_uav = out_cascade->uav.Get();
+                context_.context->CSSetUnorderedAccessViews(0, 1, &cas_uav, nullptr);
+                context_.context->CSSetShader(cascade_cs.compute.Get(), nullptr, 0);
+                context_.context->Dispatch(cas_gx, cas_gy, 1u);
+                context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+                context_.context->CSSetShaderResources(24, 1, &null_srv);
+                prev_cascade = out_cascade;
+                out_cascade = (out_cascade == cascade_a) ? cascade_b : cascade_a;
+            }
+
+            const ComputeProgram& combine_cs =
+                shaders_.get_compute("ssrc_combine_sh_cs", kShaderSource, "SsrcCombineShCS", defines);
+            ID3D11ShaderResourceView* c0_srv = prev_cascade->srv.Get();
+            ID3D11UnorderedAccessView* sh_uav = out_cascade->uav.Get();
+            context_.context->CSSetShaderResources(24, 1, &c0_srv);
+            context_.context->CSSetUnorderedAccessViews(0, 1, &sh_uav, nullptr);
+            context_.context->CSSetShader(combine_cs.compute.Get(), nullptr, 0);
+            context_.context->Dispatch((minmax->width + 7u) / 8u, (minmax->height + 7u) / 8u, 1u);
+            context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+            context_.context->CSSetShaderResources(24, 1, &null_srv);
+
+            const ComputeProgram& resolve_cs =
+                shaders_.get_compute("ssrc_resolve_cs", kShaderSource, "SsrcResolveCS", defines);
+            ID3D11ShaderResourceView* sh_srv = out_cascade->srv.Get();
+            ID3D11UnorderedAccessView* raw_uav = raw->uav.Get();
+            context_.context->CSSetShaderResources(24, 1, &sh_srv);
+            context_.context->CSSetUnorderedAccessViews(0, 1, &raw_uav, nullptr);
+            context_.context->CSSetShader(resolve_cs.compute.Get(), nullptr, 0);
+            context_.context->Dispatch((raw->width + 7u) / 8u, (raw->height + 7u) / 8u, 1u);
+            context_.context->CSSetShader(nullptr, nullptr, 0);
+            context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+            context_.context->CSSetShaderResources(24, 1, &null_srv);
+            context_.context->CSSetShaderResources(23, 1, &null_srv);
+        }
+    } else {
+        ID3D11UnorderedAccessView* out_uav = raw->uav.Get();
+        context_.context->CSSetUnorderedAccessViews(0, 1, &out_uav, nullptr);
+        context_.context->CSSetShader(program.compute.Get(), nullptr, 0);
+        context_.context->Dispatch((raw->width + 7u) / 8u, (raw->height + 7u) / 8u, 1u);
+        context_.context->CSSetShader(nullptr, nullptr, 0);
+        context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+    }
+
+    context_.context->CSSetShaderResources(0, 1, &null_srv);
+    context_.context->CSSetShaderResources(1, 1, &null_srv);
+    context_.context->CSSetShaderResources(3, 1, &null_srv);
+    context_.context->CSSetShaderResources(4, 1, &null_srv);
+    context_.context->CSSetShaderResources(5, 1, &null_srv);
+    context_.context->CSSetShaderResources(16, 1, &null_srv);
+    context_.context->CSSetShaderResources(22, 1, &null_srv);
 }
 
 void Renderer::draw_gi_filter(const GraphicsSettings& settings) {
@@ -1993,41 +2098,93 @@ void Renderer::draw_gi_filter(const GraphicsSettings& settings) {
     const Target* prefiltered = targets_.get("GiPrefilter");
     const Target* temp = targets_.get("GiBlurTmp");
     const Target* filtered = targets_.get("GiFiltered");
+    const Target* history = targets_.get("GiHistory");
     const Target* gb1 = targets_.get("GB1");
     const DepthTarget* depth = targets_.get_depth("Depth");
-    if (raw == nullptr || prefiltered == nullptr || temp == nullptr || filtered == nullptr ||
-        gb1 == nullptr || depth == nullptr) {
+    if (raw == nullptr || prefiltered == nullptr || prefiltered->uav == nullptr ||
+        temp == nullptr || temp->uav == nullptr || filtered == nullptr ||
+        filtered->uav == nullptr || history == nullptr || gb1 == nullptr || depth == nullptr) {
         return;
     }
+
     auto defines = ao_ssr_gi_defines(settings);
-    const ShaderProgram& prefilter = shaders_.get("gi_prefilter", kShaderSource, "FullscreenVS",
-                                                  "GiPrefilterPS", defines, nullptr);
-    defines.push_back({"GI_FILTER_DIR", "0"});
-    const ShaderProgram& horizontal = shaders_.get("gi_denoise_x", kShaderSource, "FullscreenVS",
-                                                   "GiDenoisePS", defines, nullptr);
-    defines.back().value = "1";
-    const ShaderProgram& vertical = shaders_.get("gi_denoise_y", kShaderSource, "FullscreenVS",
-                                                 "GiDenoisePS", defines, nullptr);
+    const ComputeProgram& prefilter =
+        shaders_.get_compute("gi_prefilter_cs", kShaderSource, "GiOutlierRejectCS", defines);
+    const ComputeProgram& temporal =
+        shaders_.get_compute("gi_temporal_cs", kShaderSource, "GiTemporalCS", defines);
+
+    context_.context->OMSetRenderTargets(0, nullptr, nullptr);
+    auto* linear = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    ID3D11SamplerState* samplers[2] = {linear, point};
+    context_.context->CSSetSamplers(0, 2, samplers);
+    bind_frame_constants();
+    bind_ao_ssr_gi_constants();
 
     ID3D11ShaderResourceView* gb1_srv = gb1->srv.Get();
     ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
-    context_.context->PSSetShaderResources(1, 1, &gb1_srv);
-    context_.context->PSSetShaderResources(5, 1, &depth_srv);
-    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->CSSetShaderResources(1, 1, &gb1_srv);
+    context_.context->CSSetShaderResources(5, 1, &depth_srv);
 
-    const auto run = [&](const Target* source, const Target* destination,
-                         const ShaderProgram& program) {
-        ID3D11RenderTargetView* views[] = {destination->rtv.Get()};
-        context_.context->OMSetRenderTargets(1, views, nullptr);
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    ID3D11UnorderedAccessView* null_uav = nullptr;
+    const std::uint32_t groups_x = (filtered->width + 7u) / 8u;
+    const std::uint32_t groups_y = (filtered->height + 7u) / 8u;
+
+    const auto run_cs = [&](const Target* source, const Target* destination,
+                            const ComputeProgram& program) {
         ID3D11ShaderResourceView* srv = source->srv.Get();
-        context_.context->PSSetShaderResources(24, 1, &srv);
-        bind_half_res_state();
-        draw_fullscreen(program);
-        context_.context->PSSetShaderResources(24, 1, &null_srv);
+        ID3D11UnorderedAccessView* uav = destination->uav.Get();
+        context_.context->CSSetShaderResources(24, 1, &srv);
+        context_.context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        context_.context->CSSetShader(program.compute.Get(), nullptr, 0);
+        context_.context->Dispatch(groups_x, groups_y, 1u);
+        context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+        context_.context->CSSetShaderResources(24, 1, &null_srv);
     };
-    run(raw, prefiltered, prefilter);
-    run(prefiltered, temp, horizontal);
-    run(temp, filtered, vertical);
+
+    run_cs(raw, prefiltered, prefilter);
+
+    const std::vector<int> blur_steps =
+        settings.gi.filter_radius >= 8 ? std::vector<int>{1, 2, 4} : std::vector<int>{1, 2};
+    const Target* current_src = prefiltered;
+    for (int step : blur_steps) {
+        auto step_defines = defines;
+        step_defines.push_back({"GI_FILTER_DIR", "0"});
+        step_defines.push_back({"GI_BLUR_STEP", std::to_string(step)});
+        const ComputeProgram& horizontal = shaders_.get_compute(
+            "gi_blur_x_" + std::to_string(step), kShaderSource, "GiBlurCS", step_defines);
+        step_defines[step_defines.size() - 2].value = "1";
+        const ComputeProgram& vertical = shaders_.get_compute(
+            "gi_blur_y_" + std::to_string(step), kShaderSource, "GiBlurCS", step_defines);
+        run_cs(current_src, temp, horizontal);
+        run_cs(temp, filtered, vertical);
+        current_src = filtered;
+    }
+
+    // Temporal accumulation with 3x3 variance clipping; outputs into temp (RGB)
+    // and prefiltered (RGB + linear depth history), then copies back.
+    ID3D11ShaderResourceView* curr_srv = filtered->srv.Get();
+    ID3D11ShaderResourceView* hist_srv = history->srv.Get();
+    ID3D11UnorderedAccessView* temp_uav = temp->uav.Get();
+    ID3D11UnorderedAccessView* hist_out_uav = prefiltered->uav.Get();
+    context_.context->CSSetShaderResources(24, 1, &curr_srv);
+    context_.context->CSSetShaderResources(22, 1, &hist_srv);
+    context_.context->CSSetUnorderedAccessViews(0, 1, &temp_uav, nullptr);
+    context_.context->CSSetUnorderedAccessViews(2, 1, &hist_out_uav, nullptr);
+    context_.context->CSSetShader(temporal.compute.Get(), nullptr, 0);
+    context_.context->Dispatch(groups_x, groups_y, 1u);
+    context_.context->CSSetShader(nullptr, nullptr, 0);
+
+    context_.context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
+    context_.context->CSSetUnorderedAccessViews(2, 1, &null_uav, nullptr);
+    context_.context->CSSetShaderResources(24, 1, &null_srv);
+    context_.context->CSSetShaderResources(22, 1, &null_srv);
+    context_.context->CSSetShaderResources(1, 1, &null_srv);
+    context_.context->CSSetShaderResources(5, 1, &null_srv);
+
+    context_.context->CopyResource(filtered->texture.Get(), temp->texture.Get());
+    context_.context->CopyResource(history->texture.Get(), prefiltered->texture.Get());
 }
 
 // Every sky entry point samples the transmittance LUT through PointSampler and

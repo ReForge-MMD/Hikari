@@ -7,12 +7,13 @@ cbuffer FrameParams : register(b0) {
     row_major float4x4 Projection;
     row_major float4x4 ViewProjection;
     row_major float4x4 InverseView;
+    row_major float4x4 PrevViewProjection;
     float4 CameraPos;
     float4 SunDirection;
     float4 SunColor;
     float4 AmbientColor;
     float4 Params0; // near, far, exposure, time
-    float4 Params1; // ortho, viewport width, viewport height, unused
+    float4 Params1; // ortho, viewport width, viewport height, frame index
     float4 Params2; // projection 00, projection 11, ortho width, ortho height
     float4 BackgroundColor;
 };
@@ -110,6 +111,8 @@ Texture2D BlurSourceTex : register(t24);
 Texture2D SsrDepth1Tex : register(t25);
 Texture2D SsrDepth2Tex : register(t26);
 Texture2D SsrDepth3Tex : register(t27);
+RWTexture2D<float4> GiOutUAV : register(u0);
+RWTexture2D<float4> GiHistoryUAV : register(u2);
 
 #ifndef SUN_SHADOW_PCSS
 #define SUN_SHADOW_PCSS 1
@@ -406,22 +409,22 @@ float3 diffuse_eon(float3 base, float3 n, float3 l, float3 v, float no_l, float 
     return base * (1.0f / PI) * max(0.0f, a + term);
 }
 
-float3 reconstruct_world(float2 uv, float depth_value) {
+float3 reconstruct_view(float2 uv, float depth_value) {
     const float near_z = Params0.x;
     const float far_z = Params0.y;
     const bool orthographic = Params1.x > 0.5f;
     const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
-    float3 view_pos;
     if (orthographic) {
         const float view_z = near_z + depth_value * (far_z - near_z);
-        view_pos = float3(ndc.x * Params2.z * 0.5f, ndc.y * Params2.w * 0.5f, view_z);
-    } else {
-        const float view_z = (near_z * far_z) / max(far_z - depth_value * (far_z - near_z),
-                                                    1.0e-6f);
-        view_pos = float3(ndc.x * view_z / max(Params2.x, 1.0e-6f),
-                          ndc.y * view_z / max(Params2.y, 1.0e-6f), view_z);
+        return float3(ndc.x * Params2.z * 0.5f, ndc.y * Params2.w * 0.5f, view_z);
     }
-    return mul(float4(view_pos, 1.0f), InverseView).xyz;
+    const float view_z = (near_z * far_z) / max(far_z - depth_value * (far_z - near_z), 1.0e-6f);
+    return float3(ndc.x * view_z / max(Params2.x, 1.0e-6f),
+                  ndc.y * view_z / max(Params2.y, 1.0e-6f), view_z);
+}
+
+float3 reconstruct_world(float2 uv, float depth_value) {
+    return mul(float4(reconstruct_view(uv, depth_value), 1.0f), InverseView).xyz;
 }
 
 float linear_view_depth(float depth_value) {
@@ -1834,6 +1837,19 @@ float phase5_hash(float2 pixel) {
     return frac(52.9829189f * frac(0.06711056f * pixel.x + 0.00583715f * pixel.y));
 }
 
+float3 phase5_hash3(float2 pixel) {
+    uint3 v = uint3(uint(pixel.x), uint(pixel.y), uint(pixel.x) * 1973u ^ uint(pixel.y) * 9277u);
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return float3(v) * (1.0f / 4294967296.0f);
+}
+
 // Screen space directional occlusion. Writes the bent normal in RGB and the
 // visibility in A. AO_TYPE 0 traces a hemisphere per pixel (SSDO), 1 uses HBAO
 // style horizon slices, and 2 uses GTAO slices plus a multi-bounce lift.
@@ -2278,22 +2294,155 @@ float4 SsrResolvePS(FSOut input) : SV_Target {
 #endif
 }
 
-// Diffuse global illumination. GI_ENABLE 1 and 2 trace short SSGI paths;
-// GI_ENABLE 3 uses longer SSPT paths and feeds last frame's denoised radiance
-// back in as the next bounce.
-float4 GiTracePS(FSOut input) : SV_Target {
-    const float2 uv = input.uv;
+// Concentric disk mapping for low-discrepancy cosine-weighted hemisphere sampling.
+float3 ssgi_cosine_hemisphere(float2 xi, float3 tangent, float3 bitangent, float3 n) {
+    const float2 u = 2.0f * xi - 1.0f;
+    float2 disk = float2(0.0f, 0.0f);
+    if (abs(u.x) > 1.0e-6f || abs(u.y) > 1.0e-6f) {
+        float r;
+        float phi;
+        if (abs(u.x) > abs(u.y)) {
+            r = u.x;
+            phi = (PI * 0.25f) * (u.y / u.x);
+        } else {
+            r = u.y;
+            phi = (PI * 0.5f) - (PI * 0.25f) * (u.x / u.y);
+        }
+        disk = r * float2(cos(phi), sin(phi));
+    }
+    const float z = sqrt(max(1.0f - dot(disk, disk), 0.0f));
+    return normalize(tangent * disk.x + bitangent * disk.y + n * z);
+}
+
+// Builds a screen-space UVz ray clipped to the viewport and near plane.
+void ssgi_init_screen_ray(float3 world_pos, float3 dir, float max_radius,
+                          out float3 start_uvz, out float3 step_uvz) {
+    const float3 view_pos = mul(float4(world_pos, 1.0f), View).xyz;
+    const float3 view_dir = mul(float4(dir, 0.0f), View).xyz;
+    const float near_z = max(Params0.x, 0.01f);
+    float span = max_radius;
+    if (view_pos.z + view_dir.z * span < near_z && view_dir.z < -1.0e-4f) {
+        span = max((near_z - view_pos.z) / view_dir.z, 0.0f);
+    }
+    const float4 start_clip = mul(float4(world_pos, 1.0f), ViewProjection);
+    const float4 end_clip = mul(float4(world_pos + dir * span, 1.0f), ViewProjection);
+    const float3 start_ndc = start_clip.xyz / max(start_clip.w, 1.0e-5f);
+    const float3 end_ndc = end_clip.xyz / max(end_clip.w, 1.0e-5f);
+
+    start_uvz = float3(start_ndc.x * 0.5f + 0.5f, 0.5f - start_ndc.y * 0.5f, start_ndc.z);
+    const float3 end_uvz = float3(end_ndc.x * 0.5f + 0.5f, 0.5f - end_ndc.y * 0.5f, end_ndc.z);
+    step_uvz = end_uvz - start_uvz;
+
+    float clip_scale = 1.0f;
+    if (abs(step_uvz.x) > 1.0e-6f) {
+        const float tx = step_uvz.x > 0.0f ? (1.0f - start_uvz.x) / step_uvz.x
+                                           : -start_uvz.x / step_uvz.x;
+        clip_scale = min(clip_scale, tx);
+    }
+    if (abs(step_uvz.y) > 1.0e-6f) {
+        const float ty = step_uvz.y > 0.0f ? (1.0f - start_uvz.y) / step_uvz.y
+                                           : -start_uvz.y / step_uvz.y;
+        clip_scale = min(clip_scale, ty);
+    }
+    step_uvz *= saturate(clip_scale);
+}
+
+// Batched 4-sample screen-space ray march.
+bool ssgi_trace_screen_ray(float3 start_uvz, float3 step_uvz, float thickness,
+                           float step_jitter, out float2 hit_uv) {
+    hit_uv = float2(0.0f, 0.0f);
+    bool hit = false;
+    const float step_inv = 1.0f / float(GI_STEPS);
+    float prev_view_z = linear_view_depth(start_uvz.z);
+
+#if GI_ENABLE == 2
+    const float exp_base = 1.6f;
+    const float log_base = log2(exp_base);
+    const float max_pow = max(exp2(log_base * float(GI_STEPS)) - 0.9f, 1.0e-4f);
+#endif
+
+    [loop] for (int base = 0; base < GI_STEPS; base += 4) {
+        float2 batch_uv[4];
+        float batch_view_z[4];
+        bool batch_valid[4];
+        bool any_valid = false;
+
+        [unroll] for (int j = 0; j < 4; ++j) {
+            const int idx = base + j;
+#if GI_ENABLE == 2
+            const float s = float(idx) + step_jitter;
+            const float t = saturate((exp2(log_base * s) - 0.9f) / max_pow);
+#else
+            const float t = (float(idx) + 0.1f + 0.9f * step_jitter) * step_inv;
+#endif
+            const float3 sample_uvz = start_uvz + step_uvz * t;
+            batch_uv[j] = sample_uvz.xy;
+            batch_view_z[j] = linear_view_depth(sample_uvz.z);
+            batch_valid[j] = (idx < GI_STEPS) && all(sample_uvz.xy >= 0.0f) &&
+                             all(sample_uvz.xy <= 1.0f) && sample_uvz.z > 0.0f &&
+                             sample_uvz.z < 0.99999f;
+            any_valid = any_valid || batch_valid[j];
+        }
+
+        if (!any_valid) {
+            break;
+        }
+
+        float batch_sd[4];
+        [unroll] for (int s_i = 0; s_i < 4; ++s_i) {
+            batch_sd[s_i] = batch_valid[s_i] ? phase5_depth(batch_uv[s_i]) : 1.0f;
+        }
+
+        [unroll] for (int k = 0; k < 4; ++k) {
+            if (!hit && batch_valid[k] && batch_sd[k] < 0.99999f) {
+                const float sample_view_z = linear_view_depth(batch_sd[k]);
+                const float step_dz = abs(batch_view_z[k] - prev_view_z);
+                const float compare_tolerance = max(thickness, step_dz * 1.5f);
+                const float delta = batch_view_z[k] - sample_view_z;
+                if (delta > 0.005f && delta < compare_tolerance) {
+                    hit_uv = batch_uv[k];
+                    hit = true;
+                }
+            }
+            if (batch_valid[k]) {
+                prev_view_z = batch_view_z[k];
+            }
+        }
+        if (hit) {
+            break;
+        }
+    }
+    return hit;
+}
+
+#ifndef GI_BLUR_STEP
+#define GI_BLUR_STEP 1
+#endif
+
+// Diffuse global illumination compute pass. GI_ENABLE 1 and 2 trace batched
+// screen-space rays; GI_ENABLE 3 uses SSPT with 3D sphere-thickness gating,
+// distance fade, and previous-frame bounce feedback.
+[numthreads(8, 8, 1)]
+void GiTraceCS(uint3 tid : SV_DispatchThreadID) {
+    uint out_w, out_h;
+    GiOutUAV.GetDimensions(out_w, out_h);
+    if (tid.x >= out_w || tid.y >= out_h) {
+        return;
+    }
+    const float2 uv = (float2(tid.xy) + 0.5f) / float2(out_w, out_h);
     const float depth_value = phase5_depth(uv);
     if (depth_value >= 0.99999f) {
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+        GiOutUAV[tid.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
     }
     const float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
     const float3 n = normalize(decode_octahedral(gb1.xy));
     const float3 world_pos = reconstruct_world(uv, depth_value);
     const int rays = GI_RAY_COUNT;
-    const float radius = max(GiParams1.y, 0.1f);
+    const float radius = max(GiParams1.y, 0.25f);
     const float thickness = max(GiParams1.z, 0.05f);
-    const float dither = phase5_hash(input.pos.xy);
+    const float frame_seed = Params1.w;
+    const float3 hash3 = phase5_hash3(float2(tid.xy) + float2(frame_seed * 13.0f, frame_seed * 37.0f));
     const float3 l = normalize(-SunDirection.xyz);
 
     float3 tangent;
@@ -2302,147 +2451,643 @@ float4 GiTracePS(FSOut input) : SV_Target {
 
     float3 sum = float3(0.0f, 0.0f, 0.0f);
     float occluded = 0.0f;
+
+#if GI_ENABLE < 3
+    const float2 pixel_rot = hash3.xy;
+    const float step_jitter = hash3.z;
     [loop] for (int i = 0; i < rays; ++i) {
-        const float2 disc = vogel_disc_sample(i, rays, dither * 6.2831853f);
-        const float3 dir = normalize(tangent * disc.x + bitangent * disc.y +
-                                     n * sqrt(max(1.0f - dot(disc, disc), 0.0f)));
+        const float2 xi = frac(hammersley((uint)i, (uint)rays) + pixel_rot);
+        const float3 dir = ssgi_cosine_hemisphere(xi, tangent, bitangent, n);
+        float3 start_uvz;
+        float3 step_uvz;
+        ssgi_init_screen_ray(world_pos, dir, radius, start_uvz, step_uvz);
+
+        float3 radiance = float3(0.0f, 0.0f, 0.0f);
+        float2 hit_uv;
+        if (ssgi_trace_screen_ray(start_uvz, step_uvz, thickness, step_jitter, hit_uv)) {
+            const float4 h0 = GB0Tex.SampleLevel(PointSampler, hit_uv, 0);
+            const float4 h1 = GB1Tex.SampleLevel(PointSampler, hit_uv, 0);
+            const float4 h4 = GB4Tex.SampleLevel(PointSampler, hit_uv, 0);
+            const float3 hn = normalize(decode_octahedral(h1.xy));
+            const float backface = saturate(1.0f - dot(hn, dir));
+            const float edge = smoothstep(0.0f, 0.05f,
+                                          min(min(hit_uv.x, 1.0f - hit_uv.x),
+                                              min(hit_uv.y, 1.0f - hit_uv.y)));
+            const float no_l = saturate(dot(hn, l));
+            const float3 direct = SunColor.rgb * no_l + AmbientColor.rgb * 0.5f;
+            radiance = max(h0.rgb * direct + h4.rgb, 0.0f) * backface * edge;
+            occluded += 1.0f;
+        } else {
+#if SKY_ENABLE && IBL_QUALITY > 0
+            radiance = max(sh_irradiance(dir), 0.0f) * (1.0f / PI);
+#endif
+        }
+        const float karis_w =
+            rays > 1 ? (1.0f / (1.0f + phase5_luminance(radiance))) : 1.0f;
+        sum += radiance * karis_w;
+    }
+    sum /= float(rays);
+    if (rays > 1) {
+        sum *= rcp(max(1.0f - phase5_luminance(sum), 0.05f));
+    }
+#else
+    const float center_view_z = linear_view_depth(depth_value);
+    const float3 ray_origin = world_pos + n * max(center_view_z * 0.002f, 0.01f);
+    const float spiral_angle = hash3.x * 6.2831853f;
+    float2 spiral_dir = float2(sin(spiral_angle), cos(spiral_angle));
+    // Golden-angle rotation (~137.508 deg) decorrelates consecutive rays.
+    const float2x2 golden_rot = float2x2(-0.73736888f, -0.67549030f,
+                                          0.67549030f, -0.73736888f);
+
+    [loop] for (int i = 0; i < rays; ++i) {
+        const float cos_theta_sq = saturate((float(i) + hash3.y) / float(rays));
+        const float cos_theta = sqrt(cos_theta_sq);
+        const float sin_theta = sqrt(max(1.0f - cos_theta_sq, 0.0f));
+        const float3 dir = normalize(tangent * (spiral_dir.x * sin_theta) +
+                                     bitangent * (spiral_dir.y * sin_theta) + n * cos_theta);
+        spiral_dir = mul(spiral_dir, golden_rot);
+
+        const float ray_jitter = frac(hash3.z + float(i) * 0.618033989f);
+        float prev_travel = 0.0f;
         float3 radiance = float3(0.0f, 0.0f, 0.0f);
         bool escaped = true;
-        float travel = 0.0f;
         [loop] for (int step_index = 0; step_index < GI_STEPS; ++step_index) {
-            // Steps grow with the index so contact detail stays dense while the
-            // tail still reaches the sample radius.
-            const float step_len =
-                radius * (0.08f + 0.92f * float(step_index + 1) / float(GI_STEPS)) /
-                float(GI_STEPS);
-            travel += step_len;
-            if (travel > radius) {
-                break;
-            }
+            const float u = (float(step_index) + 0.1f + 0.9f * ray_jitter) / float(GI_STEPS);
+            const float travel = radius * (u * sqrt(u));
+            const float local_thickness = max(thickness, (travel - prev_travel) * 1.15f);
+            const float inv_thickness = 1.0f / max(local_thickness, 0.04f);
+            prev_travel = travel;
+
+            const float3 sample_world = ray_origin + dir * travel;
             float2 suv;
             float view_z;
-            if (!phase5_project(world_pos + dir * travel, suv, view_z)) {
+            if (!phase5_project(sample_world, suv, view_z)) {
                 break;
             }
             const float sd = phase5_depth(suv);
             if (sd >= 0.99999f) {
                 continue;
             }
-            const float delta = view_z - linear_view_depth(sd);
-            if (delta <= 0.0f || delta >= thickness) {
+            const float3 p_sample_view = reconstruct_view(suv, sd);
+            const float delta_z = (p_sample_view.z - view_z) * inv_thickness;
+            if (delta_z >= 0.02f || delta_z <= -1.0f) {
                 continue;
             }
+            const float3 p_ray_view = mul(float4(sample_world, 1.0f), View).xyz;
+            const float3 delta3 = float3((p_sample_view.xy - p_ray_view.xy) * inv_thickness, delta_z);
+            const float dist_sq = dot(delta3, delta3);
+            if (dist_sq >= 1.0f) {
+                continue;
+            }
+
             const float4 h0 = GB0Tex.SampleLevel(PointSampler, suv, 0);
             const float4 h1 = GB1Tex.SampleLevel(PointSampler, suv, 0);
             const float4 h4 = GB4Tex.SampleLevel(PointSampler, suv, 0);
             const float3 hn = normalize(decode_octahedral(h1.xy));
+            const float front_face = smoothstep(0.1f, -0.05f, dot(hn, dir));
             const float no_l = saturate(dot(hn, l));
             const float3 direct = SunColor.rgb * no_l + AmbientColor.rgb * 0.5f;
             radiance = max(h0.rgb * direct + h4.rgb, 0.0f);
 #if GI_ENABLE >= 3 && GI_BOUNCES
-            // SSPT bounce feedback. The history already carries albedo, so it is
-            // the next bounce radiance rather than a second direct term.
             const float3 history = max(GiTex.SampleLevel(LinearSampler, suv, 0).rgb, 0.0f);
             radiance += history * saturate(GiParams1.w);
 #endif
+            const float dist_rem = saturate(1.0f - travel / radius);
+            const float dist_fade = dist_rem * dist_rem * (3.0f - 2.0f * dist_rem);
+            const float hit_weight = saturate(1.0f - dist_sq) * front_face * dist_fade;
+            radiance *= hit_weight;
             escaped = false;
-            occluded += 1.0f;
+            occluded += saturate(1.0f - dist_sq);
             break;
         }
         if (escaped) {
 #if SKY_ENABLE && IBL_QUALITY > 0
-            // A ray that leaves the screen samples the sky dome, which keeps the
-            // indirect term from going black in open scenes.
             radiance = max(sh_irradiance(dir), 0.0f) * (1.0f / PI);
 #endif
         }
         sum += radiance;
     }
 
-    // Cosine-weighted sampling already estimates irradiance / PI, which is the
-    // scale the Lambertian composite expects.
     sum /= float(rays);
+#endif
     sum *= max(GiParams2.x, 0.0f);
-    return float4(max(sum, 0.0f), occluded / float(rays));
+    GiOutUAV[tid.xy] = float4(max(sum, 0.0f), occluded / float(rays));
 }
 
-// Outlier rejection before the separable denoiser. Karis luminance weighting
-// keeps single-pixel fireflies from dominating the neighbourhood.
-float4 GiPrefilterPS(FSOut input) : SV_Target {
-    const float2 uv = input.uv;
-    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
-    const float center_depth = phase5_depth(uv);
-    if (center_depth >= 0.99999f) {
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+#ifndef SSRC_LEVEL
+#define SSRC_LEVEL 0
+#endif
+
+// Computes per-probe (min_view_z, max_view_z) over each 2x2 half-res (4x4
+// full-res) block for Depth-Aware Direction-First Radiance Cascades.
+[numthreads(8, 8, 1)]
+void SsrcMinMaxDepthCS(uint3 tid : SV_DispatchThreadID) {
+    uint mm_w, mm_h;
+    GiOutUAV.GetDimensions(mm_w, mm_h);
+    if (tid.x >= mm_w || tid.y >= mm_h) {
+        return;
     }
-    const float3 n = decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy);
-    const float center_linear = linear_view_depth(center_depth);
-    const int radius = GI_PREFILTER_RADIUS;
-    float3 sum = float3(0.0f, 0.0f, 0.0f);
-    float weight_sum = 0.0f;
-    [loop] for (int y = -radius; y <= radius; ++y) {
-        [loop] for (int x = -radius; x <= radius; ++x) {
-            const float2 suv = uv + float2(float(x), float(y)) * texel;
-            if (any(suv < 0.0f) || any(suv > 1.0f)) {
-                continue;
+    uint depth_w, depth_h;
+    DepthTex.GetDimensions(depth_w, depth_h);
+    const uint2 base = tid.xy * 4u;
+    float min_z = Params0.y;
+    float max_z = 0.0f;
+    bool any_valid = false;
+    [unroll] for (uint dy = 0u; dy < 4u; ++dy) {
+        [unroll] for (uint dx = 0u; dx < 4u; ++dx) {
+            const uint2 p = min(base + uint2(dx, dy), uint2(depth_w - 1u, depth_h - 1u));
+            const float d = DepthTex.Load(int3(p, 0)).r;
+            if (d < 0.99999f) {
+                const float z = linear_view_depth(d);
+                min_z = min(min_z, z);
+                max_z = max(max_z, z);
+                any_valid = true;
             }
-            const float sd = phase5_depth(suv);
-            if (sd >= 0.99999f) {
-                continue;
-            }
-            const float3 sn = decode_octahedral(GB1Tex.SampleLevel(PointSampler, suv, 0).xy);
-            const float depth_w = exp(-abs(linear_view_depth(sd) - center_linear) * 4.0f);
-            const float normal_w = pow(saturate(dot(n, sn)), 16.0f);
-            const float4 c = BlurSourceTex.SampleLevel(PointSampler, suv, 0);
-            const float karis = 1.0f / (1.0f + max(phase5_luminance(c.rgb), 0.0f));
-            const float w = depth_w * normal_w * karis;
-            sum += c.rgb * w;
-            weight_sum += w;
         }
     }
-    if (weight_sum <= 0.0f) {
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (!any_valid) {
+        min_z = Params0.y;
+        max_z = Params0.y;
     }
-    return float4(sum / weight_sum, 1.0f);
+    GiOutUAV[tid.xy] = float4(min_z, max_z, 0.0f, 0.0f);
 }
 
-// Separable bilateral denoise. GI_FILTER_RADIUS controls the tap count and
-// GiParams2.w scales how aggressively depth separates the neighbourhood.
-float4 GiDenoisePS(FSOut input) : SV_Target {
-    const float2 uv = input.uv;
-    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
-    const float2 dir = GI_FILTER_DIR == 0 ? float2(texel.x, 0.0f) : float2(0.0f, texel.y);
-    const float center_depth = phase5_depth(uv);
-    if (center_depth >= 0.99999f) {
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+// Reconstructs world position at a given UV and linear view-space depth.
+float3 ssrc_world_from_linear_z(float2 uv, float view_z) {
+    const bool orthographic = Params1.x > 0.5f;
+    const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    float3 view_pos;
+    if (orthographic) {
+        view_pos = float3(ndc.x * Params2.z * 0.5f, ndc.y * Params2.w * 0.5f, view_z);
+    } else {
+        view_pos = float3(ndc.x * view_z / max(Params2.x, 1.0e-6f),
+                          ndc.y * view_z / max(Params2.y, 1.0e-6f), view_z);
     }
-    const float3 n = decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy);
-    const float center_linear = linear_view_depth(center_depth);
-    const int radius = GI_FILTER_RADIUS;
-    const float sensitivity = max(GiParams2.w, 0.05f);
-    float3 sum = float3(0.0f, 0.0f, 0.0f);
-    float weight_sum = 0.0f;
-    [loop] for (int i = -radius; i <= radius; ++i) {
-        const float2 suv = uv + dir * float(i);
-        if (any(suv < 0.0f) || any(suv > 1.0f)) {
-            continue;
+    return mul(float4(view_pos, 1.0f), InverseView).xyz;
+}
+
+// Fetches (min_z, max_z) for a Cascade `level` probe by pooling 2^level x 2^level
+// blocks from SsrBlur0Tex (register t23, bound to SsrcMinMaxDepth).
+float2 ssrc_probe_minmax(uint2 probe_idx, uint level) {
+    uint mm_w, mm_h;
+    SsrBlur0Tex.GetDimensions(mm_w, mm_h);
+    const uint step_sz = 1u << level;
+    const uint2 base = probe_idx * step_sz;
+    float min_z = Params0.y;
+    float max_z = 0.0f;
+    bool any_valid = false;
+    // Sample 2x2 corners/sub-blocks for O(1) pooling across all cascade levels.
+    const uint half_step = max(step_sz >> 1u, 1u);
+    [unroll] for (uint sy = 0u; sy < 2u; ++sy) {
+        [unroll] for (uint sx = 0u; sx < 2u; ++sx) {
+            const uint2 c = min(base + uint2(sx, sy) * half_step, uint2(mm_w - 1u, mm_h - 1u));
+            const float2 mm = SsrBlur0Tex.Load(int3(c, 0)).rg;
+            if (mm.x < Params0.y * 0.99f) {
+                min_z = min(min_z, mm.x);
+                max_z = max(max_z, mm.y);
+                any_valid = true;
+            }
+        }
+    }
+    return any_valid ? float2(min_z, max_z) : float2(Params0.y, Params0.y);
+}
+
+// Direction-First Screen-Space Radiance Cascades with Min/Max depth layers
+// (left tile half = min_z probe, right tile half = max_z probe) and top-down merging.
+[numthreads(8, 8, 1)]
+void SsrcCascadeCS(uint3 tid : SV_DispatchThreadID) {
+    uint cas_w, cas_h;
+    GiOutUAV.GetDimensions(cas_w, cas_h);
+    if (tid.x >= cas_w || tid.y >= cas_h) {
+        return;
+    }
+
+    uint mm_w, mm_h;
+    SsrBlur0Tex.GetDimensions(mm_w, mm_h);
+    const uint ang_res = 4u << uint(SSRC_LEVEL);
+    const uint2 probe_count = max(uint2(mm_w, mm_h) >> uint(SSRC_LEVEL), uint2(1u, 1u));
+    const uint tile_w = probe_count.x * 2u;
+    const uint tile_h = probe_count.y;
+    if (tid.x >= ang_res * tile_w || tid.y >= ang_res * tile_h) {
+        GiOutUAV[tid.xy] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    const uint2 ang_idx = tid.xy / uint2(tile_w, tile_h);
+    const uint2 local = tid.xy % uint2(tile_w, tile_h);
+    const bool is_max_layer = local.x >= probe_count.x;
+    const uint2 probe_idx = uint2(is_max_layer ? (local.x - probe_count.x) : local.x, local.y);
+    const float2 probe_uv = (float2(probe_idx) + 0.5f) / float2(probe_count);
+
+    const float2 probe_mm = ssrc_probe_minmax(probe_idx, uint(SSRC_LEVEL));
+    const float probe_z = is_max_layer ? probe_mm.y : probe_mm.x;
+    if (probe_z >= Params0.y * 0.99f) {
+        GiOutUAV[tid.xy] = float4(0.0f, 0.0f, 0.0f, 1.0f);
+        return;
+    }
+
+    const float3 dir = decode_octahedral((float2(ang_idx) + 0.5f) / float(ang_res));
+    const float3 world_pos = ssrc_world_from_linear_z(probe_uv, probe_z);
+    const float3 ray_origin = world_pos + dir * max(probe_z * 0.0025f, 0.015f);
+    const float radius = max(GiParams1.y, 0.25f);
+    const float thickness = max(GiParams1.z, 0.05f);
+
+    static const float kIntervalStarts[4] = {0.0f, 2.0f / 80.0f, 8.0f / 80.0f, 26.0f / 80.0f};
+    static const float kIntervalEnds[4] = {2.0f / 80.0f, 8.0f / 80.0f, 26.0f / 80.0f, 1.0f};
+    const float t_start = radius * kIntervalStarts[SSRC_LEVEL];
+    const float t_end = radius * kIntervalEnds[SSRC_LEVEL];
+    const int steps = 4 + SSRC_LEVEL * 3;
+    const float step_len = (t_end - t_start) / float(steps);
+    const float inv_thickness = 1.0f / max(max(thickness, step_len * 1.15f), 0.04f);
+    const float3 l = normalize(-SunDirection.xyz);
+
+    float3 radiance = float3(0.0f, 0.0f, 0.0f);
+    float transmittance = 1.0f;
+
+    [loop] for (int s = 0; s < steps; ++s) {
+        const float travel = t_start + (float(s) + 0.5f) * step_len;
+        const float3 sample_world = ray_origin + dir * travel;
+        float2 suv;
+        float view_z;
+        if (!phase5_project(sample_world, suv, view_z)) {
+            break;
         }
         const float sd = phase5_depth(suv);
         if (sd >= 0.99999f) {
             continue;
         }
-        const float3 sn = decode_octahedral(GB1Tex.SampleLevel(PointSampler, suv, 0).xy);
-        const float depth_w =
-            exp(-abs(linear_view_depth(sd) - center_linear) * sensitivity * 2.0f);
-        const float normal_w = pow(saturate(dot(n, sn)), 16.0f);
-        const float w = exp(-float(i * i) / float(radius * radius + 1)) * depth_w * normal_w;
-        sum += BlurSourceTex.SampleLevel(PointSampler, suv, 0).rgb * w;
-        weight_sum += w;
+        const float3 p_sample_view = reconstruct_view(suv, sd);
+        const float delta_z = (p_sample_view.z - view_z) * inv_thickness;
+        if (delta_z >= 0.02f || delta_z <= -1.0f) {
+            continue;
+        }
+        const float3 p_ray_view = mul(float4(sample_world, 1.0f), View).xyz;
+        const float3 delta3 = float3((p_sample_view.xy - p_ray_view.xy) * inv_thickness, delta_z);
+        const float dist_sq = dot(delta3, delta3);
+        if (dist_sq >= 1.0f) {
+            continue;
+        }
+
+        const float4 h0 = GB0Tex.SampleLevel(PointSampler, suv, 0);
+        const float4 h1 = GB1Tex.SampleLevel(PointSampler, suv, 0);
+        const float4 h4 = GB4Tex.SampleLevel(PointSampler, suv, 0);
+        const float3 hn = normalize(decode_octahedral(h1.xy));
+        const float front_face = smoothstep(-0.02f, -0.15f, dot(hn, dir));
+        const float no_l = saturate(dot(hn, l));
+        const float3 direct = SunColor.rgb * no_l + AmbientColor.rgb * 0.5f;
+        radiance = max(h0.rgb * direct + h4.rgb, 0.0f);
+#if GI_BOUNCES
+        radiance += max(GiTex.SampleLevel(LinearSampler, suv, 0).rgb, 0.0f) * saturate(GiParams1.w);
+#endif
+        const float hit_opacity = saturate(1.0f - dist_sq);
+        radiance *= hit_opacity * front_face;
+        transmittance = 1.0f - hit_opacity;
+        break;
     }
-    if (weight_sum <= 0.0f) {
-        return BlurSourceTex.SampleLevel(PointSampler, uv, 0);
+
+#if SSRC_LEVEL == 3
+    if (transmittance > 0.001f) {
+#if SKY_ENABLE && IBL_QUALITY > 0
+        radiance += max(sh_irradiance(dir), 0.0f) * (1.0f / PI) * transmittance;
+#endif
     }
-    return float4(sum / weight_sum, 1.0f);
+#else
+    if (transmittance > 0.001f) {
+        const uint parent_ang_res = ang_res * 2u;
+        const uint2 parent_count = max(probe_count >> 1u, uint2(1u, 1u));
+        const uint parent_tile_w = parent_count.x * 2u;
+        const uint parent_tile_h = parent_count.y;
+
+        const float2 parent_f = probe_uv * float2(parent_count) - 0.5f;
+        const int2 p0 = clamp(int2(floor(parent_f)), int2(0, 0), int2(parent_count) - 1);
+        const int2 p1 = min(p0 + int2(1, 1), int2(parent_count) - 1);
+        const float2 pf = saturate(parent_f - float2(p0));
+
+        const int2 p_coords[4] = {p0, int2(p1.x, p0.y), int2(p0.x, p1.y), p1};
+        const float p_bilerp[4] = {(1.0f - pf.x) * (1.0f - pf.y), pf.x * (1.0f - pf.y),
+                                   (1.0f - pf.x) * pf.y, pf.x * pf.y};
+
+        float4 far_val = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        [unroll] for (int k = 0; k < 4; ++k) {
+            const float2 parent_mm = ssrc_probe_minmax(uint2(p_coords[k]), uint(SSRC_LEVEL + 1));
+            const float depth_t = saturate((probe_z - parent_mm.x) / max(parent_mm.y - parent_mm.x, 1.0e-3f));
+            float4 dir_avg = float4(0.0f, 0.0f, 0.0f, 0.0f);
+            [unroll] for (uint oy = 0u; oy < 2u; ++oy) {
+                [unroll] for (uint ox = 0u; ox < 2u; ++ox) {
+                    const uint2 c_ang = ang_idx * 2u + uint2(ox, oy);
+                    const uint2 tile_origin = c_ang * uint2(parent_tile_w, parent_tile_h);
+                    const uint2 min_texel = tile_origin + uint2(p_coords[k]);
+                    const uint2 max_texel = min_texel + uint2(parent_count.x, 0u);
+                    const float4 v_min = BlurSourceTex.Load(int3(min_texel, 0));
+                    const float4 v_max = BlurSourceTex.Load(int3(max_texel, 0));
+                    dir_avg += lerp(v_min, v_max, depth_t);
+                }
+            }
+            far_val += (dir_avg * 0.25f) * p_bilerp[k];
+        }
+        radiance += far_val.rgb * transmittance;
+        transmittance *= far_val.a;
+    }
+#endif
+
+    GiOutUAV[tid.xy] = float4(max(radiance, 0.0f), saturate(transmittance));
+}
+
+// Projects Cascade 0's 4x4 octahedral directions (for both Min and Max depth
+// layers) into L1 Spherical Harmonics (SH0, SH1x, SH1y, SH1z) packed in 4x2 tiles.
+[numthreads(8, 8, 1)]
+void SsrcCombineShCS(uint3 tid : SV_DispatchThreadID) {
+    uint mm_w, mm_h;
+    SsrBlur0Tex.GetDimensions(mm_w, mm_h);
+    if (tid.x >= mm_w || tid.y >= mm_h) {
+        return;
+    }
+
+    const uint ang_res = 4u;
+    const uint tile_w = mm_w * 2u;
+    const uint tile_h = mm_h;
+
+    [unroll] for (uint layer = 0u; layer < 2u; ++layer) {
+        float3 sh0 = float3(0.0f, 0.0f, 0.0f);
+        float3 sh1x = float3(0.0f, 0.0f, 0.0f);
+        float3 sh1y = float3(0.0f, 0.0f, 0.0f);
+        float3 sh1z = float3(0.0f, 0.0f, 0.0f);
+        [loop] for (uint ay = 0u; ay < ang_res; ++ay) {
+            [loop] for (uint ax = 0u; ax < ang_res; ++ax) {
+                const float3 dir = decode_octahedral((float2(float(ax), float(ay)) + 0.5f) / float(ang_res));
+                const uint2 texel = uint2(ax * tile_w + layer * mm_w + tid.x, ay * tile_h + tid.y);
+                const float3 rad = BlurSourceTex.Load(int3(texel, 0)).rgb;
+                sh0 += rad;
+                sh1x += rad * (2.0f * dir.x);
+                sh1y += rad * (2.0f * dir.y);
+                sh1z += rad * (2.0f * dir.z);
+            }
+        }
+        const float inv_n = 1.0f / float(ang_res * ang_res);
+        const uint row_y = layer * mm_h + tid.y;
+        GiOutUAV[uint2(0u * mm_w + tid.x, row_y)] = float4(sh0 * inv_n, 1.0f);
+        GiOutUAV[uint2(1u * mm_w + tid.x, row_y)] = float4(sh1x * inv_n, 1.0f);
+        GiOutUAV[uint2(2u * mm_w + tid.x, row_y)] = float4(sh1y * inv_n, 1.0f);
+        GiOutUAV[uint2(3u * mm_w + tid.x, row_y)] = float4(sh1z * inv_n, 1.0f);
+    }
+}
+
+// Evaluates depth-interpolated L1 SH irradiance against per-pixel surface normals.
+[numthreads(8, 8, 1)]
+void SsrcResolveCS(uint3 tid : SV_DispatchThreadID) {
+    uint out_w, out_h;
+    GiOutUAV.GetDimensions(out_w, out_h);
+    if (tid.x >= out_w || tid.y >= out_h) {
+        return;
+    }
+    const float2 uv = (float2(tid.xy) + 0.5f) / float2(out_w, out_h);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f) {
+        GiOutUAV[tid.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    uint mm_w, mm_h;
+    SsrBlur0Tex.GetDimensions(mm_w, mm_h);
+    const uint2 probe_count = uint2(mm_w, mm_h);
+    const float2 probe_f = uv * float2(probe_count) - 0.5f;
+    const int2 p0 = clamp(int2(floor(probe_f)), int2(0, 0), int2(probe_count) - 1);
+    const int2 p1 = min(p0 + int2(1, 1), int2(probe_count) - 1);
+    const float2 pf = saturate(probe_f - float2(p0));
+
+    const int2 p_coords[4] = {p0, int2(p1.x, p0.y), int2(p0.x, p1.y), p1};
+    const float p_bilerp[4] = {(1.0f - pf.x) * (1.0f - pf.y), pf.x * (1.0f - pf.y),
+                               (1.0f - pf.x) * pf.y, pf.x * pf.y};
+
+    const float3 n_pixel = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy));
+    const float z_pixel = linear_view_depth(center_depth);
+
+    float3 sh0 = float3(0.0f, 0.0f, 0.0f);
+    float3 sh1x = float3(0.0f, 0.0f, 0.0f);
+    float3 sh1y = float3(0.0f, 0.0f, 0.0f);
+    float3 sh1z = float3(0.0f, 0.0f, 0.0f);
+
+    [unroll] for (int k = 0; k < 4; ++k) {
+        const float2 mm = SsrBlur0Tex.Load(int3(p_coords[k], 0)).rg;
+        const float depth_t = saturate((z_pixel - mm.x) / max(mm.y - mm.x, 1.0e-3f));
+        const uint2 min_base = uint2(p_coords[k]);
+        const uint2 max_base = uint2(p_coords[k]) + uint2(0u, mm_h);
+        const float w = p_bilerp[k];
+        sh0 += lerp(BlurSourceTex.Load(int3(min_base + uint2(0u * mm_w, 0u), 0)).rgb,
+                    BlurSourceTex.Load(int3(max_base + uint2(0u * mm_w, 0u), 0)).rgb, depth_t) * w;
+        sh1x += lerp(BlurSourceTex.Load(int3(min_base + uint2(1u * mm_w, 0u), 0)).rgb,
+                     BlurSourceTex.Load(int3(max_base + uint2(1u * mm_w, 0u), 0)).rgb, depth_t) * w;
+        sh1y += lerp(BlurSourceTex.Load(int3(min_base + uint2(2u * mm_w, 0u), 0)).rgb,
+                     BlurSourceTex.Load(int3(max_base + uint2(2u * mm_w, 0u), 0)).rgb, depth_t) * w;
+        sh1z += lerp(BlurSourceTex.Load(int3(min_base + uint2(3u * mm_w, 0u), 0)).rgb,
+                     BlurSourceTex.Load(int3(max_base + uint2(3u * mm_w, 0u), 0)).rgb, depth_t) * w;
+    }
+
+    const float3 irradiance = max(sh0 + sh1x * n_pixel.x + sh1y * n_pixel.y + sh1z * n_pixel.z, 0.0f);
+    GiOutUAV[tid.xy] = float4(irradiance * max(GiParams2.x, 0.0f), 1.0f);
+}
+
+// Plane-distance + depth + normal cross-bilateral weight shared by the GI spatial
+// prefilter and separable blur passes so tilted walls/floors smooth cleanly.
+float gi_bilateral_weight(float3 p_center, float3 n_center, float z_center,
+                          float2 tap_uv, float plane_threshold, float depth_tolerance,
+                          float norm_base, float depth_blend) {
+    const float sd = phase5_depth(tap_uv);
+    if (sd >= 0.99999f) {
+        return 0.0f;
+    }
+    const float z_tap = linear_view_depth(sd);
+    const float3 p_tap = reconstruct_world(tap_uv, sd);
+    const float plane_dist = abs(dot(n_center, p_tap - p_center));
+    const float plane_w = exp(-(plane_dist * plane_dist) / max(plane_threshold * plane_threshold, 1.0e-5f));
+    const float depth_diff = abs(z_tap - z_center);
+    const float depth_w = exp(-(depth_diff * depth_diff) / max(depth_tolerance * depth_tolerance, 1.0e-5f));
+    const float geom_w = max(plane_w, depth_w * depth_blend);
+    const float3 n_tap = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, tap_uv, 0).xy));
+    const float normal_w = saturate(norm_base + (1.0f - norm_base) * pow(saturate(dot(n_center, n_tap)), 16.0f));
+    return geom_w * normal_w;
+}
+
+// Outlier rejection compute pass with Karis luminance weighting and plane-distance
+// cross-bilateral gating to suppress single-pixel fireflies before separable blur.
+[numthreads(8, 8, 1)]
+void GiOutlierRejectCS(uint3 tid : SV_DispatchThreadID) {
+    uint out_w, out_h;
+    GiOutUAV.GetDimensions(out_w, out_h);
+    if (tid.x >= out_w || tid.y >= out_h) {
+        return;
+    }
+    const float2 uv = (float2(tid.xy) + 0.5f) / float2(out_w, out_h);
+    const float2 texel = 1.0f / float2(out_w, out_h);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f) {
+        GiOutUAV[tid.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    const float3 n_center = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy));
+    const float3 p_center = reconstruct_world(uv, center_depth);
+    const float z_center = linear_view_depth(center_depth);
+    const float sensitivity = max(GiParams2.w, 0.05f);
+    const float plane_threshold = max(z_center * 0.05f, 0.5f) / sensitivity;
+    const float depth_tolerance = max(z_center * 0.08f, 0.8f) / sensitivity;
+
+    const int radius = GI_PREFILTER_RADIUS;
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+    float weight_sum = 0.0f;
+    [loop] for (int y = -radius; y <= radius; ++y) {
+        const float wy = (y == 0) ? 3.0f : ((abs(y) == 1) ? 2.0f : 1.0f);
+        [loop] for (int x = -radius; x <= radius; ++x) {
+            const float wx = (x == 0) ? 3.0f : ((abs(x) == 1) ? 2.0f : 1.0f);
+            const float2 suv = uv + float2(float(x), float(y)) * texel;
+            if (any(suv < 0.0f) || any(suv > 1.0f)) {
+                continue;
+            }
+            const float geom_norm_w = gi_bilateral_weight(
+                p_center, n_center, z_center, suv, plane_threshold, depth_tolerance, 0.25f, 0.70f);
+            if (geom_norm_w <= 0.0f) {
+                continue;
+            }
+            const float3 c = clamp(BlurSourceTex.SampleLevel(PointSampler, suv, 0).rgb, 0.0f, 100.0f);
+            const float karis = 1.0f / (1.0f + 0.30f * max(phase5_luminance(c), 0.0f));
+            const float w = (wx * wy) * geom_norm_w * karis;
+            sum += c * w;
+            weight_sum += w;
+        }
+    }
+    GiOutUAV[tid.xy] = weight_sum > 0.0f ? float4(sum / weight_sum, 1.0f) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+// Multi-step separable cross-bilateral blur compute pass.
+[numthreads(8, 8, 1)]
+void GiBlurCS(uint3 tid : SV_DispatchThreadID) {
+    uint out_w, out_h;
+    GiOutUAV.GetDimensions(out_w, out_h);
+    if (tid.x >= out_w || tid.y >= out_h) {
+        return;
+    }
+    const float2 uv = (float2(tid.xy) + 0.5f) / float2(out_w, out_h);
+    const float2 texel = 1.0f / float2(out_w, out_h);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f) {
+        GiOutUAV[tid.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    const float step_scale = float(GI_BLUR_STEP);
+    const float2 dir = (GI_FILTER_DIR == 0 ? float2(texel.x, 0.0f) : float2(0.0f, texel.y)) * step_scale;
+    const float3 n_center = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy));
+    const float3 p_center = reconstruct_world(uv, center_depth);
+    const float z_center = linear_view_depth(center_depth);
+    const float sensitivity = max(GiParams2.w, 0.05f);
+    const float plane_threshold = max(z_center * (0.06f * step_scale), 0.6f * step_scale) / sensitivity;
+    const float depth_tolerance = max(z_center * (0.10f * step_scale), 1.0f * step_scale) / sensitivity;
+    const float norm_base = (GI_BLUR_STEP > 1) ? 0.35f : 0.20f;
+    const float depth_blend = (GI_BLUR_STEP > 1) ? 0.85f : 0.70f;
+
+    float3 sum = clamp(BlurSourceTex.SampleLevel(PointSampler, uv, 0).rgb, 0.0f, 100.0f);
+    float weight_sum = 1.0f;
+
+    static const int kBlurTaps = 8;
+    static const float kSpatialFalloff = 1.0f / (2.0f * 4.5f * 4.5f);
+    [loop] for (int i = 1; i <= kBlurTaps; ++i) {
+        const float spatial_w = exp(-float(i * i) * kSpatialFalloff);
+        const float2 shift = dir * float(i);
+        const float2 uv_a = uv + shift;
+        const float2 uv_b = uv - shift;
+        if (all(uv_a >= 0.0f) && all(uv_a <= 1.0f)) {
+            const float w_a = spatial_w * gi_bilateral_weight(
+                p_center, n_center, z_center, uv_a, plane_threshold, depth_tolerance, norm_base, depth_blend);
+            if (w_a > 0.0f) {
+                sum += clamp(BlurSourceTex.SampleLevel(PointSampler, uv_a, 0).rgb, 0.0f, 100.0f) * w_a;
+                weight_sum += w_a;
+            }
+        }
+        if (all(uv_b >= 0.0f) && all(uv_b <= 1.0f)) {
+            const float w_b = spatial_w * gi_bilateral_weight(
+                p_center, n_center, z_center, uv_b, plane_threshold, depth_tolerance, norm_base, depth_blend);
+            if (w_b > 0.0f) {
+                sum += clamp(BlurSourceTex.SampleLevel(PointSampler, uv_b, 0).rgb, 0.0f, 100.0f) * w_b;
+                weight_sum += w_b;
+            }
+        }
+    }
+    GiOutUAV[tid.xy] = float4(sum / max(weight_sum, 1.0e-5f), 1.0f);
+}
+
+// Temporal reprojection and 3x3 variance-clipped accumulation compute pass.
+[numthreads(8, 8, 1)]
+void GiTemporalCS(uint3 tid : SV_DispatchThreadID) {
+    uint out_w, out_h;
+    GiOutUAV.GetDimensions(out_w, out_h);
+    if (tid.x >= out_w || tid.y >= out_h) {
+        return;
+    }
+    const float2 uv = (float2(tid.xy) + 0.5f) / float2(out_w, out_h);
+    const float2 texel = 1.0f / float2(out_w, out_h);
+    const float3 curr_color = max(BlurSourceTex.SampleLevel(PointSampler, uv, 0).rgb, 0.0f);
+    const float center_depth = phase5_depth(uv);
+    if (center_depth >= 0.99999f || Params1.w < 0.5f) {
+        const float z_out = center_depth >= 0.99999f ? Params0.y : linear_view_depth(center_depth);
+        GiOutUAV[tid.xy] = float4(curr_color, 1.0f);
+        GiHistoryUAV[tid.xy] = float4(curr_color, z_out);
+        return;
+    }
+
+    const float z_center = linear_view_depth(center_depth);
+    const float3 world_pos = reconstruct_world(uv, center_depth);
+    const float4 prev_clip = mul(float4(world_pos, 1.0f), PrevViewProjection);
+    const float2 prev_uv = (prev_clip.xy / max(prev_clip.w, 1.0e-5f)) * float2(0.5f, -0.5f) + 0.5f;
+    if (prev_clip.w <= 1.0e-5f || any(prev_uv < 0.0f) || any(prev_uv > 1.0f)) {
+        GiOutUAV[tid.xy] = float4(curr_color, 1.0f);
+        GiHistoryUAV[tid.xy] = float4(curr_color, z_center);
+        return;
+    }
+
+    const float4 hist_data = GiTex.SampleLevel(LinearSampler, prev_uv, 0);
+    float3 history_color = max(hist_data.rgb, 0.0f);
+    const float prev_depth = hist_data.a;
+
+    const float expected_prev_z = prev_clip.w;
+    const float depth_diff = abs(prev_depth - expected_prev_z) / max(expected_prev_z, 1.0e-3f);
+    const float depth_reject = saturate(depth_diff * 12.0f);
+
+    const float3 cur_normal = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy));
+    const float3 prev_normal = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, prev_uv, 0).xy));
+    const float normal_reject = saturate((1.0f - saturate(dot(cur_normal, prev_normal))) * 4.0f);
+
+    const float motion_len = length((uv - prev_uv) * float2(out_w, out_h) * 2.0f);
+    const float velocity_reject = saturate((motion_len - 8.0f) / 8.0f);
+    const float reject_weight = max(max(depth_reject, normal_reject), velocity_reject);
+
+    const float motion_response = saturate(motion_len / 8.0f);
+    const float base_alpha = lerp(0.05f, 0.90f, motion_response);
+    const float alpha = lerp(base_alpha, 1.0f, reject_weight);
+
+    float3 m1 = curr_color;
+    float3 m2 = curr_color * curr_color;
+    float3 min_color = curr_color;
+    float3 max_color = curr_color;
+    [unroll] for (int dy = -1; dy <= 1; ++dy) {
+        [unroll] for (int dx = -1; dx <= 1; ++dx) {
+            if (dx != 0 || dy != 0) {
+                const float2 suv = saturate(uv + float2(float(dx), float(dy)) * texel);
+                const float3 neighbor = max(BlurSourceTex.SampleLevel(PointSampler, suv, 0).rgb, 0.0f);
+                m1 += neighbor;
+                m2 += neighbor * neighbor;
+                min_color = min(min_color, neighbor);
+                max_color = max(max_color, neighbor);
+            }
+        }
+    }
+    const float3 mu = m1 / 9.0f;
+    const float3 sigma = sqrt(abs(m2 / 9.0f - mu * mu));
+    const float gamma = lerp(1.0f, 0.5f, motion_response);
+    const float3 box_min = max(mu - gamma * sigma, min_color);
+    const float3 box_max = min(mu + gamma * sigma, max_color);
+    history_color = clamp(history_color, box_min, box_max);
+
+    const float3 denoised = lerp(history_color, curr_color, alpha);
+    GiOutUAV[tid.xy] = float4(denoised, 1.0f);
+    GiHistoryUAV[tid.xy] = float4(denoised, z_center);
 }
 
 float4 LightingPS(FSOut input) : SV_Target {
@@ -2604,9 +3249,11 @@ float4 LightingPS(FSOut input) : SV_Target {
     {
         const float3 gi_radiance = max(GiTex.SampleLevel(LinearSampler, input.uv, 0).rgb, 0.0f);
         if (receive_gi) {
-            indirect_diffuse = gi_radiance * ao;
+            float gi_ao = pow(saturate(ao), max(GiParams2.y, 0.0f));
+            gi_ao *= gi_ao;
+            indirect_diffuse = gi_radiance * gi_ao;
 #if SSGI_SPECULAR_GI
-            indirect_specular = gi_radiance * f0 * saturate(1.0f - roughness) * ao;
+            indirect_specular = gi_radiance * f0 * saturate(1.0f - roughness) * gi_ao;
 #endif
         }
     }

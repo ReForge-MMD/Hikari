@@ -75,6 +75,7 @@ struct FrameConstants {
     std::array<std::array<float, 4>, 4> projection{};
     std::array<std::array<float, 4>, 4> view_projection{};
     std::array<std::array<float, 4>, 4> inverse_view{};
+    std::array<std::array<float, 4>, 4> prev_view_projection{};
     std::array<float, 4> camera_pos{};
     std::array<float, 4> sun_direction{};
     std::array<float, 4> sun_color{};
@@ -227,6 +228,9 @@ private:
     TargetPool targets_;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
+    std::uint32_t frame_index_ = 0;
+    std::array<std::array<float, 4>, 4> prev_view_projection_{};
+    bool has_prev_view_projection_ = false;
     std::uint32_t current_shadow_res_ = 0;
     std::uint32_t sky_capture_size_ = 0;
     SkyConstants sky_capture_state_{};
