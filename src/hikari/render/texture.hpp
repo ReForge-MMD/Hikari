@@ -26,8 +26,11 @@ public:
                                              std::uint32_t width, std::uint32_t height,
                                              const std::uint8_t* pixels);
     static GpuTexture from_file(core::D3D11Context& context, const std::wstring& path);
+    static GpuTexture from_file_mipped(core::D3D11Context& context, const std::wstring& path);
     static GpuTexture from_memory(core::D3D11Context& context, const std::uint8_t* data,
                                   std::size_t size);
+    static GpuTexture from_memory_mipped(core::D3D11Context& context, const std::uint8_t* data,
+                                         std::size_t size);
     static GpuTexture create_solid_color(core::D3D11Context& context,
                                          const std::uint8_t color[4]);
 };

@@ -1,3 +1,7 @@
 #include <windows.h>
 
 IDI_ICON1 ICON "hikari.ico"
+HIKARI_CLOUDS1 RCDATA "../../../assets/sky/clouds1.png"
+HIKARI_CLOUDS2 RCDATA "../../../assets/sky/clouds2.png"
+HIKARI_CLOUDS3 RCDATA "../../../assets/sky/clouds3.png"
+HIKARI_STARMAP RCDATA "../../../assets/sky/starmap_2020_4k.png"

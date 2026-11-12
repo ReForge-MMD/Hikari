@@ -3,8 +3,16 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "hikari/gfx/ibl.hpp"
 #include "hikari/gfx/sky.hpp"
@@ -158,10 +166,11 @@ Vec3 sun_color_from_settings(const GraphicsSettings& settings, const Vec3& fallb
     if (settings.sun.light_mode == 0) {
         return Vec3::zero();
     }
+    const float intensity = settings.sun.intensity > 0.001f ? settings.sun.intensity : 1.0f;
     const Vec3 base = settings.sun.auto_cct
                           ? color_temperature_rgb(settings.sun.color_temperature)
                           : fallback;
-    return base * settings.sun.intensity;
+    return base * intensity;
 }
 
 Vec3 ambient_color_from_settings(const GraphicsSettings& settings) {
@@ -397,7 +406,7 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     // Slots 8..11 hold the material texture and the shadow/sky helper targets;
     // they must be released before those targets are rebound as render targets.
     context_.context->PSSetShaderResources(8, 4, null_views);
-    context_.context->PSSetShaderResources(12, 6, null_views);
+    context_.context->PSSetShaderResources(12, 8, null_views);
     context_.context->VSSetShaderResources(0, 1, null_views);
     ID3D11ShaderResourceView* null_diffuse = nullptr;
     context_.context->VSSetShaderResources(8, 1, &null_diffuse);
@@ -419,7 +428,7 @@ FrameConstants Renderer::build_frame_constants(const GraphicsSettings& settings,
     constants.view_projection = to_array(view.view_projection);
     constants.inverse_view = to_array(view.inverse_view);
     constants.camera_pos = to_array4(view.camera_position, 1.0f);
-    constants.sun_direction = to_array4(view.sun_direction.normalize(), 0.0f);
+    constants.sun_direction = to_array4(view.sun_direction.normalize(), view.is_night ? 1.0f : 0.0f);
     constants.sun_color = to_array4(view.sun_color, 0.0f);
     constants.ambient_color = to_array4(view.ambient_color, 0.0f);
     constants.params0 = {view.near_z, view.far_z, settings.post.exposure, view.time_seconds};
@@ -735,6 +744,10 @@ void Renderer::draw_sky_capture(const GraphicsSettings& settings, const FrameVie
                                                  milky_way_texture_.srv.Get(),
                                                  moon_texture_.srv.Get()};
     context_.context->PSSetShaderResources(12, 3, sky_textures);
+    ID3D11ShaderResourceView* cloud_extra[2] = {
+        cloud_cover_texture_.srv ? cloud_cover_texture_.srv.Get() : cloud_texture_.srv.Get(),
+        cloud_detail_texture_.srv ? cloud_detail_texture_.srv.Get() : cloud_texture_.srv.Get()};
+    context_.context->PSSetShaderResources(18, 2, cloud_extra);
 
     const auto defines = lighting_defines(settings, false);
     const ShaderProgram& program = shaders_.get("sky_capture", kShaderSource, "FullscreenVS",
@@ -829,7 +842,8 @@ void Renderer::draw_sky_prefilter(const GraphicsSettings& settings, const FrameV
         // A mirror lobe needs one tap; wider lobes need more samples to hide the
         // blotches that a sparse high dynamic range sky (stars) leaves behind.
         const float samples = mip == 0 ? 1.0f : 16.0f * static_cast<float>(mip);
-        sky.sky_params4 = {roughness, samples, static_cast<float>(mip_count), 0.0f};
+        const float moon_radius = 0.025f * std::clamp(settings.sky.moon_radius, 0.1f, 10.0f);
+        sky.sky_params4 = {roughness, samples, static_cast<float>(mip_count), moon_radius};
         upload_sky_constants(sky);
 
         D3D11_VIEWPORT vp{};
@@ -942,6 +956,10 @@ void Renderer::draw_sky_background(const GraphicsSettings& settings, const Frame
         cloud_texture_.srv.Get(), milky_way_texture_.srv.Get(), moon_texture_.srv.Get(),
         cube != nullptr ? cube->srv.Get() : nullptr};
     context_.context->PSSetShaderResources(12, 4, sky_textures);
+    ID3D11ShaderResourceView* cloud_extra[2] = {
+        cloud_cover_texture_.srv ? cloud_cover_texture_.srv.Get() : cloud_texture_.srv.Get(),
+        cloud_detail_texture_.srv ? cloud_detail_texture_.srv.Get() : cloud_texture_.srv.Get()};
+    context_.context->PSSetShaderResources(18, 2, cloud_extra);
     const Target* prefilter = targets_.get("SkyPrefilter");
     ID3D11ShaderResourceView* prefilter_srv =
         prefilter != nullptr ? prefilter->srv.Get() : nullptr;
@@ -1016,6 +1034,10 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
                                                      milky_way_texture_.srv.Get(),
                                                      moon_texture_.srv.Get()};
         context_.context->PSSetShaderResources(12, 3, sky_textures);
+        ID3D11ShaderResourceView* cloud_extra[2] = {
+            cloud_cover_texture_.srv ? cloud_cover_texture_.srv.Get() : cloud_texture_.srv.Get(),
+            cloud_detail_texture_.srv ? cloud_detail_texture_.srv.Get() : cloud_texture_.srv.Get()};
+        context_.context->PSSetShaderResources(18, 2, cloud_extra);
         if (sky_sh_srv_ != nullptr && sky_capture_resolution(settings.ibl.quality) > 0) {
             ID3D11ShaderResourceView* sh_srv = sky_sh_srv_.Get();
             context_.context->PSSetShaderResources(16, 1, &sh_srv);
@@ -1472,6 +1494,8 @@ SkyConstants Renderer::build_sky_constants(const GraphicsSettings& settings,
     constants.sky_params3 = {settings.sky.moon_phase, settings.sky.moon_intensity,
                              settings.sky.star_brightness,
                              settings.sky.milky_way_intensity};
+    const float moon_radius = 0.025f * std::clamp(settings.sky.moon_radius, 0.1f, 10.0f);
+    constants.sky_params4 = {0.0f, 0.0f, 0.0f, moon_radius};
     return constants;
 }
 
@@ -1542,16 +1566,73 @@ void Renderer::bind_sky_samplers() {
     context_.context->PSSetSamplers(3, 1, &linear_wrap);
 }
 
+namespace {
+
+bool try_load_sky_texture(core::D3D11Context& context, const wchar_t* resource_name,
+                          const wchar_t* filename, render::GpuTexture& out) {
+#ifdef _WIN32
+    if (resource_name != nullptr) {
+        if (HRSRC res = FindResourceW(nullptr, resource_name, RT_RCDATA)) {
+            if (HGLOBAL mem = LoadResource(nullptr, res)) {
+                const DWORD size = SizeofResource(nullptr, res);
+                const void* data = LockResource(mem);
+                if (data != nullptr && size > 0) {
+                    try {
+                        out = render::GpuTexture::from_memory_mipped(
+                            context, static_cast<const std::uint8_t*>(data),
+                            static_cast<std::size_t>(size));
+                        return true;
+                    } catch (...) {
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)resource_name;
+#endif
+    namespace fs = std::filesystem;
+    const fs::path candidates[] = {
+        fs::path(L"assets/sky") / filename,
+        fs::path(filename),
+        fs::path(L"assets") / filename,
+    };
+    std::error_code ec;
+    for (const auto& path : candidates) {
+        if (!fs::exists(path, ec)) {
+            continue;
+        }
+        try {
+            out = render::GpuTexture::from_file_mipped(context, path.wstring());
+            return true;
+        } catch (...) {
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 void Renderer::ensure_sky_textures() {
     if (cloud_texture_.srv != nullptr) {
         return;
     }
-    const SkyImage& clouds = cloud_noise_image();
-    cloud_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
-        context_, clouds.width, clouds.height, clouds.rgba.data());
-    const SkyImage& milky_way = milky_way_image();
-    milky_way_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
-        context_, milky_way.width, milky_way.height, milky_way.rgba.data());
+    if (!try_load_sky_texture(context_, L"HIKARI_CLOUDS1", L"clouds1.png", cloud_texture_)) {
+        const SkyImage& clouds = cloud_noise_image();
+        cloud_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
+            context_, clouds.width, clouds.height, clouds.rgba.data());
+    }
+
+    try_load_sky_texture(context_, L"HIKARI_CLOUDS2", L"clouds2.png", cloud_cover_texture_);
+    try_load_sky_texture(context_, L"HIKARI_CLOUDS3", L"clouds3.png", cloud_detail_texture_);
+
+    if (!try_load_sky_texture(context_, L"HIKARI_STARMAP", L"starmap_2020_4k.png",
+                              milky_way_texture_)) {
+        const SkyImage& milky_way = milky_way_image();
+        milky_way_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
+            context_, milky_way.width, milky_way.height, milky_way.rgba.data());
+    }
+
     const SkyImage& moon = moon_albedo_image();
     moon_texture_ = render::GpuTexture::from_rgba_bytes_mipped(
         context_, moon.width, moon.height, moon.rgba.data());

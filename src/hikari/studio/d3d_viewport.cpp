@@ -3464,18 +3464,34 @@ void D3DViewport::render_scene_native() {
     view.view_projection = camera_.view_projection_matrix();
     view.inverse_view = view.view.inverse_transform();
     view.camera_position = camera_.position;
-    view.sun_direction =
-        Vec3(state_.light_direction[0], state_.light_direction[1], state_.light_direction[2])
-            .normalize();
-    // The "Sky coupled" light mode takes the sun position from the atmosphere so
-    // the disk the sky draws and the direct light that illuminates the scene agree.
-    if (state_.graphics.sky.enabled && state_.graphics.sun.light_mode == 2) {
-        view.sun_direction =
-            -gfx::sun_direction_from_time_of_day(state_.graphics.sky.time_of_day);
+    const Vec3 raw_light(state_.light_direction[0], state_.light_direction[1],
+                         state_.light_direction[2]);
+    const Vec3 light_dir = raw_light.length_squared() > 1.0e-6f
+                               ? raw_light.normalize()
+                               : Vec3(-0.5f, -1.0f, -0.5f).normalize();
+
+    // In MMD coordinates, light_direction is the ray direction.
+    // light_dir.y <= 0.0f: rays shine downwards from the upper hemisphere (Day / Sun).
+    // light_dir.y > 0.0f: positive Y means light is aimed up in MMD, which represents
+    // Moon / Night light coming from the celestial dome above.
+    const bool is_night = (light_dir.y > 0.0f);
+    if (is_night) {
+        // Moonlight shines down: invert Y so the rays illuminate downwards onto the scene
+        const Vec3 moon_light_dir(light_dir.x, -light_dir.y, light_dir.z);
+        view.sun_direction = moon_light_dir.normalize();
+        const Vec3 base_color(state_.light_color[0], state_.light_color[1], state_.light_color[2]);
+        const Vec3 moon_tint(0.70f, 0.82f, 1.0f);
+        const float intensity = std::max(state_.graphics.sky.moon_intensity, 0.2f);
+        view.sun_color = Vec3(base_color.x * moon_tint.x * intensity,
+                              base_color.y * moon_tint.y * intensity,
+                              base_color.z * moon_tint.z * intensity);
+    } else {
+        view.sun_direction = light_dir;
+        view.sun_color = gfx::sun_color_from_settings(
+            state_.graphics, Vec3(state_.light_color[0], state_.light_color[1],
+                                  state_.light_color[2]));
     }
-    view.sun_color = gfx::sun_color_from_settings(
-        state_.graphics, Vec3(state_.light_color[0], state_.light_color[1],
-                              state_.light_color[2]));
+    view.is_night = is_night;
     view.ambient_color = gfx::ambient_color_from_settings(state_.graphics);
     view.background_color = state_.viewport_white_bg ? Vec3(0.90f, 0.92f, 0.95f)
                                                      : Vec3(0.055f, 0.065f, 0.085f);

@@ -251,6 +251,7 @@ int GraphicsSettings::validate() {
     clamp_float(sky.turbidity, 0.0f, 10.0f);
     clamp_float(sky.ozone, 0.0f, 5.0f);
     clamp_float(sky.sun_radius, 0.0f, 20.0f);
+    clamp_float(sky.moon_radius, 0.0f, 20.0f);
     clamp_float(sky.sun_radiance, 0.0f, 1000.0f);
     clamp_float(sky.mie_anisotropy, -0.99f, 0.99f);
     clamp_float(sky.cloud_coverage, 0.0f, 1.0f);
@@ -448,6 +449,7 @@ std::string GraphicsSettings::to_json() const {
     put_float(out, "sky.mie_anisotropy", sky.mie_anisotropy, true);
     put_float(out, "sky.ozone", sky.ozone, true);
     put_float(out, "sky.sun_radius", sky.sun_radius, true);
+    put_float(out, "sky.moon_radius", sky.moon_radius, true);
     put_float(out, "sky.cloud_coverage", sky.cloud_coverage, true);
     put_float(out, "sky.cloud_density", sky.cloud_density, true);
     put_float(out, "sky.cloud_speed", sky.cloud_speed, true);
@@ -607,6 +609,7 @@ bool GraphicsSettings::from_json(const std::string& json) {
     sky.mie_anisotropy = read_float(values, "sky.mie_anisotropy", sky.mie_anisotropy);
     sky.ozone = read_float(values, "sky.ozone", sky.ozone);
     sky.sun_radius = read_float(values, "sky.sun_radius", sky.sun_radius);
+    sky.moon_radius = read_float(values, "sky.moon_radius", sky.moon_radius);
     sky.cloud_coverage = read_float(values, "sky.cloud_coverage", sky.cloud_coverage);
     sky.cloud_density = read_float(values, "sky.cloud_density", sky.cloud_density);
     sky.cloud_speed = read_float(values, "sky.cloud_speed", sky.cloud_speed);

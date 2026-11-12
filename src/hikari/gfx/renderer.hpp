@@ -56,6 +56,7 @@ struct FrameView {
     bool show_transparent = true;
     bool show_tonemap = true;
     bool show_grid = true;
+    bool is_night = false;
 
     std::vector<DrawItem> opaque;
     std::vector<DrawItem> transparent;
@@ -228,6 +229,8 @@ private:
     std::uint32_t grid_vertex_count_ = 0;
     render::GpuTexture white_texture_;
     render::GpuTexture cloud_texture_;
+    render::GpuTexture cloud_cover_texture_;
+    render::GpuTexture cloud_detail_texture_;
     render::GpuTexture milky_way_texture_;
     render::GpuTexture moon_texture_;
 };

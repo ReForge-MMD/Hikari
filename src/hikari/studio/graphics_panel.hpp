@@ -37,7 +37,6 @@ private:
     void apply_preset(int index);
     void build_controls();
     QWidget* make_group(const QString& title, QWidget* body);
-    void refresh_time_label();
     void refresh_preview();
     void choose_environment();
 
@@ -47,9 +46,9 @@ private:
     std::function<QString()> ibl_error_provider_;
     QComboBox* renderer_ = nullptr;
     QComboBox* preset_ = nullptr;
-    QComboBox* sun_mode_ = nullptr;
     QDoubleSpinBox* sun_intensity_ = nullptr;
     QDoubleSpinBox* sun_temperature_ = nullptr;
+    QDoubleSpinBox* sun_size_ = nullptr;
     QDoubleSpinBox* ambient_intensity_ = nullptr;
     QDoubleSpinBox* exposure_ = nullptr;
     QComboBox* tonemap_ = nullptr;
@@ -68,8 +67,7 @@ private:
 
     QCheckBox* sky_enabled_ = nullptr;
     QComboBox* sky_quality_ = nullptr;
-    QSlider* time_of_day_ = nullptr;
-    QLabel* time_of_day_label_ = nullptr;
+    QDoubleSpinBox* moon_size_ = nullptr;
     QDoubleSpinBox* sky_turbidity_ = nullptr;
     QDoubleSpinBox* sky_ozone_ = nullptr;
     QDoubleSpinBox* sky_sun_radiance_ = nullptr;

@@ -52,6 +52,8 @@ StructuredBuffer<float> SkySh : register(t16);
 RWStructuredBuffer<float> SkyShOut : register(u1);
 // GGX prefiltered copy of the captured sky, one roughness step per mip level.
 TextureCube SkyPrefilterTex : register(t17);
+Texture2D CloudCoverTex : register(t18);
+Texture2D CloudDetailTex : register(t19);
 
 SamplerState PointSampler : register(s1);
 SamplerComparisonState ShadowCmpSampler : register(s2);
@@ -984,8 +986,9 @@ float4 SunTransmittancePS(FSOut input) : SV_Target {
     const float height = kAtmosphereTopM * input.uv.x * input.uv.x;
     const float ozone = max(SkyParams0.y, 0.0f);
     const float3 mie_sigma = kMieSigma * max(SkyParams0.x, 1.0e-3f);
+    const float sun_y = (SunDirection.w > 0.5f) ? -0.5f : normalize(-SunDirection.xyz).y;
     const float3 transmittance =
-        sky_transmittance(height, normalize(-SunDirection.xyz).y, mie_sigma, ozone);
+        sky_transmittance(height, sun_y, mie_sigma, ozone);
     return float4(transmittance, 1.0f);
 }
 
@@ -1127,13 +1130,16 @@ float3 milky_way_radiance(float density) {
 }
 
 float3 moon_radiance(float3 direction, float3 sun_to) {
-    const float3 moon_dir = normalize(-sun_to);
+    const float3 moon_dir = (SunDirection.w > 0.5f)
+        ? normalize(-SunDirection.xyz)
+        : normalize(-sun_to);
     const float3 up =
         abs(moon_dir.y) < 0.995f ? float3(0.0f, 1.0f, 0.0f) : float3(0.0f, 0.0f, 1.0f);
     const float3 right = normalize(cross(up, moon_dir));
     const float3 up_local = cross(moon_dir, right);
+    const float moon_angular_radius = max(SkyParams4.w, 1.0e-4f);
     const float2 local =
-        float2(dot(direction, right), dot(direction, up_local)) / kMoonAngularRadius;
+        float2(dot(direction, right), dot(direction, up_local)) / moon_angular_radius;
     const float radius = length(local);
     // Faint halo outside the disc so the moon does not read as a pasted dot.
     const float halo = exp(-max(radius - 1.0f, 0.0f) * 3.0f) * kMoonHaloGain;
@@ -1156,6 +1162,9 @@ float3 moon_radiance(float3 direction, float3 sun_to) {
 }
 
 float night_factor(float3 sun_to) {
+    if (SunDirection.w > 0.5f) {
+        return 1.0f;
+    }
     const float elevation = asin(clamp(sun_to.y, -1.0f, 1.0f));
     return saturate((-elevation - 0.09f) / 0.16f);
 }
@@ -1165,12 +1174,19 @@ float3 night_sky_radiance(float3 direction, float3 sun_to) {
     if (night <= 0.001f) {
         return float3(0.0f, 0.0f, 0.0f);
     }
-    const float milky_density =
-        MilkyWayTex.SampleLevel(SkySampler, dir_to_equirect(direction), 0).r;
+    const float4 milky_sample =
+        MilkyWayTex.SampleLevel(SkySampler, dir_to_equirect(direction), 0);
+    const float milky_density = max(milky_sample.r, max(milky_sample.g, milky_sample.b));
     // Stars thin out away from the galactic band instead of forming a uniform soup.
     const float star_gain = max(SkyParams3.z, 0.0f) * night * kStarGain *
                             (0.45f + 1.65f * saturate(milky_density));
-    float3 result = milky_way_radiance(milky_density) * (max(SkyParams3.w, 0.0f) * night);
+    float3 milky_color;
+    if (abs(milky_sample.r - milky_sample.g) > 0.02f || abs(milky_sample.r - milky_sample.b) > 0.02f) {
+        milky_color = milky_sample.rgb * (kMilkyWayGain * 2.5f);
+    } else {
+        milky_color = milky_way_radiance(milky_density);
+    }
+    float3 result = milky_color * (max(SkyParams3.w, 0.0f) * night);
     result += band_star_dust(direction, milky_density) *
               (max(SkyParams3.z, 0.0f) * night);
     result += star_field(direction) * star_gain;
@@ -1179,47 +1195,181 @@ float3 night_sky_radiance(float3 direction, float3 sun_to) {
     return result;
 }
 
-float2 cloud_plane_uv(float3 direction, float time) {
-    const float altitude = max(direction.y, 0.04f);
-    float2 uv = direction.xz / altitude * (kCloudLayerAltitudeM / kCloudTileM);
-    uv += float2(0.72f, 0.36f) * (time * SkyParams2.z * 0.02f);
-    return uv;
+static const float kCloudBottomM = 3200.0f;
+static const float kCloudTopM = 5400.0f;
+static const float kCloudThicknessM = 2200.0f;
+
+float cumulus_height_gradient(float h) {
+    // Soft billowing base (no hard flat shelf) and rounded dome top
+    float base = smoothstep(0.0f, 0.22f, h);
+    float top  = smoothstep(1.0f, 0.42f, h);
+    return base * top;
 }
 
-// Remaps the tiling noise into a coverage driven density field in 0..1.
-float cloud_coverage_from_field(float field) {
-    const float threshold = 1.0f - SkyParams2.x;
-    // A smooth ramp keeps puffs from ending in hard, stair stepped borders.
-    const float t = saturate((field - threshold) / max(1.0f - threshold, 0.10f));
-    return t * t * (3.0f - 2.0f * t);
+float density_remap(float x, float a, float b, float c, float d) {
+    return saturate(((x - a) / max(b - a, 0.001f)) * (d - c) + c);
 }
 
-float cloud_field(float2 uv, float2 dx, float2 dy) {
-    const float turbulence = max(SkyParams2.w, 0.0f);
-    const float warp =
-        CloudNoiseTex.SampleGrad(SkySampler, uv * 0.16f, dx * 0.16f, dy * 0.16f).b - 0.5f;
-    const float2 warped = uv + float2(warp, -warp) * (turbulence * 0.6f);
-    const float base = CloudNoiseTex.SampleGrad(SkySampler, warped, dx, dy).r;
-    const float detail =
-        CloudNoiseTex.SampleGrad(SkySampler, warped * 3.3f, dx * 3.3f, dy * 3.3f).g;
-    const float field = saturate(base * 0.84f + detail * 0.16f);
-    return cloud_coverage_from_field(field);
+// Quintic C2 3D noise via 2D-slab trick (Ray-MMD / Frostbite Nubis).
+// CloudNoiseTex is a 256x256 tileable R8 noise representing 256 stacked XZ slices.
+// 1.0 unit in p corresponds to 1 texel of a 256x256 slice (world scale ~0.00052f).
+float cloud_noise3d(float3 p) {
+    float3 ip = floor(p);
+    float3 fp = frac(p);
+    fp = fp * fp * fp * (fp * (fp * 6.0f - 15.0f) + 10.0f);
+    float2 uv0 = (ip.xz + float2(37.0f, 17.0f) * ip.y) + fp.xz;
+    float2 uv1 = uv0 + float2(37.0f, 17.0f);
+    float n0 = CloudNoiseTex.SampleLevel(SkySampler, (uv0 + 0.5f) / 256.0f, 0).r;
+    float n1 = CloudNoiseTex.SampleLevel(SkySampler, (uv1 + 0.5f) / 256.0f, 0).r;
+    return lerp(n0, n1, fp.y);
 }
 
-// Fixed coarse level: the sun transmittance is evaluated per lit pixel, where
-// screen derivatives say nothing about the cloud footprint.
-float cloud_field_coarse(float2 uv) {
-    const float base = CloudNoiseTex.SampleLevel(SkySampler, uv, 1.5f).r;
-    const float detail = CloudNoiseTex.SampleLevel(SkySampler, uv * 3.3f, 2.5f).g;
-    return cloud_coverage_from_field(saturate(base * 0.82f + detail * 0.18f));
+float3 cloud_wind_offset() {
+    const float t = SkyParams1.w * SkyParams2.z;
+    return float3(131.57f, 0.0f, -300.0f) * t;
+}
+
+float evaluate_cloud_density(float3 position_ps, float h) {
+    float height_grad = cumulus_height_gradient(h);
+    if (height_grad <= 1.0e-4f) return 0.0f;
+
+    float cov = saturate(SkyParams2.x);
+    if (cov <= 1.0e-4f) return 0.0f;
+
+    const float3 wind = cloud_wind_offset();
+    const float3 p = position_ps + wind;
+
+    // Three-scale weather system (Ray-MMD: synoptic / mesoscale / local cells)
+    const float2x2 rotA = float2x2(0.8508f, -0.5255f, 0.5255f, 0.8508f);
+    const float2x2 rotB = float2x2(0.6691f,  0.7431f, -0.7431f, 0.6691f);
+    const float2 uvW1 = (p.xz + wind.xz * 0.15f) * 0.0000095f;
+    const float2 uvW2 = mul(p.xz + wind.xz * 0.15f, rotA) * 0.000026f;
+    const float2 uvW3 = mul(p.xz + wind.xz * 0.15f, rotB) * 0.000068f;
+
+    const float w1 = CloudCoverTex.SampleLevel(SkySampler, uvW1, 0).r;
+    const float w2 = CloudCoverTex.SampleLevel(SkySampler, uvW2 + 0.35f, 0).r;
+    const float w3 = CloudDetailTex.SampleLevel(SkySampler, uvW3 + 0.17f, 0).r;
+    const float weather_field = w1 * 0.50f + w2 * 0.32f + w3 * 0.18f;
+
+    const float weather_threshold = saturate(0.98f - cov * 1.15f);
+    const float coverage_mask = saturate((weather_field - weather_threshold) / 0.18f);
+    if (coverage_mask <= 0.001f) return 0.0f;
+
+    // 3-octave 3D base shaping (amplified vertical frequency so 3D lobes sculpt both top and bottom)
+    const float3 shape_pos = float3(p.x, p.y * 2.5f, p.z) * 0.00080f;
+    const float s0 = cloud_noise3d(shape_pos);
+    const float s1 = cloud_noise3d(shape_pos * 2.35f + float3(0.31f, 0.73f, 0.17f));
+    const float s2 = cloud_noise3d(shape_pos * 5.50f + float3(0.83f, 0.21f, 0.59f));
+    const float shape_noise = s0 * 0.53f + s1 * 0.30f + s2 * 0.17f;
+
+    // Remap tuned to [0.2..0.8] range of 3-octave noise so cov=0.35 forms full cumulus banks
+    const float shape_low = 0.74f - coverage_mask * height_grad * 0.54f;
+    const float base_cloud = density_remap(shape_noise, shape_low, 0.86f, 0.0f, 1.0f);
+    if (base_cloud <= 0.001f) return 0.0f;
+
+    // Height-adaptive dual-octave erosion (soft sculpted base and billowing tops)
+    const float turbulence = clamp(SkyParams2.w, 0.0f, 2.0f);
+    const float erosion_strength = lerp(0.22f, 0.42f, h) * turbulence;
+    const float3 erosion_pos = float3(p.x + wind.x * 0.5f, (p.y + wind.y * 0.5f) * 2.5f, p.z + wind.z * 0.5f) * 0.0028f;
+    const float e0 = cloud_noise3d(erosion_pos);
+    const float e1 = cloud_noise3d(erosion_pos * 2.6f + float3(0.44f, 0.12f, 0.67f));
+    const float erosion_noise = e0 * 0.62f + e1 * 0.38f;
+
+    const float eroded_cloud = density_remap(base_cloud, erosion_noise * erosion_strength, 1.0f, 0.0f, 1.0f);
+    return eroded_cloud * max(SkyParams2.y, 0.0f) * 2.6f;
+}
+
+float evaluate_cloud_density_cheap(float3 position_ps, float h) {
+    float height_grad = cumulus_height_gradient(h);
+    if (height_grad <= 1.0e-4f) return 0.0f;
+
+    float cov = saturate(SkyParams2.x);
+    if (cov <= 1.0e-4f) return 0.0f;
+
+    const float3 wind = cloud_wind_offset();
+    const float3 p = position_ps + wind;
+    const float2 uv_weather = (p.xz + wind.xz * 0.15f) * 0.0000095f;
+    const float weather1 = CloudCoverTex.SampleLevel(SkySampler, uv_weather, 0).r;
+
+    const float weather_threshold = saturate(0.98f - cov * 1.15f);
+    const float coverage_mask = saturate((weather1 - weather_threshold) / 0.18f);
+    if (coverage_mask <= 0.001f) return 0.0f;
+
+    const float shape_noise = cloud_noise3d(float3(p.x, p.y * 2.5f, p.z) * 0.00080f);
+    const float shape_low = 0.78f - coverage_mask * height_grad * 0.60f;
+    const float density = density_remap(shape_noise, shape_low, 0.92f, 0.0f, 1.0f);
+    return density * max(SkyParams2.y, 0.0f) * 2.2f;
+}
+
+float dual_lobe_phase(float g, float cos_theta) {
+    float forward = mie_phase_hg(cos_theta, g);
+    float backward = mie_phase_hg(cos_theta, -g * 0.35f);
+    return forward * 0.70f + backward * 0.20f + (0.10f / (4.0f * PI));
+}
+
+float beer_powder(float density, float cos_theta) {
+    float powder = 1.0f - exp(-density * 4.5f);
+    float angle_factor = saturate((-cos_theta * 0.5f) + 0.5f);
+    return lerp(1.0f, saturate(powder * 2.0f), angle_factor * 0.75f);
+}
+
+float evaluate_sun_inscatter(float3 p, float3 l_dir, float cos_theta, float local_density) {
+    const float total_light_dist = kCloudThicknessM * 0.85f;
+    const float interval_size = total_light_dist / 3.0f;
+    float optical_depth = 0.0f;
+
+    [unroll]
+    for (int j = 0; j < 3; ++j) {
+        const float dist = interval_size * (0.25f + float(j));
+        const float3 sp = p + l_dir * dist;
+        const float alt = length(sp) - kEarthRadiusM;
+        const float h = saturate((alt - kCloudBottomM) / kCloudThicknessM);
+        optical_depth += evaluate_cloud_density_cheap(sp, h) * 0.004f;
+    }
+
+    const float3 distant_sp = p + l_dir * (interval_size * 6.0f);
+    const float distant_alt = length(distant_sp) - kEarthRadiusM;
+    const float distant_h = saturate((distant_alt - kCloudBottomM) / kCloudThicknessM);
+    optical_depth += evaluate_cloud_density_cheap(distant_sp, distant_h) * 0.003f;
+
+    const float light_extinction = interval_size * optical_depth;
+
+    // Wrenninge/Frostbite 2-octave multi-scattering
+    float total_scattering = 0.0f;
+    float atten_accum = 1.0f;
+    float contrib_accum = 1.0f;
+    float ecc_accum = 1.0f;
+    const float g_base = clamp(SkyParams1.y, 0.1f, 0.9f);
+
+    [unroll]
+    for (int oct = 0; oct < 2; ++oct) {
+        const float phase = dual_lobe_phase(g_base * ecc_accum, cos_theta);
+        const float transmittance = exp(-light_extinction * atten_accum);
+        total_scattering += contrib_accum * phase * transmittance;
+        atten_accum *= 0.5f;
+        contrib_accum *= 0.5f;
+        ecc_accum *= 0.5f;
+    }
+
+    return total_scattering * beer_powder(local_density, cos_theta);
 }
 
 float cloud_transmittance(float3 sun_to) {
-    if (SkyParams2.x <= 0.001f || sun_to.y <= 0.03f) {
+    if (SkyParams2.x <= 0.001f || sun_to.y <= 0.02f) {
         return 1.0f;
     }
-    const float density = cloud_field_coarse(cloud_plane_uv(sun_to, SkyParams1.w));
-    return 1.0f - kCloudSunOcclusion * saturate(density * max(SkyParams2.y, 0.0f));
+    const float3 origin = float3(0.0f, kEarthRadiusM, 0.0f);
+    const float2 span = ray_sphere_span(origin, sun_to, kEarthRadiusM + kCloudBottomM + 500.0f);
+    const float3 p = origin + sun_to * max(span.y, 0.0f);
+    const float alt = length(p) - kEarthRadiusM;
+    const float h = saturate((alt - kCloudBottomM) / kCloudThicknessM);
+    const float d = evaluate_cloud_density_cheap(p, h);
+    return exp(-d * 0.35f);
+}
+
+// Interleaved Gradient Noise (Jorge Jimenez) — blue-noise-like distribution with no 4x4 grid
+float cloud_bayer_dither(float2 pixel_pos) {
+    return frac(52.9829189f * frac(dot(pixel_pos, float2(0.06711056f, 0.00583715f))));
 }
 
 struct CloudLayer {
@@ -1227,32 +1377,84 @@ struct CloudLayer {
     float alpha;
 };
 
-CloudLayer sample_clouds(float3 direction, float3 sun_to) {
+CloudLayer sample_clouds(float3 direction, float3 sun_to, float dither) {
     CloudLayer layer;
     layer.color = float3(0.0f, 0.0f, 0.0f);
     layer.alpha = 0.0f;
-    if (SkyParams2.x <= 0.001f || direction.y <= 0.0f) {
+    if (SkyParams2.x <= 0.001f || direction.y <= 0.01f) {
         return layer;
     }
-    const float2 cloud_uv = cloud_plane_uv(direction, SkyParams1.w);
-    const float density = saturate(cloud_field(cloud_uv, ddx(cloud_uv), ddy(cloud_uv)) *
-                                   max(SkyParams2.y, 0.0f));
-    const float horizon_fade = smoothstep(0.02f, 0.30f, direction.y);
-    layer.alpha = saturate(density * horizon_fade);
 
-    const float3 sun_at_cloud = SkyParams0.z * sun_transmittance_at(kCloudLayerAltitudeM) *
-                                saturate(sun_to.y * 4.0f);
-    const float glow = exp(-density * 2.2f);
-    const float forward = pow(saturate(dot(direction, sun_to)), 4.0f);
-    const float night = night_factor(sun_to);
-    layer.color = sun_at_cloud * (0.30f + 0.70f * glow + 0.25f * forward) +
-                  float3(0.06f, 0.07f, 0.10f) * night;
+    const float observer = max(SkyParams1.z, 0.0f);
+    const float3 origin = float3(0.0f, kEarthRadiusM + observer, 0.0f);
+    const float2 span_bot = ray_sphere_span(origin, direction, kEarthRadiusM + kCloudBottomM);
+    const float2 span_top = ray_sphere_span(origin, direction, kEarthRadiusM + kCloudTopM);
+
+    const float t_start = max(span_bot.y, 0.0f);
+    const float t_end = max(span_top.y, 0.0f);
+    if (t_end <= t_start) {
+        return layer;
+    }
+    const float total_dist = min(t_end - t_start, 40000.0f);
+
+    const int kSteps = 32;
+    const float step_len = total_dist / float(kSteps);
+
+    const bool is_night = SunDirection.w > 0.5f;
+    const float3 L = is_night
+        ? normalize(-SunDirection.xyz)
+        : normalize(sun_to);
+    const float cos_theta = dot(direction, L);
+
+    const float sun_horizon_fade = is_night ? 1.0f : smoothstep(-0.04f, 0.05f, L.y);
+    const float3 sun_at_cloud = SkyParams0.z * sun_transmittance_at(kCloudBottomM + 1000.0f) * sun_horizon_fade * 2.20f;
+    const float3 light_col = is_night
+        ? (kMoonColor * (kMoonLightGain * SkyParams3.y))
+        : sun_at_cloud;
+
+    const float3 sky_ambient = is_night ? float3(0.012f, 0.018f, 0.035f) : float3(0.18f, 0.25f, 0.36f);
+    const float3 ground_ambient = is_night ? float3(0.006f, 0.009f, 0.014f) : float3(0.08f, 0.09f, 0.11f);
+
+    float3 scattered = float3(0.0f, 0.0f, 0.0f);
+    float trans = 1.0f;
+
+    [loop]
+    for (int i = 0; i < kSteps; ++i) {
+        if (trans < 0.01f) break;
+        const float t = t_start + (float(i) + dither) * step_len;
+        const float3 p = origin + direction * t;
+        const float alt = length(p) - kEarthRadiusM;
+        const float h = saturate((alt - kCloudBottomM) / kCloudThicknessM);
+        const float density = evaluate_cloud_density(p, h);
+
+        if (density > 0.001f) {
+            const float sun_inscatter = evaluate_sun_inscatter(p, L, cos_theta, density);
+            const float cavity_ao = lerp(0.60f, 1.0f, exp(-density * 1.4f));
+            const float3 ambient = lerp(ground_ambient, sky_ambient, smoothstep(0.0f, 0.65f, h)) * cavity_ao;
+            const float3 inscatter = light_col * sun_inscatter + ambient;
+
+            const float step_ext = density * 0.0018f * step_len;
+            const float step_trans = exp(-step_ext);
+            const float int_factor = trans * (1.0f - step_trans);
+
+            scattered += inscatter * int_factor;
+            trans *= step_trans;
+        }
+    }
+
+    const float horizon_fade = smoothstep(0.01f, 0.14f, direction.y);
+    const float aerial_fade = exp(-t_start * 0.000018f);
+    layer.alpha = saturate((1.0f - trans) * horizon_fade);
+    layer.color = scattered * horizon_fade * lerp(0.55f, 1.0f, aerial_fade);
     return layer;
 }
 
 // The sun disk and corona are excluded from the sky cubemap: they are sub-texel
 // at capture resolution and their energy is delivered by the analytic sun light.
 float3 atmosphere_radiance(float3 view_dir, float sun_disk_scale) {
+    if (SunDirection.w > 0.5f) {
+        return float3(0.0f, 0.0f, 0.0f);
+    }
     const float turbidity = max(SkyParams0.x, 0.0f);
     const float ozone = max(SkyParams0.y, 0.0f);
     const float sun_radiance = max(SkyParams0.z, 0.0f);
@@ -1344,11 +1546,20 @@ float3 atmosphere_radiance(float3 view_dir) {
 // Full sky radiance for one world direction: atmosphere, night layer, clouds.
 // `sun_disk_scale` is zero when the caller captures the sky for image based
 // lighting instead of drawing it.
+float3 sky_radiance(float3 view_dir, float3 sun_to, float sun_disk_scale, float dither) {
+    const CloudLayer clouds = sample_clouds(view_dir, sun_to, dither);
+    // The sun disk is ~600x brighter than the sky, so even 10% transmittance lets it
+    // punch through solid clouds after tonemapping. Attenuate sun_disk_scale nonlinearly
+    // with cloud opacity so solid clouds fully occlude the disk while thin wisps glow.
+    const float sun_visibility = pow(saturate(1.0f - clouds.alpha * 1.25f), 3.0f);
+    float3 sky = (SunDirection.w > 0.5f)
+        ? night_sky_radiance(view_dir, sun_to)
+        : (atmosphere_radiance(view_dir, sun_disk_scale * sun_visibility) + night_sky_radiance(view_dir, sun_to));
+    return sky * (1.0f - clouds.alpha) + clouds.color;
+}
+
 float3 sky_radiance(float3 view_dir, float3 sun_to, float sun_disk_scale) {
-    float3 sky = atmosphere_radiance(view_dir, sun_disk_scale) +
-                 night_sky_radiance(view_dir, sun_to);
-    const CloudLayer clouds = sample_clouds(view_dir, sun_to);
-    return sky * (1.0f - clouds.alpha) + clouds.color * clouds.alpha;
+    return sky_radiance(view_dir, sun_to, sun_disk_scale, 0.5f);
 }
 
 // Real spherical harmonics up to l = 2 in the engine's y-up frame. The standard
@@ -1419,7 +1630,7 @@ float4 SkyPS(FSOut input) : SV_Target {
     const float3 environment = SkyCubeTex.SampleLevel(SkySampler, ibl_direction(view_dir), 0).rgb;
     return float4(max(environment, 0.0f), 1.0f);
 #else
-    return float4(max(sky_radiance(view_dir, sun_to, 1.0f), 0.0f), 1.0f);
+    return float4(max(sky_radiance(view_dir, sun_to, 1.0f, cloud_bayer_dither(input.pos.xy)), 0.0f), 1.0f);
 #endif
 }
 
@@ -1529,16 +1740,19 @@ float4 LightingPS(FSOut input) : SV_Target {
 
     // Extinction between this fragment and the sun, from the 64x1 LUT the sky
     // pass fills every frame. Phase 6 fog samples the same function per step.
+    const bool is_night = SunDirection.w > 0.5f;
     float3 sun_attenuation = float3(1.0f, 1.0f, 1.0f);
 #if SKY_ENABLE
-    sun_attenuation = sun_transmittance_at(world_pos.y);
+    if (!is_night) {
+        sun_attenuation = lerp(float3(1.0f, 1.0f, 1.0f), sun_transmittance_at(world_pos.y), 0.20f);
 #if SUN_SKY_COUPLING
-    // The captured environment excludes the sun disk, so the analytic direct
-    // term has to hand its energy over to the sky dome as the sun approaches
-    // the horizon. Same curve as Ray-MMD's SUN_SKY_COUPLING.
-    const float solar_elevation = saturate(-SunDirection.y);
-    sun_attenuation *= saturate(1.0f - exp(-4.5f * solar_elevation));
+        // The captured environment excludes the sun disk, so the analytic direct
+        // term has to hand its energy over to the sky dome as the sun approaches
+        // the horizon. Same curve as Ray-MMD's SUN_SKY_COUPLING.
+        const float solar_elevation = saturate(-SunDirection.y);
+        sun_attenuation *= saturate(0.6f + 0.4f * (1.0f - exp(-4.5f * solar_elevation)));
 #endif
+    }
 #endif
 
     const float3 f0 = lerp(float3(0.04f, 0.04f, 0.04f), specular, metallic);
@@ -1550,7 +1764,7 @@ float4 LightingPS(FSOut input) : SV_Target {
 
     float specular_roughness = max(roughness, 0.04f);
 #if SUN_SPECULAR_DISK_ENABLE
-    const float sin_alpha = sin(SUN_ANGULAR_RADIUS);
+    const float sin_alpha = sin(max(SkyParams0.w, SUN_ANGULAR_RADIUS));
     specular_roughness =
         sqrt(specular_roughness * specular_roughness + sin_alpha * sin_alpha);
 #endif
@@ -1591,37 +1805,6 @@ float4 LightingPS(FSOut input) : SV_Target {
 
     float3 moon_diffuse = float3(0.0f, 0.0f, 0.0f);
     float3 moon_specular = float3(0.0f, 0.0f, 0.0f);
-#if SKY_ENABLE && SUN_LIGHT_ENABLE != 0
-    // The moon sits opposite the sun and reuses the directional BRDF with the
-    // mirrored light vector. Real moonlight is about 1e-6 of sunlight, so
-    // kMoonLightGain keeps the cool fill readable instead of leaving nights
-    // black, and the phase term dims it towards new moon.
-    const float3 moon_l = -l;
-    const float moon_no_l = saturate(dot(n, moon_l));
-    const float3 moon_h = normalize(moon_l + v);
-    const float moon_no_h = saturate(dot(n, moon_h));
-#if BRDF_FRESNEL_TYPE == 0
-    const float3 moon_fresnel = F_Schlick(saturate(dot(moon_h, v)), f0);
-#else
-    const float3 moon_fresnel = F_AdobeF82(saturate(dot(moon_h, v)), f0);
-#endif
-#if DIFFUSE_BRDF_TYPE == 0
-    const float3 moon_diffuse_brdf = diffuse_burley(diffuse_base, moon_no_l, no_v, roughness);
-#else
-    const float3 moon_diffuse_brdf =
-        diffuse_eon(diffuse_base, n, moon_l, v, moon_no_l, no_v, roughness);
-#endif
-    const float moon_d = D_GGX(moon_no_h, specular_roughness);
-    const float moon_vis = V_SmithGGXCorrelated(max(no_v, 1.0e-4f), max(moon_no_l, 1.0e-4f),
-                                                specular_roughness);
-    const float moon_phase = saturate(SkyParams3.x);
-    const float moon_lit = saturate(1.0f - abs(2.0f * moon_phase - 1.0f));
-    const float moon_night = night_factor(-SunDirection.xyz);
-    const float3 moon_light =
-        kMoonColor * (kMoonLightGain * moon_lit * moon_night * saturate(SkyParams3.y));
-    moon_diffuse = moon_diffuse_brdf * moon_light * moon_no_l;
-    moon_specular = moon_d * moon_vis * moon_fresnel * moon_light * moon_no_l;
-#endif
 
     float sky_visibility = 1.0f;
     float3 bent_n = n;
@@ -1635,7 +1818,7 @@ float4 LightingPS(FSOut input) : SV_Target {
     // The captured sky is the ambient term once it exists: the SH9 irradiance
     // replaces the flat placeholder and carries the sky colour and the upward
     // bias. IblParams0.w is sky.ambient_intensity, so the same control scales it.
-    const float3 sky_irradiance = max(sh_irradiance(bent_n), float3(0.0f, 0.0f, 0.0f)) / PI;
+    const float3 sky_irradiance = max(sh_irradiance(bent_n), float3(0.0f, 0.0f, 0.0f)) * (0.25f / PI);
     ambient = sky_irradiance * max(IblParams0.w, 0.0f) * base * (1.0f - metallic) *
               sky_visibility;
 #endif
@@ -1649,7 +1832,7 @@ float4 LightingPS(FSOut input) : SV_Target {
     const float3 prefiltered =
         max(SkyPrefilterTex.SampleLevel(SkySampler, reflected, lobe_mip).rgb, 0.0f);
     const float2 ab = env_brdf_approx(roughness, max(no_v, 1.0e-4f));
-    ibl_specular = prefiltered * (f0 * ab.x + ab.y) * IblParams0.x * sky_visibility;
+    ibl_specular = prefiltered * (f0 * ab.x + ab.y) * (IblParams0.x * 0.35f) * sky_visibility;
 #endif
 
     float3 color =

@@ -48,17 +48,17 @@ enum class DebugView : std::uint8_t {
 };
 
 struct SunSettings {
-    int light_mode = 2;
+    int light_mode = 1;
     bool specular_disk = true;
     bool backlight_translucency = true;
     bool limb_darkening = true;
     bool hair_transmission = true;
     bool sky_coupling = true;
-    bool auto_cct = true;
+    bool auto_cct = false;
     bool corona = true;
     float intensity = 1.5f;
     float color_temperature = 6500.0f;
-    float angular_radius = 0.00465f;
+    float angular_radius = 0.020f;
 };
 
 struct ShadowSettings {
@@ -76,7 +76,7 @@ struct SkySettings {
     float time_of_day = 12.0f;
     float turbidity = 1.0f;
     float ozone = 1.0f;
-    float sun_radius = 1.0f;
+    float sun_radius = 1.5f;
     float sun_radiance = 10.0f;
     float mie_anisotropy = 0.76f;
     float cloud_coverage = 0.35f;
@@ -87,6 +87,7 @@ struct SkySettings {
     float milky_way_intensity = 1.0f;
     float moon_intensity = 1.0f;
     float moon_phase = 0.5f;
+    float moon_radius = 1.5f;
     float ambient_intensity = 0.10f;
     Vec3 ambient_color{0.55f, 0.66f, 0.82f};
     // Upper bound on captured environment refreshes per second.

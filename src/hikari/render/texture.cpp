@@ -270,6 +270,31 @@ GpuTexture GpuTexture::from_memory(core::D3D11Context& context, const std::uint8
     return from_rgba_bytes(context, image.width, image.height, image.rgba.data());
 }
 
+GpuTexture GpuTexture::from_memory_mipped(core::D3D11Context& context, const std::uint8_t* data,
+                                          std::size_t size) {
+    Image image;
+    if (size >= 4 && std::memcmp(data, "DDS ", 4) == 0) {
+        std::vector<std::uint8_t> bytes(data, data + size);
+        if (!load_dds(bytes, image)) {
+            throw std::runtime_error("unsupported DDS format");
+        }
+    } else {
+        int width = 0;
+        int height = 0;
+        int channels = 0;
+        stbi_uc* pixels = stbi_load_from_memory(data, static_cast<int>(size), &width, &height,
+                                                &channels, 4);
+        if (pixels == nullptr) {
+            throw std::runtime_error("image decode failed");
+        }
+        image.width = static_cast<std::uint32_t>(width);
+        image.height = static_cast<std::uint32_t>(height);
+        image.rgba.assign(pixels, pixels + static_cast<std::size_t>(width) * height * 4);
+        stbi_image_free(pixels);
+    }
+    return from_rgba_bytes_mipped(context, image.width, image.height, image.rgba.data());
+}
+
 GpuTexture GpuTexture::from_file(core::D3D11Context& context, const std::wstring& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
@@ -278,6 +303,16 @@ GpuTexture GpuTexture::from_file(core::D3D11Context& context, const std::wstring
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)),
                                     std::istreambuf_iterator<char>());
     return from_memory(context, bytes.data(), bytes.size());
+}
+
+GpuTexture GpuTexture::from_file_mipped(core::D3D11Context& context, const std::wstring& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("failed to open texture file");
+    }
+    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)),
+                                    std::istreambuf_iterator<char>());
+    return from_memory_mipped(context, bytes.data(), bytes.size());
 }
 
 GpuTexture GpuTexture::create_solid_color(core::D3D11Context& context,

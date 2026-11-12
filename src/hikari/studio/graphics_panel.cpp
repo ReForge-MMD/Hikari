@@ -27,7 +27,6 @@ namespace hikari::studio {
 namespace {
 
 constexpr int kPreviewIntervalMs = 500;
-constexpr int kMinutesPerDay = 24 * 60;
 constexpr char kTooltipProperty[] = "hikari_original_tooltip";
 
 // Disables a dependency-gated control and explains why, restoring the original
@@ -121,12 +120,8 @@ void GraphicsPanel::build_controls() {
     backend_form->addRow(QStringLiteral("Preset"), preset_);
     layout->addWidget(make_group(QStringLiteral("Backend"), backend));
 
-    sun_mode_ = new QComboBox();
-    sun_mode_->addItems({QStringLiteral("Disabled"), QStringLiteral("Simple directional"),
-                         QStringLiteral("Sky coupled")});
-    sun_mode_->setToolTip(QStringLiteral(
-        "Sky coupled takes the light direction from the atmosphere at the current "
-        "time of day; color and intensity stay on the sliders below."));
+    sun_size_ = make_spin(0.1, 10.0, 0.1, 1);
+    sun_size_->setToolTip(QStringLiteral("Visual size scaling of the sun disk in the sky."));
     sun_intensity_ = make_spin(0.0, 100.0, 0.1, 2);
     sun_temperature_ = make_spin(1000.0, 20000.0, 100.0, 0);
     sun_temperature_->setSuffix(QStringLiteral(" K"));
@@ -140,7 +135,7 @@ void GraphicsPanel::build_controls() {
     auto* sun = new QWidget();
     auto* sun_form = new QFormLayout(sun);
     sun_form->setContentsMargins(0, 0, 0, 0);
-    sun_form->addRow(QStringLiteral("Mode"), sun_mode_);
+    sun_form->addRow(QStringLiteral("Sun size"), sun_size_);
     sun_form->addRow(QStringLiteral("Intensity"), sun_intensity_);
     sun_form->addRow(QStringLiteral("Temperature"), sun_temperature_);
     sun_form->addRow(sun_disk_);
@@ -159,21 +154,8 @@ void GraphicsPanel::build_controls() {
                             QStringLiteral("Cinematic (32 steps)")});
     sky_quality_->setToolTip(QStringLiteral("Raymarch steps per sky pixel."));
 
-    time_of_day_ = new QSlider(Qt::Horizontal);
-    time_of_day_->setRange(0, kMinutesPerDay);
-    time_of_day_->setSingleStep(5);
-    time_of_day_->setPageStep(60);
-    time_of_day_->setTickInterval(180);
-    time_of_day_->setTickPosition(QSlider::TicksBelow);
-    time_of_day_->setToolTip(QStringLiteral("Local solar time in hours and minutes."));
-    time_of_day_label_ = new QLabel(QStringLiteral("12:00"));
-    time_of_day_label_->setMinimumWidth(44);
-    time_of_day_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    auto* time_row = new QWidget();
-    auto* time_layout = new QHBoxLayout(time_row);
-    time_layout->setContentsMargins(0, 0, 0, 0);
-    time_layout->addWidget(time_of_day_, 1);
-    time_layout->addWidget(time_of_day_label_);
+    moon_size_ = make_spin(0.1, 10.0, 0.1, 1);
+    moon_size_->setToolTip(QStringLiteral("Visual size scaling of the moon disk in the sky."));
 
     sky_turbidity_ = make_spin(0.0, 10.0, 0.1, 2);
     sky_turbidity_->setToolTip(QStringLiteral("Aerosol density; higher values haze the horizon."));
@@ -190,7 +172,6 @@ void GraphicsPanel::build_controls() {
     sky_form->setContentsMargins(0, 0, 0, 0);
     sky_form->addRow(sky_enabled_);
     sky_form->addRow(QStringLiteral("Quality"), sky_quality_);
-    sky_form->addRow(QStringLiteral("Time of day"), time_row);
     sky_form->addRow(QStringLiteral("Turbidity"), sky_turbidity_);
     sky_form->addRow(QStringLiteral("Ozone"), sky_ozone_);
     sky_form->addRow(QStringLiteral("Sun radiance"), sky_sun_radiance_);
@@ -218,6 +199,7 @@ void GraphicsPanel::build_controls() {
     auto* moon = new QWidget();
     auto* moon_form = new QFormLayout(moon);
     moon_form->setContentsMargins(0, 0, 0, 0);
+    moon_form->addRow(QStringLiteral("Moon size"), moon_size_);
     moon_form->addRow(QStringLiteral("Moon intensity"), moon_intensity_);
     moon_form->addRow(QStringLiteral("Moon phase"), moon_phase_);
     moon_form->addRow(QStringLiteral("Star brightness"), star_brightness_);
@@ -400,10 +382,9 @@ void GraphicsPanel::build_controls() {
     });
     connect(preset_, &QComboBox::currentIndexChanged, this,
             [this](int index) { apply_preset(index); });
-    connect(sun_mode_, &QComboBox::currentIndexChanged, this, [this](int index) {
+    connect(sun_size_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
         push_edit();
-        state_.graphics.sun.light_mode = index;
-        refresh_from_state();
+        state_.graphics.sky.sun_radius = static_cast<float>(value);
     });
     connect(sun_intensity_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
         push_edit();
@@ -434,11 +415,7 @@ void GraphicsPanel::build_controls() {
         push_edit();
         state_.graphics.sky.quality = index;
     });
-    connect(time_of_day_, &QSlider::valueChanged, this, [this](int minutes) {
-        push_edit();
-        state_.graphics.sky.time_of_day = static_cast<float>(minutes) / 60.0f;
-        refresh_time_label();
-    });
+    bind_sky_spin(moon_size_, &gfx::SkySettings::moon_radius);
     bind_sky_spin(sky_turbidity_, &gfx::SkySettings::turbidity);
     bind_sky_spin(sky_ozone_, &gfx::SkySettings::ozone);
     bind_sky_spin(sky_sun_radiance_, &gfx::SkySettings::sun_radiance);
@@ -553,13 +530,6 @@ void GraphicsPanel::apply_preset(int index) {
     refresh_from_state();
 }
 
-void GraphicsPanel::refresh_time_label() {
-    const int minutes = std::clamp(time_of_day_->value(), 0, kMinutesPerDay);
-    time_of_day_label_->setText(QStringLiteral("%1:%2")
-                                    .arg(minutes / 60, 2, 10, QChar('0'))
-                                    .arg(minutes % 60, 2, 10, QChar('0')));
-}
-
 void GraphicsPanel::refresh_preview() {
     if (ibl_error_provider_ != nullptr) {
         const std::string& path = state_.graphics.ibl.custom_path;
@@ -602,7 +572,7 @@ void GraphicsPanel::choose_environment() {
 void GraphicsPanel::refresh_from_state() {
     const QSignalBlocker block_renderer(renderer_);
     const QSignalBlocker block_preset(preset_);
-    const QSignalBlocker block_sun_mode(sun_mode_);
+    const QSignalBlocker block_sun_size(sun_size_);
     const QSignalBlocker block_sun_intensity(sun_intensity_);
     const QSignalBlocker block_sun_temperature(sun_temperature_);
     const QSignalBlocker block_ambient(ambient_intensity_);
@@ -622,7 +592,7 @@ void GraphicsPanel::refresh_from_state() {
     const QSignalBlocker block_debug_view(debug_view_);
     const QSignalBlocker block_sky_enabled(sky_enabled_);
     const QSignalBlocker block_sky_quality(sky_quality_);
-    const QSignalBlocker block_time(time_of_day_);
+    const QSignalBlocker block_moon_size(moon_size_);
     const QSignalBlocker block_turbidity(sky_turbidity_);
     const QSignalBlocker block_ozone(sky_ozone_);
     const QSignalBlocker block_sun_radiance(sky_sun_radiance_);
@@ -644,7 +614,7 @@ void GraphicsPanel::refresh_from_state() {
 
     renderer_->setCurrentIndex(graphics.renderer == gfx::RendererMode::Native ? 1 : 0);
     preset_->setCurrentIndex(static_cast<int>(graphics.preset));
-    sun_mode_->setCurrentIndex(graphics.sun.light_mode);
+    sun_size_->setValue(graphics.sky.sun_radius);
     sun_intensity_->setValue(graphics.sun.intensity);
     sun_temperature_->setValue(graphics.sun.color_temperature);
     shadow_quality_->setCurrentIndex(std::clamp(graphics.shadows.quality, 0, 4));
@@ -657,9 +627,7 @@ void GraphicsPanel::refresh_from_state() {
 
     sky_enabled_->setChecked(graphics.sky.enabled);
     sky_quality_->setCurrentIndex(std::clamp(graphics.sky.quality, 0, 4));
-    time_of_day_->setValue(
-        std::clamp(static_cast<int>(graphics.sky.time_of_day * 60.0f + 0.5f), 0, kMinutesPerDay));
-    refresh_time_label();
+    moon_size_->setValue(graphics.sky.moon_radius);
     sky_turbidity_->setValue(graphics.sky.turbidity);
     sky_ozone_->setValue(graphics.sky.ozone);
     sky_sun_radiance_->setValue(graphics.sky.sun_radiance);
@@ -689,13 +657,13 @@ void GraphicsPanel::refresh_from_state() {
     const bool sky_on = graphics.sky.enabled;
     const QString sky_reason = QStringLiteral("Enable the analytic sky to edit this value.");
     for (QWidget* widget : std::array<QWidget*, 14>{
-             sky_quality_, time_of_day_, sky_turbidity_, sky_ozone_, sky_sun_radiance_,
+             sky_quality_, moon_size_, sky_turbidity_, sky_ozone_, sky_sun_radiance_,
              sky_mie_anisotropy_, moon_intensity_, moon_phase_, star_brightness_, milky_way_,
              cloud_coverage_, cloud_density_, cloud_speed_, cloud_turbulence_}) {
         gate_control(widget, sky_on, sky_reason);
     }
 
-    gate_control(sky_coupling_, sky_on && graphics.sun.light_mode != 0,
+    gate_control(sky_coupling_, sky_on,
                  sky_on ? QStringLiteral("Only the direct sun can fade into the sky.")
                         : QStringLiteral("Enable the analytic sky to couple the sun."));
 
