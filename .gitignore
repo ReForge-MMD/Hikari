@@ -56,7 +56,13 @@ $RECYCLE.BIN/
 *.emm.bak
 
 # Local model & motion assets (prevent accidental checkin of large copyrighted media)
-/assets/
+/assets/*
+!/assets/sky/
+/assets/sky/*
+!/assets/sky/clouds1.png
+!/assets/sky/clouds2.png
+!/assets/sky/clouds3.png
+!/assets/sky/starmap_2020_4k.png
 /models/
 /motions/
 /records/
