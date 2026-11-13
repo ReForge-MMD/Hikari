@@ -1,0 +1,19 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "skin_glossy_cool_lavender_2_medium_bright",
+  "response": {
+    "shading_model": "cel",
+    "albedo": [0.9333, 0.7333, 0.8500],
+    "roughness": 0.4000,
+    "specular": [0.3500, 0.3500, 0.3500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7500,
+    "custom_b": 0.8076,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 80.0000,
+    "custom_b_color": [0.9200, 0.7800, 0.7500],
+    "normal_map": "skin.png"
+  }
+}

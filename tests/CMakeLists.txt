@@ -8,6 +8,8 @@ add_executable(hikari_tests
   test_gfx_fog.cpp
   test_gfx_ibl.cpp
   test_gfx_material.cpp
+  test_gfx_material_graph.cpp
+  test_gfx_material_io.cpp
   test_gfx_settings.cpp
   test_gfx_shadow.cpp
   test_gfx_sky.cpp

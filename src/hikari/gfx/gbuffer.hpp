@@ -24,6 +24,7 @@ enum class MaterialFlag : std::uint32_t {
     ReceiveSsr = 1u << 4,
     ReceiveGi = 1u << 5,
     Outline = 1u << 6,
+    HashedAlpha = 1u << 7,
 };
 
 } // namespace hikari::gfx

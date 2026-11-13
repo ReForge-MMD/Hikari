@@ -1,0 +1,21 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_glitter_gold",
+  "response": {
+    "shading_model": "default",
+    "albedo": [1.0000, 0.7800, 0.3500],
+    "roughness": 0.1800,
+    "specular": [1.0000, 0.8500, 0.4500],
+    "metallic": 0.8500,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.0000,
+    "custom_b": 0.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 0.0000,
+    "glitter": true,
+    "glitter_density": 200.0000,
+    "glitter_roughness": 0.6000,
+    "glitter_intensity": 3.5000
+  }
+}

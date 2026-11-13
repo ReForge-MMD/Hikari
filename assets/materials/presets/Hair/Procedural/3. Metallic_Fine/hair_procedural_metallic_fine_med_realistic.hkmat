@@ -1,0 +1,19 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "hair_procedural_metallic_fine_med_realistic",
+  "response": {
+    "shading_model": "default",
+    "roughness": 0.3000,
+    "specular": [0.5000, 0.5000, 0.5000],
+    "metallic": 0.1000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.0000,
+    "custom_b": 0.0000,
+    "hashed_alpha": true,
+    "hex_tiling_scale": 2.0000,
+    "procedural_hair": true,
+    "procedural_hair_scale": 0.4500,
+    "procedural_hair_intensity": 0.4500
+  }
+}

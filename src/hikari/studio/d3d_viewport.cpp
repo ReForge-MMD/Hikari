@@ -25,6 +25,7 @@
 #include "hikari/core/log.hpp"
 #include "hikari/gfx/material_import.hpp"
 #include "hikari/gfx/material_presets.hpp"
+#include "hikari/gfx/matgen/material_io.hpp"
 #include "hikari/gfx/sky.hpp"
 #include "hikari/render/frustum.hpp"
 #include "hikari/studio/viewport_chrome.hpp"
@@ -714,6 +715,72 @@ void D3DViewport::clear_material_override(int model_index, int subset) {
         return;
     }
     model->material_overrides[static_cast<std::size_t>(subset)].reset();
+}
+
+std::optional<gfx::MaterialResponse> D3DViewport::material_response(int model_index, int subset) const {
+    if (model_index < 0 || model_index >= static_cast<int>(models_.size())) {
+        return std::nullopt;
+    }
+    const ModelInstance& model = *models_[static_cast<std::size_t>(model_index)];
+    if (subset < 0 || static_cast<std::size_t>(subset) >= model.mesh.subsets.size()) {
+        return std::nullopt;
+    }
+    if (static_cast<std::size_t>(subset) < model.material_overrides.size() &&
+        model.material_overrides[static_cast<std::size_t>(subset)]) {
+        return *model.material_overrides[static_cast<std::size_t>(subset)];
+    }
+    const render::MeshSubset& mesh_subset = model.mesh.subsets[static_cast<std::size_t>(subset)];
+    if (mesh_subset.material_index < model.materials.size()) {
+        return gfx::response_from_constants(
+            gfx::material_from_gpu(model.materials[mesh_subset.material_index]));
+    }
+    return std::nullopt;
+}
+
+void D3DViewport::set_material_response(int model_index, int subset,
+                                        const gfx::MaterialResponse& response) {
+    ModelInstance* model = model_at(models_, model_index);
+    if (model == nullptr || subset < 0 ||
+        static_cast<std::size_t>(subset) >= model->material_overrides.size()) {
+        return;
+    }
+    model->material_overrides[static_cast<std::size_t>(subset)] = response;
+}
+
+bool D3DViewport::load_hkmat_material(int model_index, int subset, const QString& path) {
+    if (path.startsWith(QLatin1String(":/"))) {
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) return false;
+        const QByteArray bytes = file.readAll();
+        auto file_data = gfx::matgen::MaterialIO::deserialize_hkmat(std::string_view(bytes.constData(), bytes.size()));
+        if (!file_data) return false;
+        set_material_response(model_index, subset, file_data->response);
+        return true;
+    }
+    auto resp = gfx::load_hkmat(path.toStdString());
+    if (!resp) return false;
+    set_material_response(model_index, subset, *resp);
+    return true;
+}
+
+bool D3DViewport::save_hkmat_material(int model_index, int subset, const QString& path) {
+    auto resp = material_response(model_index, subset);
+    if (!resp) return false;
+    return gfx::save_hkmat(path.toStdString(), "exported_material", *resp);
+}
+
+void D3DViewport::convert_material_toon(int model_index, int subset, bool to_toon) {
+    auto resp = material_response(model_index, subset);
+    if (!resp) return;
+    if (to_toon) {
+        resp->shading_model = static_cast<int>(gfx::ShadingModel::Cel);
+        resp->custom_a = 0.5f; // Cel threshold
+        resp->custom_b = 0.0f; // Neutral shadow
+        resp->roughness = std::max(resp->roughness, 0.4f);
+    } else {
+        resp->shading_model = static_cast<int>(gfx::ShadingModel::Default);
+    }
+    set_material_response(model_index, subset, *resp);
 }
 
 gfx::ImportReport D3DViewport::import_ray_mmd(int model_index, int subset, const QString& path) {
@@ -3717,6 +3784,12 @@ void D3DViewport::render_scene_native() {
                 view.material_overrides.push_back(gfx::apply_material_response(
                     authored_constants, *model->material_overrides[i]));
                 draw.material_override = &view.material_overrides.back();
+                draw.albedo_map_override = model->material_overrides[i]->albedo_map;
+                draw.normal_map_override = model->material_overrides[i]->normal_map;
+                draw.roughness_map_override = model->material_overrides[i]->roughness_map;
+                draw.metallic_map_override = model->material_overrides[i]->metallic_map;
+                draw.emissive_map_override = model->material_overrides[i]->emissive_map;
+                draw.occlusion_map_override = model->material_overrides[i]->occlusion_map;
             }
             // Glass always takes the forward path, even when the authored
             // diffuse is opaque.

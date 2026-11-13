@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_auto_normal_skin_hq",
+  "response": {
+    "shading_model": "skin",
+    "roughness": 0.9000,
+    "specular": [0.3500, 0.3500, 0.3500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.6000,
+    "custom_b": 0.8500,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 80.0000,
+    "custom_b_color": [0.8500, 0.8500, 0.8500],
+    "normal_map": "auto"
+  }
+}

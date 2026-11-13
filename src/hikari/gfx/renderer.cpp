@@ -15,6 +15,7 @@
 #endif
 
 #include "hikari/gfx/ao_ssr_gi.hpp"
+#include "hikari/gfx/embedded_material_textures.hpp"
 #include "hikari/gfx/fog.hpp"
 #include "hikari/gfx/gbuffer.hpp"
 #include "hikari/gfx/ibl.hpp"
@@ -197,6 +198,10 @@ Renderer::Renderer(core::D3D11Context& context)
       white_texture_([&context] {
           const std::uint8_t white[4] = {255, 255, 255, 255};
           return render::GpuTexture::create_solid_color(context, white);
+      }()),
+      flat_normal_texture_([&context] {
+          const std::uint8_t flat[4] = {128, 128, 255, 0};
+          return render::GpuTexture::create_solid_color(context, flat);
       }()) {
     create_buffers();
     build_grid();
@@ -564,6 +569,7 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     // they must be released before those targets are rebound as render targets.
     context_.context->PSSetShaderResources(8, 4, null_views);
     context_.context->PSSetShaderResources(12, 8, null_views);
+    context_.context->PSSetShaderResources(28, 8, null_views);
     context_.context->VSSetShaderResources(0, 1, null_views);
     ID3D11ShaderResourceView* null_diffuse = nullptr;
     context_.context->VSSetShaderResources(8, 1, &null_diffuse);
@@ -936,10 +942,34 @@ void Renderer::draw_item(const DrawItem& item, bool transparent) {
             two_sided ? core::RasterizerPreset::CullNoneSolid
                       : core::RasterizerPreset::CullBackSolid));
     }
+    auto resolve_srv = [&](std::string_view override_name, ID3D11ShaderResourceView* fallback) -> ID3D11ShaderResourceView* {
+        if (override_name.empty()) return fallback;
+        auto it = material_texture_cache_.find(std::string(override_name));
+        if (it != material_texture_cache_.end()) return it->second.srv.Get();
+        render::GpuTexture tex;
+        if (try_load_material_texture(context_, override_name, tex)) {
+            auto inserted = material_texture_cache_.emplace(std::string(override_name), std::move(tex));
+            return inserted.first->second.srv.Get();
+        }
+        return fallback;
+    };
+
+    ID3D11ShaderResourceView* diffuse_srv = resolve_srv(item.albedo_map_override, srv);
+    ID3D11ShaderResourceView* normal_srv = resolve_srv(item.normal_map_override, flat_normal_texture_.srv.Get());
+    ID3D11ShaderResourceView* roughness_srv = resolve_srv(item.roughness_map_override, white_texture_.srv.Get());
+    ID3D11ShaderResourceView* metallic_srv = resolve_srv(item.metallic_map_override, white_texture_.srv.Get());
+    ID3D11ShaderResourceView* occlusion_srv = resolve_srv(item.occlusion_map_override, white_texture_.srv.Get());
+    ID3D11ShaderResourceView* emissive_srv = resolve_srv(item.emissive_map_override, white_texture_.srv.Get());
+
     update_material_constants(constants);
     bind_material_constants();
-    context_.context->PSSetShaderResources(8, 1, &srv);
+    context_.context->PSSetShaderResources(8, 1, &diffuse_srv);
     context_.context->PSSetShaderResources(28, 1, &sphere_srv);
+    context_.context->PSSetShaderResources(30, 1, &normal_srv);
+    context_.context->PSSetShaderResources(31, 1, &roughness_srv);
+    context_.context->PSSetShaderResources(32, 1, &metallic_srv);
+    context_.context->PSSetShaderResources(33, 1, &occlusion_srv);
+    context_.context->PSSetShaderResources(34, 1, &emissive_srv);
     context_.context->DrawIndexed(subset.index_count, subset.index_start, 0);
 }
 

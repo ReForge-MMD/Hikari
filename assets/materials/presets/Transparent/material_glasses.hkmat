@@ -1,0 +1,16 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_glasses",
+  "response": {
+    "shading_model": "glass",
+    "roughness": 0.0000,
+    "specular": [0.0200, 0.0200, 0.0200],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 1.0000,
+    "custom_b": 0.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 0.0000
+  }
+}

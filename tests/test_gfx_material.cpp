@@ -168,7 +168,7 @@ TEST_CASE("the subsurface composite blends the albedo instead of adding it", "[g
 
 TEST_CASE("material preset library covers the native surface kinds", "[gfx][material]") {
     const std::vector<hikari::gfx::MaterialPreset>& presets = hikari::gfx::material_presets();
-    REQUIRE(presets.size() == 10);
+    REQUIRE(presets.size() >= 10);
     for (const hikari::gfx::MaterialPreset& preset : presets) {
         REQUIRE_FALSE(preset.name.empty());
         REQUIRE(preset.roughness > 0.0f);

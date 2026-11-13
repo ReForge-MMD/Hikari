@@ -1,0 +1,22 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_snow",
+  "response": {
+    "shading_model": "sss",
+    "albedo": [0.9600, 0.9700, 0.9900],
+    "roughness": 0.6500,
+    "specular": [0.0500, 0.0500, 0.0500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.8000,
+    "custom_b": 0.8289,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 4.0000,
+    "custom_b_color": [0.7000, 0.8500, 1.0000],
+    "glitter": true,
+    "glitter_density": 150.0000,
+    "glitter_roughness": 0.5500,
+    "glitter_intensity": 2.0000
+  }
+}

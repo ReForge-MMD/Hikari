@@ -1,0 +1,17 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "hair_anime_vibrant_realistic",
+  "response": {
+    "shading_model": "anisotropy",
+    "roughness": 0.1200,
+    "specular": [0.6500, 0.6500, 0.6500],
+    "metallic": 0.1000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 1.0000,
+    "custom_b": 0.0000,
+    "hashed_alpha": true,
+    "hex_tiling_scale": 18.0000,
+    "normal_map": "hair.png"
+  }
+}

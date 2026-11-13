@@ -1,0 +1,17 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_leaves_tree",
+  "response": {
+    "shading_model": "cel",
+    "roughness": 0.4500,
+    "specular": [0.0400, 0.0400, 0.0400],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7500,
+    "custom_b": 0.3729,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 0.0000,
+    "custom_b_color": [0.2800, 0.4200, 0.1800]
+  }
+}

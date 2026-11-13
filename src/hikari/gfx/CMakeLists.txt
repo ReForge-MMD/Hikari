@@ -7,6 +7,9 @@ add_library(hikari_gfx STATIC
   material.cpp
   material_import.cpp
   material_presets.cpp
+  matgen/material_compiler.cpp
+  matgen/material_graph.cpp
+  matgen/material_io.cpp
   renderer.cpp
   settings.cpp
   shader_library.cpp

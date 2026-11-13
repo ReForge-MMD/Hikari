@@ -23,6 +23,7 @@ add_executable(hikari_studio WIN32
   project_io.cpp
   project_io.hpp
   resources.qrc
+  ${CMAKE_SOURCE_DIR}/assets/materials/materials.qrc
   splash_screen.cpp
   splash_screen.hpp
   theme.hpp
@@ -70,4 +71,11 @@ if(WIN32)
       )
     endif()
   endif()
+
+  add_custom_command(TARGET hikari_studio POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/assets/materials"
+            "$<TARGET_FILE_DIR:hikari_studio>/assets/materials"
+    COMMENT "Deploying material presets and textures next to hikari_studio.exe"
+  )
 endif()

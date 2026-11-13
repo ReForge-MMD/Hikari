@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "hair_fine_high_shine_realistic",
+  "response": {
+    "shading_model": "cel",
+    "roughness": 0.2400,
+    "specular": [0.5500, 0.5500, 0.5500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7500,
+    "custom_b": 0.5308,
+    "hashed_alpha": true,
+    "hex_tiling_scale": 30.0000,
+    "custom_b_color": [0.5500, 0.5000, 0.7800],
+    "normal_map": "hair.png"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_eye_anime",
+  "response": {
+    "shading_model": "eye",
+    "albedo": [1.0500, 1.0500, 1.0500],
+    "roughness": 0.0500,
+    "specular": [0.0500, 0.0500, 0.0500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7500,
+    "custom_b": 0.4358,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 0.0000,
+    "custom_b_color": [0.4500, 0.4200, 0.5500]
+  }
+}

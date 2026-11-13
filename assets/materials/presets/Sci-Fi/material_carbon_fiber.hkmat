@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_carbon_fiber",
+  "response": {
+    "shading_model": "anisotropy",
+    "albedo": [0.0600, 0.0600, 0.0600],
+    "roughness": 0.1200,
+    "specular": [0.0500, 0.0500, 0.0500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7000,
+    "custom_b": 1.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 0.0000,
+    "custom_b_color": [1.0000, 1.0000, 1.0000]
+  }
+}

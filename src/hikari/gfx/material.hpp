@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <string_view>
 
 #include "hikari/formats/pmx.hpp"
@@ -38,8 +40,19 @@ struct MaterialConstants {
     std::array<float, 4> edge_color_size{0.0f, 0.0f, 0.0f, 0.0f};
     // PMX texture slots that are not the diffuse map: x is the sphere map mode
     // (0 off, 1 multiply, 2 add, 3 sub-texture), y is the toon ramp slice in the
-    // renderer's ramp array (0 means no ramp). zw are reserved.
+    // renderer's ramp array (0 means no ramp). z is hex-tiling scale, w is reserved.
     std::array<float, 4> pmx_params{0.0f, 0.0f, 0.0f, 0.0f};
+    // custom_b vector (RGB) and feature flags in w:
+    // bit 0 (1): procedural hair tangent perturbation
+    // bit 1 (2): micro-glitter stochastic sparkle
+    // bit 2 (4): eye cornea-iris parallax refraction
+    // bit 3 (8): auto-normal from diffuse height
+    std::array<float, 4> custom_b{0.0f, 0.0f, 0.0f, 0.0f};
+    // Feature parameters:
+    // params0: x = hair_scale, y = hair_intensity, z = eye_iris_depth, w = eye_cornea_ior
+    std::array<float, 4> feature_params0{1.0f, 0.5f, 0.05f, 1.376f};
+    // params1: x = glitter_density, y = glitter_roughness, z = glitter_intensity, w = reserved
+    std::array<float, 4> feature_params1{150.0f, 0.55f, 2.0f, 0.0f};
 };
 
 float roughness_from_shininess(float shininess);
@@ -52,6 +65,7 @@ MaterialConstants material_from_gpu(const render::GpuMaterial& material);
 // stay with the material itself, so a per-subset override does not freeze them
 // and material morphs keep reaching the surface.
 struct MaterialResponse {
+    std::optional<std::array<float, 3>> albedo;
     std::array<float, 3> specular{0.04f, 0.04f, 0.04f};
     float roughness = 0.5f;
     std::array<float, 3> emissive{0.0f, 0.0f, 0.0f};
@@ -59,7 +73,30 @@ struct MaterialResponse {
     // CustomData.x/y, the two free floats a PMX material cannot express.
     float custom_a = 0.0f;
     float custom_b = 0.0f;
+    std::array<float, 3> custom_b_color{0.0f, 0.0f, 0.0f};
     int shading_model = 0;
+    bool hashed_alpha = false;
+    float hex_tiling_scale = 0.0f;
+    std::string albedo_map{};
+    std::string normal_map{};
+    std::string roughness_map{};
+    std::string metallic_map{};
+    std::string emissive_map{};
+    std::string occlusion_map{};
+
+    // Advanced procedural & PBR parameters
+    bool procedural_hair = false;
+    float procedural_hair_scale = 1.0f;
+    float procedural_hair_intensity = 0.5f;
+
+    bool glitter = false;
+    float glitter_density = 150.0f;
+    float glitter_roughness = 0.55f;
+    float glitter_intensity = 2.0f;
+
+    bool eye_parallax = false;
+    float eye_iris_depth = 0.05f;
+    float eye_cornea_ior = 1.376f;
 };
 
 MaterialResponse response_from_constants(const MaterialConstants& constants);
@@ -96,5 +133,9 @@ std::string_view shading_model_name(int shading_model);
 std::string_view shading_model_label(int shading_model);
 // Parses an identifier written by shading_model_name; -1 when unknown.
 int shading_model_from_name(std::string_view name);
+
+// High-level native Hikari Material (.hkmat) file I/O
+bool save_hkmat(std::string_view filepath, std::string_view name, const MaterialResponse& response);
+std::optional<MaterialResponse> load_hkmat(std::string_view filepath);
 
 } // namespace hikari::gfx

@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_auto_normal_cloth_ultra",
+  "response": {
+    "shading_model": "cel",
+    "roughness": 0.9500,
+    "specular": [0.2000, 0.2000, 0.2000],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7500,
+    "custom_b": 0.6272,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 5.0000,
+    "custom_b_color": [0.6200, 0.6200, 0.7200],
+    "normal_map": "Fabric02_N by 2gou.bmp"
+  }
+}

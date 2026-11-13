@@ -25,7 +25,10 @@ cbuffer MaterialParams : register(b1) {
     float4 CustomData; // customA, customB, visibility, packed shading model/flags
     float4 UvTransform; // scale xy, offset zw
     float4 EdgeColorSize; // rgb outline ink, a PMX edge size in model units
-    float4 PmxParams; // sphere map mode, toon ramp slice, unused, unused
+    float4 PmxParams; // sphere map mode, toon ramp slice, hex tiling scale, unused
+    float4 CustomB; // customB color rgb, feature flags in w
+    float4 FeatureParams0; // hair_scale, hair_intensity, eye_iris_depth, eye_cornea_ior
+    float4 FeatureParams1; // glitter_density, glitter_roughness, glitter_intensity, unused
 };
 
 StructuredBuffer<float4> BoneRows : register(t8);
@@ -135,6 +138,12 @@ Texture2D HzbTex : register(t25);
 Texture2D SphereMapTex : register(t28);
 // PMX toon ramps, one slice per ramp. The lighting pass samples it along NoL.
 Texture2DArray ToonRampTex : register(t29);
+// Normal map texture sampled by the G-buffer pass.
+Texture2D NormalMapTex : register(t30);
+Texture2D RoughnessMapTex : register(t31);
+Texture2D MetallicMapTex : register(t32);
+Texture2D OcclusionMapTex : register(t33);
+Texture2D EmissiveMapTex : register(t34);
 RWTexture2D<float4> GiOutUAV : register(u0);
 RWTexture2D<float4> GiHistoryUAV : register(u2);
 
@@ -426,6 +435,285 @@ float pack_shading_model(int model, int flags) {
     return float(model) + float(flags) / 256.0f;
 }
 
+// ============================================================================
+// Procedural Perlin & Voronoi Library (Jenkins Lookup3 Hash)
+// ============================================================================
+
+uint JenkinsHash3(int3 p) {
+    uint a = 0xdeadbeefu + 12u + uint(p.x);
+    uint b = 0xdeadbeefu + 12u + uint(p.y);
+    uint c = 0xdeadbeefu + 12u + uint(p.z);
+
+    a -= c; a ^= ((c << 4u) | (c >> 28u)); c += b;
+    b -= a; b ^= ((a << 6u) | (a >> 26u)); a += c;
+    c -= b; c ^= ((b << 8u) | (b >> 24u)); b += a;
+    a -= c; a ^= ((c << 16u) | (c >> 16u)); c += b;
+    b -= a; b ^= ((a << 19u) | (a >> 13u)); a += c;
+    c -= b; c ^= ((b << 4u) | (b >> 28u)); b += a;
+
+    c ^= b; c -= ((b << 14u) | (b >> 18u));
+    a ^= c; a -= ((c << 11u) | (c >> 21u));
+    b ^= a; b -= ((a << 25u) | (a >> 7u));
+    c ^= b; c -= ((b << 16u) | (b >> 16u));
+    a ^= c; a -= ((c << 4u) | (c >> 28u));
+    b ^= a; b -= ((a << 14u) | (a >> 18u));
+    c ^= b; c -= ((b << 24u) | (b >> 8u));
+    return c;
+}
+
+float3 HashToVector3(int3 p) {
+    uint h = JenkinsHash3(p);
+    return float3(
+        float(h & 0x3FFu) / 1023.0f * 2.0f - 1.0f,
+        float((h >> 10u) & 0x3FFu) / 1023.0f * 2.0f - 1.0f,
+        float((h >> 20u) & 0x3FFu) / 1023.0f * 2.0f - 1.0f
+    );
+}
+
+float PerlinNoise3D(float3 p) {
+    int3 pi = int3(floor(p));
+    float3 pf = frac(p);
+    float3 w = pf * pf * pf * (pf * (pf * 6.0f - 15.0f) + 10.0f);
+
+    float d000 = dot(HashToVector3(pi + int3(0,0,0)), pf - float3(0,0,0));
+    float d100 = dot(HashToVector3(pi + int3(1,0,0)), pf - float3(1,0,0));
+    float d010 = dot(HashToVector3(pi + int3(0,1,0)), pf - float3(0,1,0));
+    float d110 = dot(HashToVector3(pi + int3(1,1,0)), pf - float3(1,1,0));
+    float d001 = dot(HashToVector3(pi + int3(0,0,1)), pf - float3(0,0,1));
+    float d101 = dot(HashToVector3(pi + int3(1,0,1)), pf - float3(1,0,1));
+    float d011 = dot(HashToVector3(pi + int3(0,1,1)), pf - float3(0,1,1));
+    float d111 = dot(HashToVector3(pi + int3(1,1,1)), pf - float3(1,1,1));
+
+    float x00 = lerp(d000, d100, w.x);
+    float x10 = lerp(d010, d110, w.x);
+    float x01 = lerp(d001, d101, w.x);
+    float x11 = lerp(d011, d111, w.x);
+
+    float y0 = lerp(x00, x10, w.y);
+    float y1 = lerp(x01, x11, w.y);
+
+    return lerp(y0, y1, w.z) * 0.5f + 0.5f;
+}
+
+float FractalNoise3D(float3 p, float scale, float detail, float roughness, float lacunarity) {
+    p *= scale;
+    float sum = 0.0f;
+    float amp = 1.0f;
+    float max_amp = 0.0f;
+
+    [unroll(5)]
+    for (int i = 0; i <= min(int(detail), 4); ++i) {
+        sum += PerlinNoise3D(p) * amp;
+        max_amp += amp;
+        amp *= roughness;
+        p *= lacunarity;
+    }
+    return sum / max(max_amp, 1.0e-5f);
+}
+
+struct VoronoiResult {
+    float distance_f1;
+    float distance_f2;
+    float smooth_dist;
+    float3 cell_color;
+};
+
+VoronoiResult Voronoi3D(float3 p, float scale, float randomness, float smoothness) {
+    p *= scale;
+    int3 base_cell = int3(floor(p));
+    float3 frac_pos = frac(p);
+
+    float min_dist1 = 100.0f;
+    float min_dist2 = 100.0f;
+    float smooth_d = 0.0f;
+    float3 best_cell_color = float3(0, 0, 0);
+
+    for (int z = -1; z <= 1; ++z) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                int3 neighbor = int3(x, y, z);
+                int3 cell = base_cell + neighbor;
+                float3 hash_pt = HashToVector3(cell) * 0.5f + 0.5f;
+                float3 feature_point = float3(neighbor) + hash_pt * randomness;
+                float d = length(feature_point - frac_pos);
+
+                if (d < min_dist1) {
+                    min_dist2 = min_dist1;
+                    min_dist1 = d;
+                    best_cell_color = hash_pt;
+                } else if (d < min_dist2) {
+                    min_dist2 = d;
+                }
+
+                float h = smoothstep(0.0f, 1.0f, 0.5f + 0.5f * (smooth_d - d) / max(smoothness, 1.0e-4f));
+                smooth_d = lerp(smooth_d, d, h) - smoothness * h * (1.0f - h);
+            }
+        }
+    }
+
+    VoronoiResult res;
+    res.distance_f1 = min_dist1;
+    res.distance_f2 = min_dist2;
+    res.smooth_dist = smooth_d;
+    res.cell_color = best_cell_color;
+    return res;
+}
+
+// ============================================================================
+// Wyman & McGuire Hashed Alpha Testing [ACM I3D 2017]
+// Stable stochastic transparency for deferred GBuffer antialiased by TAA
+// ============================================================================
+
+uint Hash_PCG(uint u) {
+    uint state = u * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float Hash_PCG_3D(float3 p) {
+    uint3 u = asuint(p);
+    uint h = Hash_PCG(Hash_PCG(Hash_PCG(u.x) + u.y) + u.z);
+    return float(h) * (1.0f / 4294967295.0f);
+}
+
+float HashedAlphaThreshold(float3 P, float hash_scale, float hash_offset) {
+    float3 dPdx = ddx(P);
+    float3 dPdy = ddy(P);
+    float max_deriv = max(length(dPdx), length(dPdy));
+    float pix_scale = 1.0f / (max(hash_scale * max_deriv, 1.0e-5f));
+
+    float pix_scale_log = log2(pix_scale);
+    float scale_low = exp2(floor(pix_scale_log));
+    float scale_high = exp2(ceil(pix_scale_log));
+
+    float alpha_low  = Hash_PCG_3D(floor(scale_low * P));
+    float alpha_high = Hash_PCG_3D(floor(scale_high * P));
+
+    float fac = frac(pix_scale_log);
+    float x = lerp(alpha_low, alpha_high, fac);
+
+    float a = min(fac, 1.0f - fac);
+    float one_a = 1.0f - a;
+    float denom = 1.0f / max(2.0f * a * one_a, 1.0e-6f);
+    float one_x = 1.0f - x;
+
+    float c0 = (x * x) * denom;
+    float c1 = (x - 0.5f * a) / one_a;
+    float c2 = 1.0f - (one_x * one_x * denom);
+
+    float threshold = (x < one_a) ? ((x < a) ? c0 : c1) : c2;
+    threshold = frac(threshold + hash_offset);
+    return clamp(threshold, 1.0e-5f, 0.99999f);
+}
+
+bool TestHashedAlpha(float alpha, float3 pos_world, float temporal_jitter) {
+    float threshold = HashedAlphaThreshold(pos_world, 1.0f, temporal_jitter);
+    return alpha >= threshold;
+}
+
+// ============================================================================
+// Morten Mikkelsen Practical Real-Time Hex-Tiling [JCGT 2022]
+// Seamless non-repeating procedural tiling for diffuse, normal & roughness
+// ============================================================================
+
+uint Hash_Int2(int2 v) {
+    uint2 u = uint2(v);
+    uint a = u.x * 0x85ebca6bu;
+    uint b = (u.y ^ (a >> 13u)) * 0xc2b2ae35u;
+    return (b ^ (b >> 16u));
+}
+
+float2 Hash_Float2(int2 v) {
+    uint h = Hash_Int2(v);
+    return float2(
+        float(h & 0xFFFFu) / 65535.0f,
+        float((h >> 16u) & 0xFFFFu) / 65535.0f
+    );
+}
+
+void HexTriangleGrid(float2 uv, out float3 weights, out int2 v0, out int2 v1, out int2 v2) {
+    uv *= 3.464101615f;
+    const float2x2 grid_to_skewed = float2x2(1.0f, -0.57735027f, 0.0f, 1.15470054f);
+    float2 skewed_coord = mul(grid_to_skewed, uv);
+    
+    int2 base_id = int2(floor(skewed_coord));
+    float3 temp = float3(frac(skewed_coord), 0.0f);
+    temp.z = 1.0f - temp.x - temp.y;
+
+    if (temp.z > 0.0f) {
+        weights = float3(temp.z, temp.y, temp.x);
+        v0 = base_id;
+        v1 = base_id + int2(0, 1);
+        v2 = base_id + int2(1, 0);
+    } else {
+        weights = float3(-temp.z, 1.0f - temp.y, 1.0f - temp.x);
+        v0 = base_id + int2(1, 1);
+        v1 = base_id + int2(1, 0);
+        v2 = base_id + int2(0, 1);
+    }
+}
+
+float3 HexGainWeights(float3 w, float falloff_power) {
+    float3 powered = pow(max(w, 0.0f), falloff_power);
+    return powered / max(dot(powered, float3(1.0f, 1.0f, 1.0f)), 1.0e-5f);
+}
+
+float2 RotateUV(float2 uv, float angle) {
+    float s, c;
+    sincos(angle, s, c);
+    return float2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+}
+
+float4 SampleHexTiledTexture(Texture2D tex, SamplerState samp, float2 uv, float tiling_scale, float blend_contrast) {
+    float2 st = uv * tiling_scale;
+    float2 dUVdx = ddx(uv);
+    float2 dUVdy = ddy(uv);
+
+    float3 w;
+    int2 v0, v1, v2;
+    HexTriangleGrid(st, w, v0, v1, v2);
+
+    float3 final_weights = HexGainWeights(w, blend_contrast);
+
+    float2 h0 = Hash_Float2(v0);
+    float2 h1 = Hash_Float2(v1);
+    float2 h2 = Hash_Float2(v2);
+
+    float2 uv0 = RotateUV(uv, h0.x * 6.2831853f) + h0;
+    float2 uv1 = RotateUV(uv, h1.x * 6.2831853f) + h1;
+    float2 uv2 = RotateUV(uv, h2.x * 6.2831853f) + h2;
+
+    float4 col0 = tex.SampleGrad(samp, uv0, dUVdx, dUVdy);
+    float4 col1 = tex.SampleGrad(samp, uv1, dUVdx, dUVdy);
+    float4 col2 = tex.SampleGrad(samp, uv2, dUVdx, dUVdy);
+
+    return col0 * final_weights.x + col1 * final_weights.y + col2 * final_weights.z;
+}
+
+// ============================================================================
+// Morten Mikkelsen Surface Gradient Bump Mapping [2010 / 2020]
+// Tangent-free normal perturbation directly from screen derivatives
+// ============================================================================
+
+float3 PerturbNormalFromHeight(float3 P_world, float3 N_world, float height, float strength, float distance_scale) {
+    N_world = normalize(N_world);
+    float3 dPdx = ddx(P_world);
+    float3 dPdy = ddy(P_world);
+    float  dHdx = ddx(height);
+    float  dHdy = ddy(height);
+
+    float3 Rx = cross(dPdy, N_world);
+    float3 Ry = cross(N_world, dPdx);
+
+    float det = dot(dPdx, Rx);
+    if (abs(det) < 1.0e-7f) {
+        return N_world;
+    }
+    float3 surf_grad = (dHdx * Rx + dHdy * Ry) / det;
+    float effective_scale = strength * distance_scale;
+    return normalize(N_world - surf_grad * effective_scale);
+}
+
 // PMX sphere map lookup: the map is a matcap indexed by the view-space normal,
 // so it follows the camera instead of the surface. v is flipped because the
 // texture origin is the top-left corner while view-space y points up.
@@ -454,24 +742,171 @@ float3 pmx_sphere_modulate(float3 base_linear, float3 normal_world) {
     return base_linear + sub * sphere;
 }
 
+// ============================================================================
+// Cornea-Iris Parallax Refraction and Stochastic Micro-Glitter Sparkle
+// ============================================================================
+
+float2 ComputeCorneaIrisParallax(float2 uv, float3 viewDir, float3 normal, float irisDepth, float corneaIOR, out float outCaustic, out float outLimbal) {
+    float eta = 1.0f / max(corneaIOR, 1.0f);
+    float3 refrRay = refract(-viewDir, normal, eta);
+    if (all(refrRay == 0.0f)) {
+        refrRay = -viewDir;
+    }
+    float2 uvOffset = (refrRay.xy / max(abs(refrRay.z), 0.25f)) * irisDepth;
+    float2 refractedUV = uv + uvOffset;
+
+    float2 centeredUV = (uv - 0.5f) * 2.0f;
+    float distFromCenter = length(centeredUV);
+    outLimbal = saturate(smoothstep(0.98f, 0.70f, distFromCenter) + 0.35f);
+    outCaustic = saturate(pow(saturate(dot(refrRay, normal) * 0.5f + 0.5f), 2.5f) * 1.5f);
+    return refractedUV;
+}
+
+float ComputeMicroGlitterSparkle(float3 worldPos, float3 N, float3 H, float flakeDensity, float flakeRoughness, float sparkleIntensity) {
+    float3 cellCoord = floor(worldPos * flakeDensity);
+    float3 hash = frac(sin(float3(
+        dot(cellCoord, float3(12.9898f, 78.233f, 45.164f)),
+        dot(cellCoord, float3(39.346f, 11.135f, 83.156f)),
+        dot(cellCoord, float3(73.156f, 52.235f, 29.178f))
+    )) * 43758.5453f) * 2.0f - 1.0f;
+
+    float3 flakeNormal = normalize(N + hash * flakeRoughness);
+    float NdotH = saturate(dot(flakeNormal, H));
+    float sparkle = pow(NdotH, 120.0f) * sparkleIntensity;
+    return sparkle;
+}
+
 GBufferOut GBufferPS(VSOut input) {
     GBufferOut output;
-    const float4 texel = DiffuseMap.Sample(LinearSampler, input.uv);
-    const float alpha = texel.a * BaseColor.a;
-    if (alpha < 0.02f) {
-        discard;
+    const float hex_scale = PmxParams.z;
+    const uint feat = (uint)round(CustomB.w);
+    const bool feat_hair = (feat & 1) != 0;
+    const bool feat_glitter = (feat & 2) != 0;
+    const bool feat_eye = (feat & 4) != 0;
+    const bool feat_autonormal = (feat & 8) != 0;
+
+    float2 sample_uv = input.uv;
+    float eyeCaustic = 0.0f;
+    float eyeLimbal = 1.0f;
+    if (feat_eye) {
+        float3 eyeViewDir = normalize(CameraPos.xyz - input.pos_world);
+        sample_uv = ComputeCorneaIrisParallax(input.uv, eyeViewDir, normalize(input.normal_world),
+                                              FeatureParams0.z, FeatureParams0.w, eyeCaustic, eyeLimbal);
     }
-    const float3 normal = normalize(input.normal_world);
+
+    float4 texel;
+    if (hex_scale > 0.01f) {
+        texel = SampleHexTiledTexture(DiffuseMap, LinearSampler, sample_uv, hex_scale, 3.5f);
+    } else {
+        texel = DiffuseMap.Sample(LinearSampler, sample_uv);
+    }
+    if (feat_eye) {
+        texel.rgb = texel.rgb * eyeLimbal + texel.rgb * (eyeCaustic * 0.35f);
+    }
+
+    const float alpha = texel.a * BaseColor.a;
+    const int flags = int(round(frac(CustomData.w) * 256.0f));
+    if ((flags & 128) != 0) { // Hashed Alpha flag
+        float temporal_jitter = frac(Params1.w * 0.6180339887f);
+        if (!TestHashedAlpha(alpha, input.pos_world, temporal_jitter)) {
+            discard;
+        }
+    } else {
+        if (alpha < 0.02f) {
+            discard;
+        }
+    }
+
+    float3 normal = normalize(input.normal_world);
+    float4 ntex;
+    if (hex_scale > 0.01f) {
+        ntex = SampleHexTiledTexture(NormalMapTex, LinearSampler, sample_uv, hex_scale, 3.5f);
+    } else {
+        ntex = NormalMapTex.Sample(LinearSampler, sample_uv);
+    }
+    if (ntex.a > 0.1f && (ntex.x > 0.05f || ntex.y > 0.05f || ntex.z > 0.05f)) {
+        float3 map = ntex.xyz * 2.0f - 1.0f;
+        float3 dp1 = ddx(input.pos_world);
+        float3 dp2 = ddy(input.pos_world);
+        float2 duv1 = ddx(sample_uv);
+        float2 duv2 = ddy(sample_uv);
+        float3 dp2perp = cross(dp2, normal);
+        float3 dp1perp = cross(normal, dp1);
+        float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+        float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+        float invmax = rsqrt(max(dot(T, T), dot(B, B)));
+        if (!isnan(invmax) && !isinf(invmax) && invmax > 0.00001f) {
+            normal = normalize(T * (map.x * invmax) + B * (map.y * invmax) + normal * map.z);
+        }
+    } else if (feat_autonormal) {
+        float diff_luma = dot(texel.rgb, float3(0.299f, 0.587f, 0.114f));
+        normal = PerturbNormalFromHeight(input.pos_world, normal, diff_luma, 1.5f, 1.0f);
+    }
+
+    if (feat_hair) {
+        float nx = sample_uv.x * FeatureParams0.x * 10000.0f;
+        float hairNoise = sin(nx) * 0.4f + sin(nx * 1.732f) * 0.3f + sin(nx * 3.1415f) * 0.3f;
+        float fw = fwidth(nx);
+        hairNoise *= saturate(exp(-fw * 0.2f));
+        float3 T_fake = cross(normal, float3(0.0f, 1.0f, 0.0f));
+        if (dot(T_fake, T_fake) < 0.001f) T_fake = float3(1.0f, 0.0f, 0.0f);
+        T_fake = normalize(T_fake);
+        normal = normalize(normal + T_fake * hairNoise * FeatureParams0.y);
+    }
+
+    float3 specular_rgb = SpecularRoughness.rgb;
+    if (feat_glitter) {
+        float3 glitterV = normalize(CameraPos.xyz - input.pos_world);
+        float3 glitterL = normalize(-SunDirection.xyz);
+        float3 glitterH = normalize(glitterV + glitterL);
+        float sparkle = ComputeMicroGlitterSparkle(input.pos_world, normal, glitterH,
+                                                  FeatureParams1.x, FeatureParams1.y, FeatureParams1.z);
+        specular_rgb += sparkle * (1.0f - SpecularRoughness.a * 0.5f);
+    }
+
+    float customA = CustomData.x;
+    const int shading_model = (int)floor(CustomData.w);
+    if (shading_model == 1) { // Skin geometric curvature
+        float3 ddxP = ddx(input.pos_world);
+        float3 ddyP = ddy(input.pos_world);
+        float3 ddxN = ddx(normal);
+        float3 ddyN = ddy(normal);
+        float deltaP_sq = dot(ddxP, ddxP) + dot(ddyP, ddyP);
+        float deltaN_sq = dot(ddxN, ddxN) + dot(ddyN, ddyN);
+        float curvature = sqrt(deltaN_sq / max(deltaP_sq, 1.0e-3f));
+        customA = saturate(max(customA, curvature * 2.0f));
+    }
+
     const float3 base_linear =
         pmx_sphere_modulate(srgb_to_linear(texel.rgb) * BaseColor.rgb, normal);
 
+    float rough_map = 1.0f;
+    float metal_map = 1.0f;
+    float occ_map = 1.0f;
+    float3 emissive_map = 1.0f;
+    if (hex_scale > 0.01f) {
+        rough_map = SampleHexTiledTexture(RoughnessMapTex, LinearSampler, sample_uv, hex_scale, 3.5f).r;
+        metal_map = SampleHexTiledTexture(MetallicMapTex, LinearSampler, sample_uv, hex_scale, 3.5f).r;
+        occ_map = SampleHexTiledTexture(OcclusionMapTex, LinearSampler, sample_uv, hex_scale, 3.5f).r;
+        emissive_map = SampleHexTiledTexture(EmissiveMapTex, LinearSampler, sample_uv, hex_scale, 3.5f).rgb;
+    } else {
+        rough_map = RoughnessMapTex.Sample(LinearSampler, sample_uv).r;
+        metal_map = MetallicMapTex.Sample(LinearSampler, sample_uv).r;
+        occ_map = OcclusionMapTex.Sample(LinearSampler, sample_uv).r;
+        emissive_map = EmissiveMapTex.Sample(LinearSampler, sample_uv).rgb;
+    }
+
+    const float final_roughness = SpecularRoughness.a * rough_map;
+    const float final_metallic = EmissiveMetallic.a * metal_map;
+    const float final_visibility = CustomData.z * occ_map;
+    const float3 final_emissive = EmissiveMetallic.rgb * emissive_map;
+
     output.gb0 = float4(base_linear, alpha);
-    output.gb1 = float4(encode_octahedral(normal), SpecularRoughness.a, EmissiveMetallic.a);
-    output.gb2 = float4(SpecularRoughness.rgb, CustomData.x);
-    // GB3.g carries the PMX toon ramp slice; GB3.rb stay the replicated
-    // CustomData.y the shading models read as their second free float.
-    output.gb3 = float4(CustomData.y, PmxParams.y, CustomData.y, CustomData.z);
-    output.gb4 = float4(EmissiveMetallic.rgb, CustomData.w);
+    output.gb1 = float4(encode_octahedral(normal), final_roughness, final_metallic);
+    output.gb2 = float4(specular_rgb, customA);
+    // GB3.rgb carries CustomB vector; GB3.a packs toon_slice (whole part * 2) and visibility (fraction * 2)
+    output.gb3 = float4(CustomB.rgb, PmxParams.y * 2.0f + saturate(final_visibility) * 0.5f);
+    output.gb4 = float4(final_emissive, CustomData.w);
     return output;
 }
 
@@ -496,8 +931,17 @@ VSOut ShadowVS(VSIn input) {
 
 float4 ShadowPS(VSOut input) : SV_Target {
     const float4 texel = DiffuseMap.SampleLevel(LinearSampler, input.uv, 0);
-    if (texel.a * BaseColor.a < 0.02f) {
-        discard;
+    const float alpha = texel.a * BaseColor.a;
+    const int flags = int(round(frac(CustomData.w) * 256.0f));
+    if ((flags & 128) != 0) {
+        float temporal_jitter = frac(Params1.w * 0.6180339887f);
+        if (!TestHashedAlpha(alpha, input.pos_world, temporal_jitter)) {
+            discard;
+        }
+    } else {
+        if (alpha < 0.02f) {
+            discard;
+        }
     }
     return float4(0.0f, 0.0f, 0.0f, 1.0f);
 }
@@ -3838,6 +4282,7 @@ struct SurfaceInput {
     // PMX toon ramp slice, 0 when the material has no ramp.
     int toon_slice;
     float4 custom; // customA, customB, visibility, packed model/flags
+    float3 custom_b; // RGB vector
 };
 
 struct SurfaceLobes {
@@ -3899,7 +4344,7 @@ SurfaceLobes surface_skin(SurfaceInput s) {
     o.specular = tight * SkinParams2.x + broad * SkinParams2.y;
     // The dermal mask keeps the diffuse response red-shifted, which is what the
     // subdermal layer of real skin does with the light it scatters.
-    const float3 dermal = o.albedo * float3(1.0f, 0.72f, 0.66f);
+    const float3 dermal = any(s.custom_b > 0.001f) ? (o.albedo * s.custom_b) : (o.albedo * float3(1.0f, 0.72f, 0.66f));
     o.diffuse = diffuse_burley(dermal, s.no_l, s.no_v, s.roughness);
 #if SKIN_BACKLIT
     // Backlit transmission: light entering the far side of a thin surface is
@@ -4016,7 +4461,7 @@ float V_Neubelt(float no_v, float no_l) {
 // correlated term, which keeps the sheen wider at the terminator.
 SurfaceLobes surface_cloth(SurfaceInput s) {
     SurfaceLobes o = surface_default(s);
-    const float3 sheen = (s.custom.x > 0.0f) ? s.specular * s.custom.x : s.specular;
+    const float3 sheen = any(s.custom_b > 0.001f) ? s.custom_b : ((s.custom.x > 0.0f) ? s.specular * s.custom.x : s.specular);
     const float fresnel = pow(saturate(1.0f - s.no_v), 5.0f);
     const float3 sheen_fresnel = sheen + (1.0f - sheen) * fresnel;
 #if BRDF_CLOTH_VIS_CHARLIE
@@ -4115,15 +4560,17 @@ SurfaceLobes surface_cel(SurfaceInput s) {
     const float lit = has_ramp ? dot(ramp, float3(0.2126f, 0.7152f, 0.0722f))
                                : toon_band(s.no_l, threshold);
     o.diffuse_no_l = has_ramp ? 1.0f : lerp(0.30f, 1.0f, lit);
+    const float3 shadow_tint = any(s.custom_b > 0.001f) ? s.custom_b : (ToonParams0.rgb + ToonParams1.rgb);
+    const float3 shadow_color = any(s.custom_b > 0.001f) ? (o.albedo * shadow_tint) : toon_grade(o.albedo, 0.0f);
 #if TOON_ENABLE > 0
-    o.diffuse = (has_ramp ? o.albedo * ramp : toon_grade(o.albedo, lit)) * (1.0f / PI);
+    o.diffuse = (has_ramp ? o.albedo * ramp : lerp(shadow_color, o.albedo, lit)) * (1.0f / PI);
     // The rim is a back-facing wrap term, so it survives on the shadow side
     // where the sun highlight is already banded out.
     const float rim =
         pow(saturate(1.0f - s.no_v), max(ToonParams3.z, 0.5f)) * ToonParams3.y;
     o.backlight = o.albedo * rim * (1.0f - lit * 0.5f);
 #else
-    o.diffuse = (has_ramp ? o.albedo * ramp : o.albedo) * (1.0f / PI);
+    o.diffuse = (has_ramp ? o.albedo * ramp : lerp(shadow_color, o.albedo, lit)) * (1.0f / PI);
 #endif
     o.specular *= lit;
     return o;
@@ -4146,13 +4593,15 @@ SurfaceLobes surface_tonebased(SurfaceInput s) {
                                 : smoothstep(0.05f, 0.95f, shaped);
 #endif
     o.diffuse_no_l = has_ramp ? 1.0f : lerp(0.30f, 1.0f, ramp);
+    const float3 shadow_tint = any(s.custom_b > 0.001f) ? s.custom_b : (ToonParams0.rgb + ToonParams1.rgb);
+    const float3 shadow_color = any(s.custom_b > 0.001f) ? (o.albedo * shadow_tint) : toon_grade(o.albedo, 0.0f);
 #if TOON_ENABLE > 0
-    o.diffuse = (has_ramp ? o.albedo * ramp_color : toon_grade(o.albedo, ramp)) * (1.0f / PI);
+    o.diffuse = (has_ramp ? o.albedo * ramp_color : lerp(shadow_color, o.albedo, ramp)) * (1.0f / PI);
     const float rim =
         pow(saturate(1.0f - s.no_v), max(ToonParams3.z, 0.5f)) * ToonParams3.y;
     o.backlight = o.albedo * rim * (1.0f - ramp * 0.5f);
 #else
-    o.diffuse = (has_ramp ? o.albedo * ramp_color : o.albedo) * (1.0f / PI);
+    o.diffuse = (has_ramp ? o.albedo * ramp_color : lerp(shadow_color, o.albedo, ramp)) * (1.0f / PI);
 #endif
     return o;
 }
@@ -4364,9 +4813,11 @@ float4 LightingPS(FSOut input) : SV_Target {
     surface.no_l = no_l;
     surface.no_v = no_v;
     surface.no_h = no_h;
-    surface.custom = float4(gb2.a, gb3.r, gb3.a, gb4.a);
-    // GB3.g holds the PMX toon ramp slice the G-buffer pass resolved.
-    surface.toon_slice = (int)round(gb3.g);
+    const int toon_slice = (int)floor(gb3.a * 0.5f + 0.1f);
+    const float visibility = saturate(frac(gb3.a * 0.5f) * 2.0f);
+    surface.custom = float4(gb2.a, gb3.r, visibility, gb4.a);
+    surface.toon_slice = toon_slice;
+    surface.custom_b = gb3.rgb;
     const SurfaceLobes lobes = eval_surface(shading_model, surface);
 
     float sun_limb = 1.0f;
@@ -4449,7 +4900,7 @@ float4 LightingPS(FSOut input) : SV_Target {
         if (!receive_ao) {
             ao = 1.0f;
         }
-        ao = saturate(ao * gb3.a);
+        ao = saturate(ao * visibility);
         // The Eye model bypasses occlusion so the sclera stays readable inside
         // the socket; every other model keeps the full AO term.
         if (lobes.ao_scale <= 0.0f) {

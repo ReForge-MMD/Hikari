@@ -1,0 +1,17 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "hair_clustered_med_shine_realistic",
+  "response": {
+    "shading_model": "anisotropy",
+    "roughness": 0.4000,
+    "specular": [0.4500, 0.4500, 0.4500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.9000,
+    "custom_b": 0.0000,
+    "hashed_alpha": true,
+    "hex_tiling_scale": 10.0000,
+    "normal_map": "hair.png"
+  }
+}

@@ -2144,6 +2144,26 @@ QWidget* MainWindow::build_graphics_tab() {
                        ? viewport_->import_ray_mmd(model, subset, path)
                        : gfx::ImportReport{};
         },
+        [this](int model, int subset) {
+            return viewport_ != nullptr ? viewport_->material_response(model, subset)
+                                        : std::nullopt;
+        },
+        [this](int model, int subset, const gfx::MaterialResponse& resp) {
+            if (viewport_ != nullptr) {
+                viewport_->set_material_response(model, subset, resp);
+            }
+        },
+        [this](int model, int subset, const QString& path) {
+            return viewport_ != nullptr ? viewport_->load_hkmat_material(model, subset, path) : false;
+        },
+        [this](int model, int subset, const QString& path) {
+            return viewport_ != nullptr ? viewport_->save_hkmat_material(model, subset, path) : false;
+        },
+        [this](int model, int subset, bool to_toon) {
+            if (viewport_ != nullptr) {
+                viewport_->convert_material_toon(model, subset, to_toon);
+            }
+        },
     });
     return graphics_panel_;
 }

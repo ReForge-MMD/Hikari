@@ -1,0 +1,20 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "hair_procedural_metallic_vfine_low_realistic",
+  "response": {
+    "shading_model": "cel",
+    "roughness": 0.4000,
+    "specular": [0.5000, 0.5000, 0.5000],
+    "metallic": 0.1000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7500,
+    "custom_b": 0.5308,
+    "hashed_alpha": true,
+    "hex_tiling_scale": 3.0000,
+    "custom_b_color": [0.5500, 0.5000, 0.7800],
+    "procedural_hair": true,
+    "procedural_hair_scale": 0.4500,
+    "procedural_hair_intensity": 0.4500
+  }
+}

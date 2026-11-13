@@ -1,0 +1,20 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_glitter",
+  "response": {
+    "shading_model": "default",
+    "roughness": 0.2500,
+    "specular": [0.0500, 0.0500, 0.0500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.0000,
+    "custom_b": 0.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 0.0000,
+    "glitter": true,
+    "glitter_density": 160.0000,
+    "glitter_roughness": 0.5000,
+    "glitter_intensity": 2.5000
+  }
+}

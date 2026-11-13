@@ -1,0 +1,17 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_wet_asphalt",
+  "response": {
+    "shading_model": "coat",
+    "albedo": [0.0900, 0.0900, 0.0900],
+    "roughness": 0.1500,
+    "specular": [0.0500, 0.0500, 0.0500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.9200,
+    "custom_b": 0.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 4.0000
+  }
+}

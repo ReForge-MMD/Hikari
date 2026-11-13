@@ -1,0 +1,21 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_sand",
+  "response": {
+    "shading_model": "default",
+    "albedo": [0.8200, 0.6800, 0.4500],
+    "roughness": 0.7800,
+    "specular": [0.0400, 0.0400, 0.0400],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.0000,
+    "custom_b": 0.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 4.0000,
+    "glitter": true,
+    "glitter_density": 150.0000,
+    "glitter_roughness": 0.5500,
+    "glitter_intensity": 2.0000
+  }
+}

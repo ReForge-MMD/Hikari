@@ -32,6 +32,11 @@ struct MaterialSectionCallbacks {
     // counts. The source is read as data; its shader body never runs.
     std::function<gfx::ImportReport(int model_index, int subset, const QString& path)>
         import_ray_mmd;
+    std::function<std::optional<gfx::MaterialResponse>(int model_index, int subset)> get_response;
+    std::function<void(int model_index, int subset, const gfx::MaterialResponse& response)> set_response;
+    std::function<bool(int model_index, int subset, const QString& path)> load_hkmat;
+    std::function<bool(int model_index, int subset, const QString& path)> save_hkmat;
+    std::function<void(int model_index, int subset, bool to_toon)> convert_toon;
 };
 
 } // namespace hikari::studio

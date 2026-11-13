@@ -1,0 +1,19 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "skin_matte_rosy_peach_3_medium",
+  "response": {
+    "shading_model": "cel",
+    "albedo": [0.8750, 0.5250, 0.5750],
+    "roughness": 0.5500,
+    "specular": [0.3500, 0.3500, 0.3500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.7500,
+    "custom_b": 0.8076,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 80.0000,
+    "custom_b_color": [0.9200, 0.7800, 0.7500],
+    "normal_map": "skin.png"
+  }
+}

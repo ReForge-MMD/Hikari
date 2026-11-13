@@ -32,6 +32,12 @@ struct DrawItem {
     // Full native material override, used by scenes that need emissive or
     // metallic values the PMX material format cannot express.
     const MaterialConstants* material_override = nullptr;
+    std::string_view albedo_map_override{};
+    std::string_view normal_map_override{};
+    std::string_view roughness_map_override{};
+    std::string_view metallic_map_override{};
+    std::string_view emissive_map_override{};
+    std::string_view occlusion_map_override{};
     std::size_t subset = 0;
     float depth = 0.0f;
 };
@@ -341,6 +347,8 @@ private:
     std::uint32_t grid_vertex_count_ = 0;
     ToonRampAtlas toon_ramps_;
     render::GpuTexture white_texture_;
+    render::GpuTexture flat_normal_texture_;
+    mutable std::unordered_map<std::string, render::GpuTexture> material_texture_cache_;
     render::GpuTexture cloud_texture_;
     render::GpuTexture cloud_cover_texture_;
     render::GpuTexture cloud_detail_texture_;

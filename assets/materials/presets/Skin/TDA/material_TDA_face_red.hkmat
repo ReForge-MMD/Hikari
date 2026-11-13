@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_TDA_face_red",
+  "response": {
+    "shading_model": "skin",
+    "roughness": 0.8000,
+    "specular": [0.3500, 0.3500, 0.3500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.5000,
+    "custom_b": 0.1913,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 25.0000,
+    "custom_b_color": [0.9000, 0.0000, 0.0000],
+    "normal_map": "skin.png"
+  }
+}

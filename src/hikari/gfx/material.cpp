@@ -5,6 +5,7 @@
 #include <iterator>
 
 #include "hikari/gfx/gbuffer.hpp"
+#include "hikari/gfx/matgen/material_io.hpp"
 
 namespace hikari::gfx {
 
@@ -116,6 +117,8 @@ bool shading_model_scatters_subsurface(int shading_model) {
 
 MaterialResponse response_from_constants(const MaterialConstants& constants) {
     MaterialResponse response;
+    response.albedo = std::array<float, 3>{constants.base_color[0], constants.base_color[1],
+                                           constants.base_color[2]};
     response.specular = {constants.specular_roughness[0], constants.specular_roughness[1],
                          constants.specular_roughness[2]};
     response.roughness = constants.specular_roughness[3];
@@ -124,20 +127,68 @@ MaterialResponse response_from_constants(const MaterialConstants& constants) {
     response.metallic = constants.emissive_metallic[3];
     response.custom_a = constants.custom_data[0];
     response.custom_b = constants.custom_data[1];
+    response.custom_b_color = {constants.custom_b[0], constants.custom_b[1], constants.custom_b[2]};
+    const int feat = static_cast<int>(std::round(constants.custom_b[3]));
+    response.procedural_hair = (feat & 1) != 0;
+    response.glitter = (feat & 2) != 0;
+    response.eye_parallax = (feat & 4) != 0;
+    if ((feat & 8) != 0) {
+        response.normal_map = "auto";
+    }
+    response.procedural_hair_scale = constants.feature_params0[0];
+    response.procedural_hair_intensity = constants.feature_params0[1];
+    response.eye_iris_depth = constants.feature_params0[2];
+    response.eye_cornea_ior = constants.feature_params0[3];
+    response.glitter_density = constants.feature_params1[0];
+    response.glitter_roughness = constants.feature_params1[1];
+    response.glitter_intensity = constants.feature_params1[2];
+
     response.shading_model = shading_model_from_constants(constants);
+    const int flags = unpack_material_flags(constants.custom_data[3]);
+    response.hashed_alpha = (flags & static_cast<int>(MaterialFlag::HashedAlpha)) != 0;
+    response.hex_tiling_scale = constants.pmx_params[2];
     return response;
 }
 
 MaterialConstants apply_material_response(const MaterialConstants& authored,
                                           const MaterialResponse& response) {
     MaterialConstants constants = authored;
+    if (response.albedo.has_value()) {
+        constants.base_color[0] = (*response.albedo)[0];
+        constants.base_color[1] = (*response.albedo)[1];
+        constants.base_color[2] = (*response.albedo)[2];
+    }
     constants.specular_roughness = {response.specular[0], response.specular[1],
                                     response.specular[2], response.roughness};
     constants.emissive_metallic = {response.emissive[0], response.emissive[1],
                                    response.emissive[2], response.metallic};
     constants.custom_data[0] = response.custom_a;
     constants.custom_data[1] = response.custom_b;
-    set_shading_model(constants, response.shading_model);
+
+    std::array<float, 3> cb = response.custom_b_color;
+    if (cb[0] == 0.0f && cb[1] == 0.0f && cb[2] == 0.0f && response.custom_b != 0.0f) {
+        cb = {response.custom_b, response.custom_b, response.custom_b};
+    }
+    float feat = 0.0f;
+    if (response.procedural_hair) feat += 1.0f;
+    if (response.glitter) feat += 2.0f;
+    if (response.eye_parallax) feat += 4.0f;
+    if (response.normal_map == "auto") feat += 8.0f;
+
+    constants.custom_b = {cb[0], cb[1], cb[2], feat};
+    constants.feature_params0 = {response.procedural_hair_scale, response.procedural_hair_intensity,
+                                 response.eye_iris_depth, response.eye_cornea_ior};
+    constants.feature_params1 = {response.glitter_density, response.glitter_roughness,
+                                 response.glitter_intensity, 0.0f};
+
+    int flags = unpack_material_flags(constants.custom_data[3]);
+    if (response.hashed_alpha) {
+        flags |= static_cast<int>(MaterialFlag::HashedAlpha);
+    } else {
+        flags &= ~static_cast<int>(MaterialFlag::HashedAlpha);
+    }
+    constants.custom_data[3] = pack_shading_model(response.shading_model, flags);
+    constants.pmx_params[2] = response.hex_tiling_scale;
     return constants;
 }
 
@@ -175,6 +226,20 @@ int shading_model_from_name(std::string_view name) {
         }
     }
     return -1;
+}
+
+bool save_hkmat(std::string_view filepath, std::string_view name, const MaterialResponse& response) {
+    matgen::MaterialFileData data;
+    data.name = std::string(name);
+    data.version = 1;
+    data.response = response;
+    return matgen::MaterialIO::save_file(filepath, data);
+}
+
+std::optional<MaterialResponse> load_hkmat(std::string_view filepath) {
+    auto data = matgen::MaterialIO::load_file(filepath);
+    if (!data) return std::nullopt;
+    return data->response;
 }
 
 } // namespace hikari::gfx

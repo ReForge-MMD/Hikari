@@ -1,0 +1,17 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_brick",
+  "response": {
+    "shading_model": "default",
+    "albedo": [0.7200, 0.3200, 0.2200],
+    "roughness": 0.8200,
+    "specular": [0.0400, 0.0400, 0.0400],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.0000,
+    "custom_b": 0.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 4.0000
+  }
+}

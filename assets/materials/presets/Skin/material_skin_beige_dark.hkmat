@@ -1,0 +1,19 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_skin_beige_dark",
+  "response": {
+    "shading_model": "skin",
+    "albedo": [0.9686, 0.7804, 0.5843],
+    "roughness": 0.5500,
+    "specular": [0.3500, 0.3500, 0.3500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.6000,
+    "custom_b": 0.5167,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 80.0000,
+    "custom_b_color": [0.9333, 0.4078, 0.3686],
+    "normal_map": "skin.png"
+  }
+}

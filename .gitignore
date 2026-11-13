@@ -63,6 +63,8 @@ $RECYCLE.BIN/
 !/assets/sky/clouds2.png
 !/assets/sky/clouds3.png
 !/assets/sky/starmap_2020_4k.png
+!/assets/materials/
+!/assets/materials/**
 /models/
 /motions/
 /records/

@@ -1,0 +1,20 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_body_melanoderm",
+  "response": {
+    "shading_model": "skin",
+    "roughness": 0.6500,
+    "specular": [0.5000, 0.5000, 0.5000],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.6000,
+    "custom_b": 0.4193,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 5.0000,
+    "custom_b_color": [0.8235, 0.3137, 0.2745],
+    "albedo_map": "Skin_-_Human_Albedo.png",
+    "normal_map": "Skin_-_Human_Normal.png",
+    "roughness_map": "Skin_-_Human_Gloss.PNG"
+  }
+}

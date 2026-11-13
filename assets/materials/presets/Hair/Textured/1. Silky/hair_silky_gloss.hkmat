@@ -1,0 +1,17 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "hair_silky_gloss",
+  "response": {
+    "shading_model": "anisotropy",
+    "roughness": 0.2200,
+    "specular": [0.5500, 0.5500, 0.5500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.9500,
+    "custom_b": 0.0000,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 15.0000,
+    "normal_map": "hair.png"
+  }
+}

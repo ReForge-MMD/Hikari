@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_marble_polished",
+  "response": {
+    "shading_model": "sss",
+    "albedo": [0.9500, 0.9500, 0.9400],
+    "roughness": 0.0800,
+    "specular": [0.0500, 0.0500, 0.0500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.6500,
+    "custom_b": 0.9070,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 0.0000,
+    "custom_b_color": [0.9500, 0.9000, 0.8500]
+  }
+}

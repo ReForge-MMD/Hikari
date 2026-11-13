@@ -1,0 +1,18 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "material_stockings",
+  "response": {
+    "shading_model": "cloth",
+    "albedo": [0.0800, 0.0600, 0.0600],
+    "roughness": 0.6500,
+    "specular": [0.0500, 0.0500, 0.0500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.8000,
+    "custom_b": 0.2713,
+    "hashed_alpha": true,
+    "hex_tiling_scale": 0.0000,
+    "custom_b_color": [0.3500, 0.2500, 0.2500]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "format": "hikari_material",
+  "version": 1,
+  "name": "skin_matte_neutral_2_medium_bright",
+  "response": {
+    "shading_model": "skin",
+    "albedo": [0.8500, 0.8500, 0.8500],
+    "roughness": 0.5500,
+    "specular": [0.3500, 0.3500, 0.3500],
+    "metallic": 0.0000,
+    "emissive": [0.0000, 0.0000, 0.0000],
+    "custom_a": 0.6000,
+    "custom_b": 0.5167,
+    "hashed_alpha": false,
+    "hex_tiling_scale": 80.0000,
+    "custom_b_color": [0.9333, 0.4078, 0.3686],
+    "normal_map": "skin.png"
+  }
+}

@@ -50,6 +50,9 @@ private:
     void refresh_material_entry();
     void apply_material_shading(int shading_model);
     void import_ray_mmd_material();
+    void open_material_library();
+    void open_material_allocator();
+    void open_material_node_editor();
 
     StudioAppState& state_;
     std::function<void()> record_edit_;
@@ -100,8 +103,29 @@ private:
     QComboBox* material_subset_ = nullptr;
     QComboBox* material_shading_ = nullptr;
     QComboBox* material_preset_ = nullptr;
+    QPushButton* material_browse_preset_ = nullptr;
+    QDoubleSpinBox* material_roughness_ = nullptr;
+    QDoubleSpinBox* material_metallic_ = nullptr;
+    QDoubleSpinBox* material_custom_a_ = nullptr;
+    QDoubleSpinBox* material_custom_b_ = nullptr;
+    QCheckBox* material_hashed_alpha_ = nullptr;
+    QDoubleSpinBox* material_hex_tiling_ = nullptr;
+    QPushButton* material_toggle_toon_ = nullptr;
+    QPushButton* material_load_hkmat_ = nullptr;
+    QPushButton* material_save_hkmat_ = nullptr;
     QPushButton* material_clear_ = nullptr;
     QPushButton* material_import_ = nullptr;
+    QPushButton* material_allocator_btn_ = nullptr;
+    QPushButton* material_node_editor_btn_ = nullptr;
+    QLineEdit* material_albedo_map_ = nullptr;
+    QLineEdit* material_normal_map_ = nullptr;
+    QLineEdit* material_roughness_map_ = nullptr;
+    QLineEdit* material_metallic_map_ = nullptr;
+    QLineEdit* material_emissive_map_ = nullptr;
+    QLineEdit* material_occlusion_map_ = nullptr;
+    QCheckBox* material_procedural_hair_ = nullptr;
+    QCheckBox* material_glitter_ = nullptr;
+    QCheckBox* material_eye_parallax_ = nullptr;
     QLabel* material_status_ = nullptr;
     QStringList material_model_cache_;
 
