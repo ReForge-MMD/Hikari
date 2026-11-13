@@ -502,7 +502,10 @@ void GraphicsPanel::build_controls() {
     fog_max_opacity_->setToolTip(
         QStringLiteral("Upper bound on how much of the scene the fog may hide."));
     fog_sun_intensity_ = make_spin(0.0, 100.0, 0.05, 2);
-    fog_sun_intensity_->setToolTip(QStringLiteral("Radiance the sun injects into the medium."));
+    fog_sun_intensity_->setToolTip(
+        QStringLiteral("Radiance the sun injects into the medium. Scales with the scene "
+                       "sun, so the shafts brighten with the sun and stay above the lit "
+                       "surfaces when indirect light raises the room."));
     fog_mie_phase_ = make_spin(-1.0, 1.0, 0.01, 2);
     fog_mie_phase_->setToolTip(
         QStringLiteral("Henyey-Greenstein anisotropy. Positive values tighten the shafts "

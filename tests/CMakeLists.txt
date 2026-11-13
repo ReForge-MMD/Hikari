@@ -183,7 +183,7 @@ if(TARGET hikari_gfx_lab)
       --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_analytical.bmp
       --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_analytical.json
       --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_analytical.bmp
-      --expect-mean-min 0.19 --expect-mean-max 0.23
+      --expect-mean-min 0.20 --expect-mean-max 0.23
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase6_analytical PROPERTIES TIMEOUT 120)
@@ -194,7 +194,7 @@ if(TARGET hikari_gfx_lab)
       --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_volumetric.bmp
       --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_volumetric.json
       --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_volumetric.bmp
-      --expect-mean-min 0.18 --expect-mean-max 0.22
+      --expect-mean-min 0.21 --expect-mean-max 0.24
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase6_volumetric PROPERTIES TIMEOUT 120)
@@ -219,7 +219,7 @@ if(TARGET hikari_gfx_lab)
       --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_cloud_shadow.bmp
       --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_cloud_shadow.json
       --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_cloud_shadow.bmp
-      --expect-mean-min 0.19 --expect-mean-max 0.23
+      --expect-mean-min 0.21 --expect-mean-max 0.24
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase6_cloud_shadow PROPERTIES TIMEOUT 120)
@@ -254,8 +254,22 @@ if(TARGET hikari_gfx_lab)
       --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_quality_low.bmp
       --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_quality_low.json
       --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_quality_low.bmp
-      --expect-mean-min 0.18 --expect-mean-max 0.22
+      --expect-mean-min 0.21 --expect-mean-max 0.24
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase6_quality_low PROPERTIES TIMEOUT 120)
+
+  # GI lifts the room's ambient light, so the shafts have to stay above it: the
+  # beam is tied to the scene sun rather than to a free-standing constant, and
+  # this capture is the guard against it washing out again.
+  add_test(NAME gfx_phase6_gi_shafts
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3 --gi 3 --gi-quality 2
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_gi_shafts.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_gi_shafts.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_gi_shafts.bmp
+      --expect-mean-min 0.22 --expect-mean-max 0.25
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_gi_shafts PROPERTIES TIMEOUT 120)
 endif()

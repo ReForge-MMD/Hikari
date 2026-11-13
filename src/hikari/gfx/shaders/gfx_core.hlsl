@@ -4341,8 +4341,10 @@ Texture2D FogDebugTex : register(t27);
 
 // The Henyey-Greenstein lobe is a per-steradian phase function while the sun
 // colour in FrameParams is authored as a directional irradiance. This weight
-// puts the two on the same scale; it is artistic rather than physical.
-static const float kFogSunGain = 0.25f;
+// puts the two on the same scale. Shafts are highlights, not surfaces: a beam
+// has to sit clearly above the ambient-lit room, otherwise indirect light from
+// GI raises the surroundings past it and the tonemapper flattens the contrast.
+static const float kFogSunGain = 0.5f;
 static const float kFogAmbientWeight = 0.5f;
 // The sky dome already carries its own aerial perspective, so the fog only
 // covers a fraction of the sky distance instead of integrating a second
@@ -4439,11 +4441,15 @@ float fog_sun_visibility(float3 p) {
 
 // Radiance the sun scatters towards the camera at `p`, before the medium
 // density is applied: sun colour, intensity, phase, cloud shadow and the
-// extinction along the sun ray.
+// extinction along the sun ray. The shaft is tied to the scene sun rather than
+// to an independent constant, so a brighter sun brightens the beam together with
+// the surfaces it lights.
 float3 fog_sun_shaft(float3 p, float cos_theta) {
     const float3 sun_to = normalize(-SunDirection.xyz);
     const float phase = mie_phase_hg(cos_theta, clamp(FogParams2.z, -0.95f, 0.95f));
-    float3 radiance = FogSunColor.rgb * max(FogParams2.y, 0.0f) * kFogSunGain * phase;
+    // SunColor carries the scene sun colour and intensity, so the shafts inherit
+    // both the colour temperature and any change the artist makes to the sun.
+    float3 radiance = FogSunColor.rgb * SunColor.rgb * (max(FogParams2.y, 0.0f) * kFogSunGain * phase);
 #if FOG_CLOUD_SHADOW_ENABLE
     radiance *= clamp(FogParams3.y, 0.0f, 1.0f) * cloud_transmittance(sun_to);
 #endif
