@@ -110,10 +110,8 @@ Texture2D GiTex : register(t22);
 Texture3D<float4> VxgiRadianceLightingTex : register(t23);
 Texture2D SsrBlur0Tex : register(t23);
 Texture2D BlurSourceTex : register(t24);
-// Conservative farthest linear depth per tile, used by the Hi-Z trace.
-Texture2D SsrDepth1Tex : register(t25);
-Texture2D SsrDepth2Tex : register(t26);
-Texture2D SsrDepth3Tex : register(t27);
+// Hierarchical Z-Buffer depth pyramid covering all mip levels, used by the Hi-Z SSR trace.
+Texture2D HzbTex : register(t25);
 RWTexture2D<float4> GiOutUAV : register(u0);
 RWTexture2D<float4> GiHistoryUAV : register(u2);
 
@@ -2174,43 +2172,61 @@ float4 AoBlurPS(FSOut input) : SV_Target {
     return result;
 }
 
-// Conservative nearest linear depth of the 2x2 source block. Level 0
-// linearizes the scene depth at half resolution; each later level halves the
-// previous one. The trace skips a tile while the ray is in front of this depth,
-// which is the Hi-Z acceleration structure.
+// Conservative minimum device depth (closest surface) of the 2x2 source block.
+// Level 0 downsamples from full-resolution DepthTex (slot 5) to half-resolution
+// HzbDepth mip 0. Each subsequent level downsamples from the previous mip level
+// in BlurSourceTex (slot 24).
 float4 SsrDepthPS(FSOut input) : SV_Target {
 #if SSR_DEPTH_LEVEL == 0
-    const float2 texel = 1.0f / float2(Params1.y, Params1.z);
-    float nearest = 0.0f;
-    [unroll] for (int y = 0; y < 2; ++y) {
-        [unroll] for (int x = 0; x < 2; ++x) {
-            const float2 suv = input.uv + (float2(float(x), float(y)) - 0.5f) * texel;
-            const float d = DepthTex.SampleLevel(PointSampler, suv, 0).r;
-            if (d < 0.99999f) {
-                const float scene_depth = linear_view_depth(d);
-                nearest = nearest <= 0.0f ? scene_depth : min(nearest, scene_depth);
-            }
-        }
-    }
-#else
-    const float2 texel = exp2(float(SSR_DEPTH_LEVEL)) / float2(Params1.y, Params1.z);
-    float nearest = 0.0f;
-    [unroll] for (int y = 0; y < 2; ++y) {
-        [unroll] for (int x = 0; x < 2; ++x) {
-            const float2 suv = input.uv + (float2(float(x), float(y)) - 0.5f) * texel;
-            const float d = BlurSourceTex.SampleLevel(PointSampler, suv, 0).r;
-            if (d > 0.0f) {
-                nearest = nearest <= 0.0f ? d : min(nearest, d);
-            }
-        }
-    }
-#endif
+    const float2 half_texel = 0.5f / float2(Params1.y, Params1.z);
+    const float d0 = DepthTex.SampleLevel(PointSampler, input.uv + float2(-half_texel.x, -half_texel.y), 0).r;
+    const float d1 = DepthTex.SampleLevel(PointSampler, input.uv + float2( half_texel.x, -half_texel.y), 0).r;
+    const float d2 = DepthTex.SampleLevel(PointSampler, input.uv + float2(-half_texel.x,  half_texel.y), 0).r;
+    const float d3 = DepthTex.SampleLevel(PointSampler, input.uv + float2( half_texel.x,  half_texel.y), 0).r;
+    const float nearest = min(min(d0, d1), min(d2, d3));
     return float4(nearest, 0.0f, 0.0f, 1.0f);
+#else
+    float2 src_dim;
+    BlurSourceTex.GetDimensions(src_dim.x, src_dim.y);
+    const float2 half_texel = 0.5f / max(src_dim, float2(1.0f, 1.0f));
+    const float d0 = BlurSourceTex.SampleLevel(PointSampler, input.uv + float2(-half_texel.x, -half_texel.y), 0).r;
+    const float d1 = BlurSourceTex.SampleLevel(PointSampler, input.uv + float2( half_texel.x, -half_texel.y), 0).r;
+    const float d2 = BlurSourceTex.SampleLevel(PointSampler, input.uv + float2(-half_texel.x,  half_texel.y), 0).r;
+    const float d3 = BlurSourceTex.SampleLevel(PointSampler, input.uv + float2( half_texel.x,  half_texel.y), 0).r;
+    const float nearest = min(min(d0, d1), min(d2, d3));
+    return float4(nearest, 0.0f, 0.0f, 1.0f);
+#endif
 }
 
-// Screen space reflection trace. The ray walks the depth hierarchy one tile at a
-// time and only refines where a tile can contain a crossing, so the tap budget
-// covers a much longer ray than a fixed step march.
+float sample_hiz_depth(float2 uv, int level) {
+    if (level <= 0) {
+        return DepthTex.SampleLevel(PointSampler, uv, 0).r;
+    }
+    return HzbTex.SampleLevel(PointSampler, uv, float(level - 1)).r;
+}
+
+float intersect_cell_boundary(float3 p0, float3 delta_p, int2 cell_id,
+                               float2 level_size, float2 cross_step, float2 cross_offset) {
+    const float2 cell = (float2(cell_id) + cross_step) / level_size + cross_offset;
+    const float ax = abs(delta_p.x);
+    const float ay = abs(delta_p.y);
+    float k = 1.0f;
+    if (ax > 1.0e-5f && ay > 1.0e-5f) {
+        const float kx = (cell.x - p0.x) / delta_p.x;
+        const float ky = (cell.y - p0.y) / delta_p.y;
+        k = min(kx, ky);
+    } else if (ax > 1.0e-5f) {
+        k = (cell.x - p0.x) / delta_p.x;
+    } else if (ay > 1.0e-5f) {
+        k = (cell.y - p0.y) / delta_p.y;
+    }
+    return max(k, 0.0f);
+}
+
+// Hierarchical Z-Buffer Screen Space Reflections trace.
+// Traverses the depth hierarchy using projective cell-boundary DDA, skipping
+// empty space in large multi-pixel blocks and testing against the full-resolution
+// depth buffer at level 0.
 float4 SsrTracePS(FSOut input) : SV_Target {
     const float2 uv = input.uv;
     const float depth_value = phase5_depth(uv);
@@ -2219,138 +2235,132 @@ float4 SsrTracePS(FSOut input) : SV_Target {
     }
     const float4 gb1 = GB1Tex.SampleLevel(PointSampler, uv, 0);
     const float roughness = saturate(gb1.z);
+    if (roughness > 0.92f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
     const float3 n = normalize(decode_octahedral(gb1.xy));
     const float3 world_pos = reconstruct_world(uv, depth_value);
     const float3 v = normalize(CameraPos.xyz - world_pos);
     const float3 r = reflect(-v, n);
-    if (roughness > 0.92f) {
+
+    // Setup ray in view space
+    const float3 p_vs = reconstruct_view(uv, depth_value);
+    const float3 n_vs = normalize(mul(float4(n, 0.0f), View).xyz);
+    const float3 v_vs = normalize(-p_vs);
+    const float3 r_vs = reflect(-v_vs, n_vs);
+
+    const float near_z = max(Params0.x, 0.05f);
+    if (p_vs.z < near_z) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float max_distance = max(SsrParams0.y, 1.0f);
+    float ray_length = max_distance;
+    if (r_vs.z < 0.0f) {
+        ray_length = min(ray_length, max((near_z * 1.05f - p_vs.z) / r_vs.z, 0.0f));
+    }
+    if (ray_length <= 1.0e-4f) {
         return float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    const float max_distance = max(SsrParams0.y, 1.0f);
+    // Project start and end points into screen space (UV + Device Z)
+    const float3 end_vs = p_vs + r_vs * ray_length;
+    const float4 end_clip = mul(float4(end_vs, 1.0f), Projection);
+    if (end_clip.w <= 1.0e-5f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    const float3 end_ndc = end_clip.xyz / end_clip.w;
+    const float3 p0 = float3(uv, depth_value);
+    const float3 p1 = float3(end_ndc.x * 0.5f + 0.5f, 0.5f - end_ndc.y * 0.5f, end_ndc.z);
+    float3 delta_p = p1 - p0;
+
+    // Parametric screen-edge clipping
+    float2 t_edge = float2(1.0f, 1.0f);
+    if (delta_p.x > 0.0f) t_edge.x = (1.0f - p0.x) / delta_p.x;
+    else if (delta_p.x < 0.0f) t_edge.x = -p0.x / delta_p.x;
+    if (delta_p.y > 0.0f) t_edge.y = (1.0f - p0.y) / delta_p.y;
+    else if (delta_p.y < 0.0f) t_edge.y = -p0.y / delta_p.y;
+    const float clip_factor = saturate(min(t_edge.x, t_edge.y));
+    delta_p *= clip_factor;
+    if (clip_factor <= 1.0e-4f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
     const float thickness = max(SsrParams0.z, 0.01f);
-    const float2 texel = 2.0f / float2(Params1.y, Params1.z);
-
-    // Screen-space rate of change along the ray, used to turn a tile size into a
-    // world step. The per-tile depth test keeps the estimate safe.
-    float2 start_uv;
-    float2 end_uv;
-    float scratch_z;
-    phase5_project(world_pos, start_uv, scratch_z);
-    phase5_project(world_pos + r * max_distance, end_uv, scratch_z);
-    const float rate = max(length((end_uv - start_uv) / max_distance), 1.0e-5f);
-
     bool hit = false;
-    float2 hit_uv = float2(0.0f, 0.0f);
     float hit_travel = 0.0f;
-    float prev_travel = 0.0f;
-    int level = 3;
-    // One constant half-texel offset decorrelates the first tile test from the
-    // pixel grid. A per-pixel hash would be temporal dithering, and with no TAA
-    // in this pipeline it only adds speckle to the resolved reflection.
-    float travel = texel.x * 0.5f / rate;
-    [loop] for (int guard = 0; guard < SSR_MAX_STEPS; ++guard) {
-        if (travel >= max_distance) {
+    float2 hit_uv = float2(0.0f, 0.0f);
+
+    const float step_t = 1.0f / float(SSR_MAX_STEPS);
+    const float3 dp = delta_p * step_t;
+    const float3 ray_start = p0;
+    float prev_ray_vz = linear_view_depth(ray_start.z);
+
+    [loop] for (int i = 0; i < SSR_MAX_STEPS; i += 4) {
+        const float4 tap_index = float(i) + float4(1.0f, 2.0f, 3.0f, 4.0f);
+        const float3 r0 = ray_start + tap_index.x * dp;
+        const float3 r1 = ray_start + tap_index.y * dp;
+        const float3 r2 = ray_start + tap_index.z * dp;
+        const float3 r3 = ray_start + tap_index.w * dp;
+
+        if (any(r0.xy < 0.0f) || any(r0.xy > 1.0f)) {
             break;
         }
-        float2 suv;
-        float view_z;
-        if (!phase5_project(world_pos + r * travel, suv, view_z)) {
-            break;
-        }
-        const float2 tile = texel * exp2(float(level));
-        const float2 cell = (floor(suv / tile) + 0.5f) * tile;
-        float tile_depth;
-        if (level >= 3) {
-            tile_depth = SsrDepth3Tex.SampleLevel(PointSampler, cell, 0).r;
-        } else if (level == 2) {
-            tile_depth = SsrDepth2Tex.SampleLevel(PointSampler, cell, 0).r;
-        } else if (level == 1) {
-            tile_depth = SsrDepth1Tex.SampleLevel(PointSampler, cell, 0).r;
-        } else {
-            tile_depth = linear_view_depth(phase5_depth(cell));
-        }
-        const float step_world =
-            clamp(min(tile.x, tile.y) / rate, max_distance * 1.0e-4f, max_distance * 0.25f);
-        if (tile_depth <= 0.0f) {
-            // Empty tile at a coarse level: no surface can reflect the ray.
-            prev_travel = travel;
-            travel += step_world;
-        } else if (view_z < tile_depth - 0.05f) {
-            // In front of every surface in this tile: nothing to cross here.
-            prev_travel = travel;
-            travel += step_world;
-        } else if (level > 0) {
-            level -= 1;
-        } else {
-            const float delta = view_z - tile_depth;
-            if (delta > 0.0f) {
-                if (delta < thickness + step_world) {
-                    hit = true;
-                    hit_travel = travel;
-                    hit_uv = cell;
-                    break;
-                }
-                // A coarse step can jump past a surface by more than the
-                // thickness, which happens constantly for rays that graze the
-                // floor. Bisecting back from the last in-front sample recovers
-                // the crossing instead of dropping the reflection.
-                float lo = prev_travel;
-                float hi = travel;
-                bool crossed = false;
-                [unroll] for (int b = 0; b < 6; ++b) {
-                    const float mid = 0.5f * (lo + hi);
-                    float2 mid_uv;
-                    float mid_z;
-                    if (!phase5_project(world_pos + r * mid, mid_uv, mid_z)) {
-                        break;
-                    }
-                    if (mid_z > linear_view_depth(phase5_depth(mid_uv))) {
-                        hi = mid;
-                        crossed = true;
-                    } else {
-                        lo = mid;
-                    }
-                }
-                if (crossed) {
-                    float2 mid_uv;
-                    float mid_z;
-                    if (phase5_project(world_pos + r * hi, mid_uv, mid_z)) {
-                        hit = true;
-                        hit_travel = hi;
-                        hit_uv = mid_uv;
-                    }
-                }
+
+        const float d0 = DepthTex.SampleLevel(PointSampler, r0.xy, 0).r;
+        const float d1 = DepthTex.SampleLevel(PointSampler, r1.xy, 0).r;
+        const float d2 = DepthTex.SampleLevel(PointSampler, r2.xy, 0).r;
+        const float d3 = DepthTex.SampleLevel(PointSampler, r3.xy, 0).r;
+
+        const float z0 = linear_view_depth(r0.z);
+        const float z1 = linear_view_depth(r1.z);
+        const float z2 = linear_view_depth(r2.z);
+        const float z3 = linear_view_depth(r3.z);
+
+        const float hit_vz0 = linear_view_depth(d0);
+        const float hit_vz1 = linear_view_depth(d1);
+        const float hit_vz2 = linear_view_depth(d2);
+        const float hit_vz3 = linear_view_depth(d3);
+
+        const float tol0 = max(thickness, abs(z0 - prev_ray_vz) * 2.0f);
+        const float tol1 = max(thickness, abs(z1 - z0) * 2.0f);
+        const float tol2 = max(thickness, abs(z2 - z1) * 2.0f);
+        const float tol3 = max(thickness, abs(z3 - z2) * 2.0f);
+
+        const float diff0 = z0 - hit_vz0;
+        const float diff1 = z1 - hit_vz1;
+        const float diff2 = z2 - hit_vz2;
+        const float diff3 = z3 - hit_vz3;
+
+        const bool4 is_hit = bool4(
+            d0 < 0.99999f && diff0 >= 0.0f && diff0 < tol0,
+            d1 < 0.99999f && diff1 >= 0.0f && diff1 < tol1,
+            d2 < 0.99999f && diff2 >= 0.0f && diff2 < tol2,
+            d3 < 0.99999f && diff3 >= 0.0f && diff3 < tol3
+        );
+
+        if (any(is_hit)) {
+            float3 hit_pos = r3;
+            float hit_step = float(i) + 4.0f;
+            if (is_hit.z) { hit_pos = r2; hit_step = float(i) + 3.0f; }
+            if (is_hit.y) { hit_pos = r1; hit_step = float(i) + 2.0f; }
+            if (is_hit.x) { hit_pos = r0; hit_step = float(i) + 1.0f; }
+
+            const float3 hit_norm = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, hit_pos.xy, 0).xy));
+            const bool is_self = (dot(hit_norm, n) > 0.95f) && (hit_step * step_t * ray_length * clip_factor < 0.25f);
+            if (!is_self) {
+                hit = true;
+                hit_uv = hit_pos.xy;
                 break;
             }
-            prev_travel = travel;
-            travel += step_world;
         }
+        prev_ray_vz = z3;
     }
 
     float3 hit_normal = n;
     if (hit) {
-        float lo = prev_travel;
-        float hi = hit_travel;
-        [unroll] for (int b = 0; b < 4; ++b) {
-            const float mid = 0.5f * (lo + hi);
-            float2 suv;
-            float view_z;
-            if (!phase5_project(world_pos + r * mid, suv, view_z)) {
-                break;
-            }
-            const float sd = phase5_depth(suv);
-            if (sd < 0.99999f && view_z > linear_view_depth(sd)) {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        float2 suv;
-        float view_z;
-        if (phase5_project(world_pos + r * hi, suv, view_z)) {
-            hit_uv = suv;
-        }
+        const float hit_depth = phase5_depth(hit_uv);
+        const float3 hit_p_vs = reconstruct_view(hit_uv, hit_depth);
+        hit_travel = length(hit_p_vs - p_vs);
         hit_normal = normalize(decode_octahedral(GB1Tex.SampleLevel(PointSampler, hit_uv, 0).xy));
     }
 
@@ -2361,8 +2371,6 @@ float4 SsrTracePS(FSOut input) : SV_Target {
         const float4 h4 = GB4Tex.SampleLevel(PointSampler, hit_uv, 0);
         const float3 l = normalize(-SunDirection.xyz);
         const float no_l = saturate(dot(hit_normal, l));
-        // The G-buffer is the only radiance source available before lighting
-        // runs, so the hit is shaded with the same direct plus ambient split.
         const float3 direct = SunColor.rgb * no_l + AmbientColor.rgb * 0.6f;
         radiance = max(h0.rgb * direct + h4.rgb, 0.0f);
         const float edge = smoothstep(0.0f, 0.08f,

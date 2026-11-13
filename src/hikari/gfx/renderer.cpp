@@ -386,14 +386,10 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
     targets_.create_volume(context_.device.Get(), "VxgiScratch", init_vxgi_dim / 2u, init_vxgi_dim / 2u, init_vxgi_dim / 2u,
                            DXGI_FORMAT_R16G16B16A16_FLOAT, init_vxgi_mips - 1u);
     current_vxgi_dim_ = init_vxgi_dim;
-    // Hi-Z pyramid for the SSR trace. Level 0 is half resolution and each later
-    // level halves again, storing the nearest linear depth per tile.
-    for (int level = 0; level < 4; ++level) {
-        const std::uint32_t divisor = 1u << level;
-        targets_.create_target(context_.device.Get(), "SsrDepth" + std::to_string(level),
-                                std::max(half_width / divisor, 1u),
-                                std::max(half_height / divisor, 1u), DXGI_FORMAT_R32_FLOAT);
-    }
+    // Hi-Z depth pyramid for the SSR trace. Level 0 is half resolution with a full
+    // mip chain down to 1x1, storing the nearest device depth (min Z) per tile.
+    targets_.create_target_mipmapped(context_.device.Get(), "HzbDepth", half_width, half_height,
+                                     DXGI_FORMAT_R32_FLOAT);
     // The GI history buffer feeds bounce radiance and temporal reprojection
     // into the next frame, so it must not start from uninitialised memory.
     const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1888,32 +1884,32 @@ void Renderer::draw_ao_blur(const GraphicsSettings& settings) {
 }
 
 void Renderer::draw_ssr_depth(const GraphicsSettings& settings) {
-    const Target* levels[4] = {targets_.get("SsrDepth0"), targets_.get("SsrDepth1"),
-                               targets_.get("SsrDepth2"), targets_.get("SsrDepth3")};
+    const Target* hzb = targets_.get("HzbDepth");
     const DepthTarget* depth = targets_.get_depth("Depth");
-    if (levels[0] == nullptr || levels[1] == nullptr || levels[2] == nullptr ||
-        levels[3] == nullptr || depth == nullptr) {
+    if (hzb == nullptr || depth == nullptr || hzb->mip_levels == 0) {
         return;
     }
     ID3D11ShaderResourceView* null_srv = nullptr;
-    for (int level = 0; level < 4; ++level) {
+    for (std::uint32_t level = 0; level < hzb->mip_levels; ++level) {
         auto defines = ao_ssr_gi_defines(settings);
-        defines.push_back({"SSR_DEPTH_LEVEL", std::to_string(level)});
-        const ShaderProgram& program = shaders_.get("ssr_depth_" + std::to_string(level),
-                                                    kShaderSource, "FullscreenVS", "SsrDepthPS",
-                                                    defines, nullptr);
-        ID3D11RenderTargetView* views[] = {levels[level]->rtv.Get()};
+        defines.push_back({"SSR_DEPTH_LEVEL", level == 0 ? "0" : "1"});
+        const ShaderProgram& program = shaders_.get(
+            level == 0 ? "ssr_depth_0" : "ssr_depth_n",
+            kShaderSource, "FullscreenVS", "SsrDepthPS", defines, nullptr);
+
+        ID3D11RenderTargetView* views[] = {hzb->mip_rtvs[level].Get()};
         context_.context->OMSetRenderTargets(1, views, nullptr);
         if (level == 0) {
             ID3D11ShaderResourceView* source = depth->srv.Get();
             context_.context->PSSetShaderResources(5, 1, &source);
         } else {
-            ID3D11ShaderResourceView* source = levels[level - 1]->srv.Get();
+            ID3D11ShaderResourceView* source = hzb->mip_srvs[level - 1].Get();
             context_.context->PSSetShaderResources(24, 1, &source);
         }
+        const float mip_w = static_cast<float>(std::max(hzb->width >> level, 1u));
+        const float mip_h = static_cast<float>(std::max(hzb->height >> level, 1u));
         bind_half_res_state();
-        context_.set_viewport(static_cast<float>(levels[level]->width),
-                              static_cast<float>(levels[level]->height));
+        context_.set_viewport(mip_w, mip_h);
         draw_fullscreen(program);
         if (level > 0) {
             context_.context->PSSetShaderResources(24, 1, &null_srv);
@@ -1926,12 +1922,10 @@ void Renderer::draw_ssr(const GraphicsSettings& settings) {
     const Target* gb0 = targets_.get("GB0");
     const Target* gb1 = targets_.get("GB1");
     const Target* gb4 = targets_.get("GB4");
-    const Target* depth1 = targets_.get("SsrDepth1");
-    const Target* depth2 = targets_.get("SsrDepth2");
-    const Target* depth3 = targets_.get("SsrDepth3");
+    const Target* hzb = targets_.get("HzbDepth");
     const DepthTarget* depth = targets_.get_depth("Depth");
     if (trace == nullptr || gb0 == nullptr || gb1 == nullptr || gb4 == nullptr ||
-        depth1 == nullptr || depth2 == nullptr || depth3 == nullptr || depth == nullptr) {
+        hzb == nullptr || depth == nullptr) {
         return;
     }
     const auto defines = ao_ssr_gi_defines(settings);
@@ -1946,11 +1940,14 @@ void Renderer::draw_ssr(const GraphicsSettings& settings) {
     context_.context->PSSetShaderResources(1, 1, &resources[1]);
     context_.context->PSSetShaderResources(4, 1, &resources[2]);
     context_.context->PSSetShaderResources(5, 1, &resources[3]);
-    ID3D11ShaderResourceView* pyramid[3] = {depth1->srv.Get(), depth2->srv.Get(),
-                                            depth3->srv.Get()};
-    context_.context->PSSetShaderResources(25, 3, pyramid);
+
+    ID3D11ShaderResourceView* hzb_srv = hzb->srv.Get();
+    context_.context->PSSetShaderResources(25, 1, &hzb_srv);
     bind_half_res_state();
     draw_fullscreen(program);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(25, 1, &null_srv);
 }
 
 void Renderer::draw_ssr_blur(const GraphicsSettings& settings) {

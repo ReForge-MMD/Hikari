@@ -44,6 +44,74 @@ void TargetPool::create_target(ID3D11Device* device, const std::string& name,
     targets_[name] = std::move(target);
 }
 
+void TargetPool::create_target_mipmapped(ID3D11Device* device, const std::string& name,
+                                        std::uint32_t width, std::uint32_t height,
+                                        DXGI_FORMAT format, std::uint32_t mip_levels) {
+    if (device == nullptr || width == 0 || height == 0) {
+        throw std::runtime_error("invalid render target description: " + name);
+    }
+    std::uint32_t available = 1;
+    for (std::uint32_t dim = std::max(width, height); dim > 1; dim >>= 1) {
+        ++available;
+    }
+    if (mip_levels == 0 || mip_levels > available) {
+        mip_levels = available;
+    }
+    Target target;
+    target.width = width;
+    target.height = height;
+    target.format = format;
+    target.mip_levels = mip_levels;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = mip_levels;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, target.texture.GetAddressOf()))) {
+        throw std::runtime_error("CreateTexture2D mipmapped failed: " + name);
+    }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = format;
+    srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MostDetailedMip = 0;
+    srv_desc.Texture2D.MipLevels = mip_levels;
+    if (FAILED(device->CreateShaderResourceView(target.texture.Get(), &srv_desc,
+                                                target.srv.GetAddressOf()))) {
+        throw std::runtime_error("CreateShaderResourceView failed: " + name);
+    }
+
+    target.mip_rtvs.resize(mip_levels);
+    target.mip_srvs.resize(mip_levels);
+    for (std::uint32_t m = 0; m < mip_levels; ++m) {
+        D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{};
+        rtv_desc.Format = format;
+        rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        rtv_desc.Texture2D.MipSlice = m;
+        if (FAILED(device->CreateRenderTargetView(target.texture.Get(), &rtv_desc,
+                                                  target.mip_rtvs[m].GetAddressOf()))) {
+            throw std::runtime_error("CreateRenderTargetView mip failed: " + name);
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC single_srv_desc{};
+        single_srv_desc.Format = format;
+        single_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        single_srv_desc.Texture2D.MostDetailedMip = m;
+        single_srv_desc.Texture2D.MipLevels = 1;
+        if (FAILED(device->CreateShaderResourceView(target.texture.Get(), &single_srv_desc,
+                                                    target.mip_srvs[m].GetAddressOf()))) {
+            throw std::runtime_error("CreateShaderResourceView single mip failed: " + name);
+        }
+    }
+    target.rtv = target.mip_rtvs[0];
+    targets_[name] = std::move(target);
+}
+
 void TargetPool::create_cubemap(ID3D11Device* device, const std::string& name,
                                 std::uint32_t size, DXGI_FORMAT format,
                                 std::uint32_t mip_levels) {

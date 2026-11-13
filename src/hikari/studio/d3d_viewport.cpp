@@ -3555,7 +3555,7 @@ void D3DViewport::render_scene_native() {
             }
             const bool transparent =
                 subset.material_index < model->materials.size() &&
-                model->materials[subset.material_index].constants.diffuse[3] < 0.999f;
+                model->materials[subset.material_index].constants.diffuse[3] < 0.95f;
             gfx::DrawItem draw;
             draw.mesh = &model->mesh;
             draw.materials = &model->materials;
@@ -3708,7 +3708,7 @@ void D3DViewport::render_scene() {
             }
             const bool transparent =
                 subset.material_index < model->materials.size() &&
-                model->materials[subset.material_index].constants.diffuse[3] < 0.999f;
+                model->materials[subset.material_index].constants.diffuse[3] < 0.95f;
             render::SubsetDraw draw;
             draw.mesh = &model->mesh;
             draw.materials = &model->materials;
