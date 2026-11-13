@@ -284,9 +284,9 @@ void GraphicsPanel::build_controls() {
 
     ao_radius_ = make_spin(0.05, 20.0, 0.05, 2);
     ao_radius_->setToolTip(QStringLiteral("Sampling radius in world units."));
-    ao_intensity_ = make_spin(0.0, 4.0, 0.05, 2);
+    ao_intensity_ = make_spin(0.0, 10.0, 0.05, 2);
     ao_intensity_->setToolTip(
-        QStringLiteral("Blend between the unoccluded and the traced ambient occlusion."));
+        QStringLiteral("Intensity and contrast power of ambient occlusion crevices and contact shadows."));
 
     auto* ao = new QWidget();
     auto* ao_form = new QFormLayout(ao);

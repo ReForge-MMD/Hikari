@@ -60,6 +60,8 @@ struct Options {
     // Phase 5 overrides. Negative means "use the phase default".
     int ao_type = -1;
     int ao_quality = -1;
+    float ao_intensity = -1.0f;
+    float ao_radius = -1.0f;
     int ssr_quality = -1;
     int ssr_debug_mode = -1;
     int gi_enable = -1;
@@ -128,6 +130,8 @@ void print_help() {
         << "  --dump-materials   Print PMX material names, colors and texture slots.\n"
         << "  --ao <type>        AO algorithm (0=SSDO, 1=HBAO, 2=GTAO).\n"
         << "  --ao-quality <n>   AO quality, 0 disables (default 6).\n"
+        << "  --ao-intensity <n> AO intensity (default 1.0).\n"
+        << "  --ao-radius <n>    AO radius in meters (default 1.5).\n"
         << "  --ssr-quality <n>  SSR quality, 0 disables (default 4).\n"
         << "  --ssr-debug-mode <n> SSR trace debug output, 0 to 4.\n"
         << "  --gi <n>           GI mode (0=off, 1=SSGI, 2=SSGI+, 3=SSPT, 4=SSRC, 5=VXGI).\n"
@@ -220,6 +224,10 @@ Options parse_options(int argc, char** argv) {
             options.ao_type = std::stoi(next("--ao"));
         } else if (argument == "--ao-quality") {
             options.ao_quality = std::stoi(next("--ao-quality"));
+        } else if (argument == "--ao-intensity") {
+            options.ao_intensity = std::stof(next("--ao-intensity"));
+        } else if (argument == "--ao-radius") {
+            options.ao_radius = std::stof(next("--ao-radius"));
         } else if (argument == "--ssr-quality") {
             options.ssr_quality = std::stoi(next("--ssr-quality"));
         } else if (argument == "--ssr-debug-mode") {
@@ -322,6 +330,12 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
     }
     if (options.ao_quality >= 0) {
         settings.ao.quality = options.ao_quality;
+    }
+    if (options.ao_intensity >= 0.0f) {
+        settings.ao.intensity = options.ao_intensity;
+    }
+    if (options.ao_radius > 0.0f) {
+        settings.ao.radius = options.ao_radius;
     }
     if (options.ssr_quality >= 0) {
         settings.ssr.quality = options.ssr_quality;

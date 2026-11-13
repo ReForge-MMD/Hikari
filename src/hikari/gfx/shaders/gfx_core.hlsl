@@ -224,6 +224,28 @@ RWTexture3D<float4> VxgiRadianceMipUav : register(u0);
 #endif
 
 static const float PI = 3.14159265358979323846;
+static const float HALF_PI = 1.5707963267948966;
+
+float gtao_integrate_arc_cos_weight(float h, float n) {
+    return 0.25f * (-cos(2.0f * h - n) + cos(n) + 2.0f * h * sin(n));
+}
+
+// Google Filament / Jimenez 2016 spatial dither functions (4x4 periodic matrix for spatial bilateral filtering)
+float gtao_spatial_direction_noise(int2 pos) {
+    return (1.0f / 16.0f) * (float(((pos.x + pos.y) & 3) << 2) + float(pos.x & 3));
+}
+
+float gtao_spatial_offsets_noise(int2 pos) {
+    return 0.25f * float((pos.y - pos.x) & 3);
+}
+
+float3 gtao_multi_bounce(float visibility, float3 albedo) {
+    const float3 a =  2.0404f * albedo - 0.3324f;
+    const float3 b = -4.7951f * albedo + 0.6417f;
+    const float3 c =  2.7552f * albedo + 0.6903f;
+    return max(float3(visibility, visibility, visibility),
+               ((visibility * a + b) * visibility + c) * visibility);
+}
 
 struct VSIn {
     float3 position : POSITION;
@@ -1859,9 +1881,18 @@ float3 phase5_hash3(float2 pixel) {
     return float3(v) * (1.0f / 4294967296.0f);
 }
 
-// Screen space directional occlusion. Writes the bent normal in RGB and the
-// visibility in A. AO_TYPE 0 traces a hemisphere per pixel (SSDO), 1 uses HBAO
-// style horizon slices, and 2 uses GTAO slices plus a multi-bounce lift.
+// Interleaved gradient noise (Jorge Jimenez 2014) - deterministic spatial dither
+float ign_dither(float2 screen_pos) {
+    float3 magic = float3(0.06711056f, 0.00583715f, 52.9829189f);
+    return frac(magic.z * frac(dot(screen_pos, magic.xy)));
+}
+
+// Screen space directional occlusion / Horizon / GTAO pass.
+// Writes the bent normal in RGB and visibility in A.
+// AO_TYPE 0: SSDO (Vogel hemisphere tracing + finite thickness + occluder color bounce)
+// AO_TYPE 1: HBAO (Horizon-Based AO with angle bias + distance/thickness falloff)
+// AO_TYPE 2: GTAO (Ground-Truth AO with Jimenez 2016 analytic cosine integration,
+//                   analytic bent normals, thickness heuristics, and G-Buffer albedo multi-bounce)
 float4 AoPS(FSOut input) : SV_Target {
     const float2 uv = input.uv;
     const float depth_value = phase5_depth(uv);
@@ -1872,12 +1903,14 @@ float4 AoPS(FSOut input) : SV_Target {
     const float3 n = normalize(decode_octahedral(gb1.xy));
     const float3 world_pos = reconstruct_world(uv, depth_value);
     const float radius = max(AoParams0.x, 0.01f);
-    const float dither = phase5_hash(input.pos.xy);
+    const float dither = ign_dither(input.pos.xy);
+    const float3 view_vec = normalize(CameraPos.xyz - world_pos);
 
     float visibility = 1.0f;
     float3 bent = n;
 
 #if AO_TYPE == 0
+    // SSDO: Screen-Space Directional Occlusion with thickness limit
     {
         float3 tangent;
         float3 bitangent;
@@ -1896,8 +1929,13 @@ float4 AoPS(FSOut input) : SV_Target {
                 if (!phase5_project(world_pos + dir * t, suv, view_z)) {
                     break;
                 }
-                const float delta = view_z - linear_view_depth(phase5_depth(suv));
-                if (delta > 0.02f * radius && delta < radius) {
+                const float sample_depth = phase5_depth(suv);
+                if (sample_depth >= 0.99999f) {
+                    continue;
+                }
+                const float delta = view_z - linear_view_depth(sample_depth);
+                // Finite thickness: occluder must be within [0.02 * radius, 0.6 * radius]
+                if (delta > 0.02f * radius && delta < 0.6f * radius) {
                     occluded = true;
                     break;
                 }
@@ -1912,72 +1950,188 @@ float4 AoPS(FSOut input) : SV_Target {
             bent = normalize(accum);
         }
     }
-#else
+#elif AO_TYPE == 1
+    // HBAO: Horizon-Based Ambient Occlusion with tangent angle bias and distance/thickness falloff
     {
         float3 tangent;
         float3 bitangent;
         phase5_basis(n, tangent, bitangent);
+        const float tan_bias = 0.15f; // ~8.5 degrees angle bias
         float total = 0.0f;
         float3 accum = float3(0.0f, 0.0f, 0.0f);
         [loop] for (int slice = 0; slice < AO_SLICES; ++slice) {
             const float phi = (float(slice) + dither) * (PI / float(AO_SLICES));
             const float3 axis = tangent * cos(phi) + bitangent * sin(phi);
-            // The horizon starts at the tangent plane on both sides, so a fully
-            // open slice integrates to one.
-            float horizon[2] = {0.0f, 0.0f};
+            float max_horizon[2] = {tan_bias, tan_bias};
             float3 horizon_dir[2] = {n, n};
+
             [unroll] for (int side = 0; side < 2; ++side) {
-                const float sign = side == 0 ? 1.0f : -1.0f;
+                const float sign_side = side == 0 ? 1.0f : -1.0f;
                 [loop] for (int step_index = 1; step_index <= AO_STEPS; ++step_index) {
-                    const float t = radius * float(step_index) / float(AO_STEPS);
+                    const float t = radius * pow(float(step_index) / float(AO_STEPS), 1.3f);
                     float2 suv;
                     float view_z;
-                    if (!phase5_project(world_pos + axis * (sign * t), suv, view_z)) {
+                    if (!phase5_project(world_pos + axis * (sign_side * t), suv, view_z)) {
                         continue;
                     }
-                    const float delta = view_z - linear_view_depth(phase5_depth(suv));
-                    if (delta <= 0.0f || delta >= radius) {
+                    const float sample_depth = phase5_depth(suv);
+                    if (sample_depth >= 0.99999f) {
                         continue;
                     }
-                    const float3 occluder = reconstruct_world(suv, phase5_depth(suv));
+                    const float3 occluder = reconstruct_world(suv, sample_depth);
                     const float3 to_occluder = occluder - world_pos;
-                    const float len = length(to_occluder);
-                    if (len < 1.0e-4f) {
+                    const float dist = length(to_occluder);
+                    if (dist < 1.0e-4f) {
                         continue;
                     }
-                    const float3 to_occ = to_occluder / len;
-                    const float cos_h = dot(to_occ, n);
-                    if (cos_h > horizon[side]) {
-                        horizon[side] = cos_h;
+                    const float3 to_occ = to_occluder / dist;
+                    const float sin_h = dot(to_occ, n);
+                    // Thickness and quadratic falloff
+                    const float falloff = saturate(1.0f - (dist * dist) / (radius * radius));
+                    const float n_delta = dot(to_occluder, n);
+                    const float thick_w = (n_delta < -0.3f * radius)
+                        ? saturate(1.0f - (-n_delta - 0.3f * radius) / (0.4f * radius))
+                        : 1.0f;
+                    const float effective_sin = lerp(tan_bias, sin_h, falloff * thick_w);
+                    if (effective_sin > max_horizon[side]) {
+                        max_horizon[side] = effective_sin;
                         horizon_dir[side] = to_occ;
                     }
                 }
             }
-            // Angle from the normal. The two visible arcs are the slice
-            // visibility, and their centroid tilts the bent normal away from the
-            // occluded side.
-            const float arc0 = acos(saturate(horizon[0]));
-            const float arc1 = acos(saturate(horizon[1]));
-            total += (arc0 + arc1) / PI;
-            accum += (n + horizon_dir[0]) * arc0 + (n + horizon_dir[1]) * arc1;
+            // HBAO projection onto hemisphere
+            const float h0 = saturate(max_horizon[0] - tan_bias) / (1.0f - tan_bias);
+            const float h1 = saturate(max_horizon[1] - tan_bias) / (1.0f - tan_bias);
+            total += 1.0f - (h0 + h1) * 0.5f;
+            accum += (n + horizon_dir[0]) * (1.0f - h0) + (n + horizon_dir[1]) * (1.0f - h1);
         }
-        visibility = total / float(AO_SLICES);
+        visibility = saturate(total / float(AO_SLICES));
         bent = normalize(accum + n * 0.001f);
+    }
+#else
+    // GTAO: Ground-Truth Ambient Occlusion (Jimenez 2016 / XeGTAO / Filament)
+    // with 2D screen-space ray stepping, analytic cosine-weighted arc integration,
+    // analytic bent normals, and falloff thickness heuristics.
+    {
+        const float3 origin = reconstruct_view(uv, depth_value);
+        const float3 view_normal = normalize(mul(float4(n, 0.0f), View).xyz);
+        const float3 view_dir = normalize(-origin);
+
+        const float proj_scale = 0.5f * Params1.z * max(Params2.y, 1.0e-4f);
+        const float ss_radius = clamp((radius * proj_scale) / max(origin.z, 0.1f), 2.0f, 160.0f);
+        const float step_radius = ss_radius / (float(AO_STEPS) + 1.0f);
+        const float2 inv_res = 1.0f / float2(Params1.y, Params1.z);
+        const float inv_radius_sq = 1.0f / max(radius * radius, 1.0e-4f);
+        const float thickness_heuristic = 0.004f;
+
+        const int2 pixel_pos = int2(input.pos.xy);
+        const float noise_dir = gtao_spatial_direction_noise(pixel_pos);
+        const float noise_offset = gtao_spatial_offsets_noise(pixel_pos);
+
+        float total_vis = 0.0f;
+        float3 accum_bent = float3(0.0f, 0.0f, 0.0f);
+        const float slice_inv = 1.0f / float(AO_SLICES);
+
+        [loop] for (int slice_idx = 0; slice_idx < AO_SLICES; ++slice_idx) {
+            const float slice_k = (float(slice_idx) + noise_dir) * slice_inv;
+            const float phi = slice_k * PI;
+            const float cos_phi = cos(phi);
+            const float sin_phi = sin(phi);
+
+            // 2D screen-space step direction (in DX UV space, +Y is down, so -sin_phi)
+            const float2 omega = float2(cos_phi, -sin_phi);
+
+            // Slice direction in view space (+Y is up)
+            const float3 dir_vec = float3(cos_phi, sin_phi, 0.0f);
+
+            // Project direction onto plane orthogonal to view_dir
+            const float3 ortho_dir = normalize(dir_vec - view_dir * dot(dir_vec, view_dir));
+
+            // Axis orthogonal to ortho_dir and view_dir
+            const float3 axis_vec = cross(ortho_dir, view_dir);
+
+            // Project view normal onto the slice plane
+            const float3 proj_normal = view_normal - axis_vec * dot(view_normal, axis_vec);
+            const float proj_len = length(proj_normal);
+            if (proj_len < 1.0e-4f) {
+                total_vis += 1.0f;
+                accum_bent += view_normal;
+                continue;
+            }
+
+            const float sign_norm = sign(dot(ortho_dir, proj_normal));
+            const float cos_norm = saturate(dot(proj_normal, view_dir) / proj_len);
+            const float n_angle = sign_norm * acos(cos_norm);
+
+            float horizon_cos0 = -1.0f;
+            float horizon_cos1 = -1.0f;
+
+            [loop] for (int step_idx = 0; step_idx < AO_STEPS; ++step_idx) {
+                const float step_val = max((float(step_idx) + noise_offset) * step_radius, 1.0f + float(step_idx));
+                const float2 uv_offset = (step_val * omega) * inv_res;
+
+                const float2 sample_uv0 = uv + uv_offset;
+                const float2 sample_uv1 = uv - uv_offset;
+
+                // Sample 0 (+omega)
+                if (sample_uv0.x >= 0.0f && sample_uv0.x <= 1.0f && sample_uv0.y >= 0.0f && sample_uv0.y <= 1.0f) {
+                    const float sd0 = phase5_depth(sample_uv0);
+                    if (sd0 < 0.99999f) {
+                        const float3 p0 = reconstruct_view(sample_uv0, sd0);
+                        const float3 delta0 = p0 - origin;
+                        const float sq_dist0 = dot(delta0, delta0);
+                        const float inv_dist0 = rsqrt(max(sq_dist0, 1.0e-6f));
+                        const float falloff0 = saturate(sq_dist0 * inv_radius_sq * 2.0f);
+                        const float shc0 = dot(delta0, view_dir) * inv_dist0;
+                        horizon_cos0 = (shc0 > horizon_cos0)
+                            ? lerp(shc0, horizon_cos0, falloff0)
+                            : lerp(horizon_cos0, shc0, thickness_heuristic);
+                    }
+                }
+
+                // Sample 1 (-omega)
+                if (sample_uv1.x >= 0.0f && sample_uv1.x <= 1.0f && sample_uv1.y >= 0.0f && sample_uv1.y <= 1.0f) {
+                    const float sd1 = phase5_depth(sample_uv1);
+                    if (sd1 < 0.99999f) {
+                        const float3 p1 = reconstruct_view(sample_uv1, sd1);
+                        const float3 delta1 = p1 - origin;
+                        const float sq_dist1 = dot(delta1, delta1);
+                        const float inv_dist1 = rsqrt(max(sq_dist1, 1.0e-6f));
+                        const float falloff1 = saturate(sq_dist1 * inv_radius_sq * 2.0f);
+                        const float shc1 = dot(delta1, view_dir) * inv_dist1;
+                        horizon_cos1 = (shc1 > horizon_cos1)
+                            ? lerp(shc1, horizon_cos1, falloff1)
+                            : lerp(horizon_cos1, shc1, thickness_heuristic);
+                    }
+                }
+            }
+
+            float h0 = -acos(clamp(horizon_cos1, -1.0f, 1.0f));
+            float h1 =  acos(clamp(horizon_cos0, -1.0f, 1.0f));
+            h0 = n_angle + clamp(h0 - n_angle, -HALF_PI, HALF_PI);
+            h1 = n_angle + clamp(h1 - n_angle, -HALF_PI, HALF_PI);
+
+            // Filament analytic bent normal
+            const float bent_angle = 0.5f * (h0 + h1);
+            accum_bent += (view_dir * cos(bent_angle) - ortho_dir * sin(bent_angle)) * proj_len;
+
+            // Filament / Jimenez 2016 analytic cosine integration
+            total_vis += proj_len * (gtao_integrate_arc_cos_weight(h0, n_angle) +
+                                     gtao_integrate_arc_cos_weight(h1, n_angle));
+        }
+
+        visibility = saturate(total_vis * slice_inv);
+        const float3 view_bent = normalize(accum_bent + view_normal * 0.001f);
+        bent = normalize(mul(float4(view_bent, 0.0f), InverseView).xyz);
     }
 #endif
 
     visibility = saturate(visibility);
-#if AO_TYPE == 2
-    // GTSO multi-bounce: light reflected off nearby surfaces re-enters the
-    // hemisphere. A geometric series with a 0.3 albedo is a stable first order
-    // approximation and keeps contact regions from collapsing to black.
-    visibility = saturate(visibility / max(1.0f - 0.3f * (1.0f - visibility), 0.1f));
-#endif
     return float4(bent, visibility);
 }
 
-// Separable bilateral blur of the bent normal and visibility. Depth and normal
-// weights keep silhouettes and creases sharp.
+// Separable bilateral blur of the bent normal and visibility.
+// Relative depth and high-order normal tolerance keep silhouettes and creases razor-sharp.
 float4 AoBlurPS(FSOut input) : SV_Target {
     const float2 uv = input.uv;
     const float2 texel = 2.0f / float2(Params1.y, Params1.z);
@@ -2001,10 +2155,13 @@ float4 AoBlurPS(FSOut input) : SV_Target {
             continue;
         }
         const float3 sn = decode_octahedral(GB1Tex.SampleLevel(PointSampler, suv, 0).xy);
-        const float depth_w = exp(-abs(linear_view_depth(sd) - center_linear) * 8.0f /
-                                  max(AoParams0.x, 0.01f));
-        const float normal_w = pow(saturate(dot(n, sn)), 8.0f);
-        const float w = exp(-float(i * i) / float(radius * radius + 1)) * depth_w * normal_w;
+        const float sample_linear = linear_view_depth(sd);
+        const float depth_diff = abs(sample_linear - center_linear);
+        const float depth_w = exp(-depth_diff / (0.05f * center_linear + 0.005f));
+        const float normal_w = pow(saturate(dot(n, sn)), 16.0f);
+        const float spatial_w = exp(-float(i * i) / float(radius * radius + 1));
+        const float w = spatial_w * depth_w * normal_w;
+
         sum += BlurSourceTex.SampleLevel(PointSampler, suv, 0) * w;
         weight_sum += w;
     }
@@ -3625,16 +3782,28 @@ float4 LightingPS(FSOut input) : SV_Target {
     float3 indirect_diffuse = float3(0.0f, 0.0f, 0.0f);
     float3 indirect_specular = float3(0.0f, 0.0f, 0.0f);
 #if AO_ENABLE
+    float3 bent_normal = n;
     {
         const float4 ao_sample = AoBlurTex.SampleLevel(LinearSampler, input.uv, 0);
-        ao = saturate(lerp(1.0f, ao_sample.a, saturate(AoParams0.y)));
+        const float raw_ao = clamp(ao_sample.a, 1.0e-4f, 1.0f);
+        const float intensity = max(AoParams0.y, 0.0f);
+        ao = (intensity <= 0.0f) ? 1.0f : saturate(pow(raw_ao, intensity * 1.8f));
         if (!receive_ao) {
             ao = 1.0f;
         }
         ao = saturate(ao * gb3.a);
+        bent_normal = normalize(ao_sample.rgb);
     }
+    // Directional specular occlusion from bent normal and roughness (Lagarde & Rousiers / Filament)
+    const float3 refl_dir = reflect(-v, n);
+    const float spec_occ = saturate(pow(saturate(dot(bent_normal, refl_dir) + ao), 2.0f));
+    ibl_specular *= lerp(spec_occ, 1.0f, roughness * roughness);
 #endif
+#if AO_TYPE == 2
+    ambient *= gtao_multi_bounce(ao, base);
+#else
     ambient *= ao;
+#endif
 #if SSR_ENABLE && !SSR_DEBUG
     {
         const float4 ssr = SsrTex.SampleLevel(LinearSampler, input.uv, 0);
