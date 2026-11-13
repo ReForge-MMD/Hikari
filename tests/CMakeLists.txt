@@ -5,6 +5,7 @@ add_executable(hikari_tests
   test_formats.cpp
   test_gfx_frame_graph.cpp
   test_gfx_ao_ssr_gi.cpp
+  test_gfx_fog.cpp
   test_gfx_ibl.cpp
   test_gfx_material.cpp
   test_gfx_settings.cpp
@@ -172,4 +173,89 @@ if(TARGET hikari_gfx_lab)
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase5_firefly PROPERTIES TIMEOUT 120)
+
+  # Phase 6 goldens. The analytical path is a closed form, so it must differ from
+  # the marched one while both stay inside a narrow energy band; fog off has to
+  # give back the unfogged room instead of a dimmed copy.
+  add_test(NAME gfx_phase6_analytical
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3 --fog 1
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_analytical.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_analytical.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_analytical.bmp
+      --expect-mean-min 0.19 --expect-mean-max 0.23
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_analytical PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase6_volumetric
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_volumetric.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_volumetric.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_volumetric.bmp
+      --expect-mean-min 0.18 --expect-mean-max 0.22
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_volumetric PROPERTIES TIMEOUT 120)
+
+  # The shaft channel must stay sparse: only the volume the sun reaches through
+  # the three openings carries in-scattered light.
+  add_test(NAME gfx_phase6_godrays
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3 --fog-debug 4 --target FogDebug
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_godrays.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_godrays.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_godrays.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_godrays PROPERTIES TIMEOUT 120)
+
+  # Dense overcast plus the cloud shadow switched off brightens the shafts,
+  # which is the contribution the flag removes.
+  add_test(NAME gfx_phase6_cloud_shadow
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3 --cloud-coverage 0.7 --fog-cloud-shadow 0
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_cloud_shadow.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_cloud_shadow.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_cloud_shadow.bmp
+      --expect-mean-min 0.19 --expect-mean-max 0.23
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_cloud_shadow PROPERTIES TIMEOUT 120)
+
+  # Transmittance view: dense ground mist, clear air above it, and the pillar.
+  add_test(NAME gfx_phase6_debug
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3 --fog-debug 1 --target FogDebug
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_debug.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_debug.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_debug.bmp
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_debug PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase6_off
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3 --fog 0
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_off.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_off.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_off.bmp
+      --expect-mean-max 0.09
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_off PROPERTIES TIMEOUT 120)
+
+  # Twelve steps is the low quality budget; the blurred volume still has to keep
+  # the shafts free of banding, so the golden is compared at the same tolerance.
+  add_test(NAME gfx_phase6_quality_low
+    COMMAND hikari_gfx_lab
+      --phase 6 --scene phase6 --frames 3 --fog-quality 0
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase6_quality_low.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase6_quality_low.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase6_quality_low.bmp
+      --expect-mean-min 0.18 --expect-mean-max 0.22
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase6_quality_low PROPERTIES TIMEOUT 120)
 endif()

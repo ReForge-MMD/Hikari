@@ -4290,3 +4290,364 @@ void SkyShReduceCS(uint3 thread : SV_GroupThreadID) {
         }
     }
 }
+
+// --- Phase 6: fog and atmosphere -------------------------------------------
+//
+// Two exponential height layers make up the medium: an upper haze that thickens
+// towards FogParams0.y and a ground mist slab above FogParams1.x. Both are
+// integrated analytically along the view ray, which is the whole story when
+// FOG_ENABLE is 1. The volumetric path marches the same profile so it can add
+// per-sample sun shadowing and wind-driven noise to the mist, then hands the
+// distance beyond the march budget back to the analytic integral.
+
+cbuffer FogParams : register(b7) {
+    float4 FogParams0;  // density, height, falloff, ground density
+    float4 FogParams1;  // ground height, ground falloff, start, cutoff
+    float4 FogParams2;  // max opacity, sun intensity, mie phase, raymarch max
+    float4 FogParams3;  // debug, cloud shadow, mist noise, wind speed
+    float4 FogColor;    // haze RGB, godray intensity
+    float4 FogSunColor; // sun RGB, ray density
+};
+
+// The composite cannot read Hdr while it writes it, so it resolves the fog over
+// the copy FogCopyPS made. FogDebug is the RGBA8 channel view of the volume.
+Texture2D FogSceneTex : register(t26);
+Texture2D FogDebugTex : register(t27);
+
+#ifndef FOG_ENABLE
+#define FOG_ENABLE 0
+#endif
+#ifndef FOG_QUALITY
+#define FOG_QUALITY 1
+#endif
+#ifndef FOG_STEPS
+#define FOG_STEPS 20
+#endif
+#ifndef FOG_DEBUG
+#define FOG_DEBUG 0
+#endif
+#ifndef FOG_BLUR_DIR
+#define FOG_BLUR_DIR 0
+#endif
+#ifndef FOG_CLOUD_SHADOW_ENABLE
+#define FOG_CLOUD_SHADOW_ENABLE 0
+#endif
+#ifndef FOG_SUN_SHADOW
+#define FOG_SUN_SHADOW 0
+#endif
+#ifndef FOG_SKY_ENABLE
+#define FOG_SKY_ENABLE 0
+#endif
+
+// The Henyey-Greenstein lobe is a per-steradian phase function while the sun
+// colour in FrameParams is authored as a directional irradiance. This weight
+// puts the two on the same scale; it is artistic rather than physical.
+static const float kFogSunGain = 0.25f;
+static const float kFogAmbientWeight = 0.5f;
+// The sky dome already carries its own aerial perspective, so the fog only
+// covers a fraction of the sky distance instead of integrating a second
+// atmosphere on top of the first one.
+static const float kFogSkyDistanceScale = 0.25f;
+
+struct FogSample {
+    float3 radiance;
+    float3 shafts;
+    float transmittance;
+    float optical_depth;
+};
+
+struct FogOut {
+    float4 volume : SV_Target0;
+    float4 debug : SV_Target1;
+};
+
+// Optical depth of one exponential layer along a ray segment of length `span`
+// whose vertical direction component is `dy`. The profile saturates at `base`,
+// so a descending ray splits into an exponential part above the base and a
+// constant slab below it.
+float fog_layer_optical_depth(float density, float base, float falloff, float y_start,
+                              float dy, float span) {
+    if (density <= 0.0f || span <= 0.0f) {
+        return 0.0f;
+    }
+    const float rate = max(falloff, 0.0f);
+    const float h0 = max(y_start - base, 0.0f);
+    if (rate <= 1.0e-5f || abs(dy) <= 1.0e-5f) {
+        return density * exp(-rate * h0) * span;
+    }
+    const float h1 = h0 + dy * span;
+    const float h_stop = max(h1, 0.0f);
+    float depth = (density / (rate * dy)) * (exp(-rate * h0) - exp(-rate * h_stop));
+    if (h1 < 0.0f) {
+        depth += density * (h1 / dy);
+    }
+    return max(depth, 0.0f);
+}
+
+float fog_optical_depth(float3 origin, float3 ray, float span) {
+    return fog_layer_optical_depth(FogParams0.x, FogParams0.y, FogParams0.z, origin.y,
+                                   ray.y, span) +
+           fog_layer_optical_depth(FogParams0.w, FogParams1.x, FogParams1.y, origin.y,
+                                   ray.y, span);
+}
+
+// Instaneous extinction at `p`. `mist` is the animated noise that only modulates
+// the ground slab so the upper haze stays smooth.
+float fog_density_at(float3 p, float mist) {
+    const float upper =
+        FogParams0.x * exp(-max(p.y - FogParams0.y, 0.0f) * max(FogParams0.z, 0.0f));
+    const float ground =
+        FogParams0.w * exp(-max(p.y - FogParams1.x, 0.0f) * max(FogParams1.y, 0.0f));
+    return max(upper + ground * mist, 0.0f);
+}
+
+// Two octaves of the tiling cloud noise scroll across the ground layer. The
+// scales are room sized: 0.16 gives ~6 m features and 0.40 ~2.5 m wisps.
+float fog_mist_noise(float3 p) {
+    const float amount = saturate(FogParams3.z);
+    if (amount <= 0.0f) {
+        return 1.0f;
+    }
+    const float3 wind = float3(0.3f, 0.05f, 0.15f) * (Params0.w * max(FogParams3.w, 0.0f) * 2.0f);
+    const float coarse = cloud_noise3d((p + wind) * 0.16f);
+    const float fine = cloud_noise3d((p + wind * 1.7f) * 0.40f);
+    const float noise = saturate(coarse * 0.7f + fine * 0.5f);
+    return lerp(1.0f, noise, amount);
+}
+
+// Fraction of the sunlight that reaches an arbitrary point in the air. There is
+// no surface normal to bias along, so the comparison uses a fixed light-space
+// depth offset and a single tap; the cross-bilateral denoiser removes the noise
+// this leaves in the shafts.
+float fog_sun_visibility(float3 p) {
+#if FOG_SUN_SHADOW
+    const float view_z = mul(float4(p, 1.0f), View).z;
+    const int cascade = choose_cascade(view_z);
+    const float4 light_clip = mul(float4(p, 1.0f), LightViewProjection[cascade]);
+    const float3 ndc = light_clip.xyz / max(light_clip.w, 1.0e-6f);
+    const float2 uv = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+    if (uv.x < 0.002f || uv.x > 0.998f || uv.y < 0.002f || uv.y > 0.998f || ndc.z < 0.0f ||
+        ndc.z > 1.0f) {
+        return 1.0f;
+    }
+    return ShadowMapArray.SampleCmpLevelZero(ShadowCmpSampler, float3(uv, (float)cascade),
+                                             saturate(ndc.z) - 0.0008f);
+#else
+    return 1.0f;
+#endif
+}
+
+// Radiance the sun scatters towards the camera at `p`, before the medium
+// density is applied: sun colour, intensity, phase, cloud shadow and the
+// extinction along the sun ray.
+float3 fog_sun_shaft(float3 p, float cos_theta) {
+    const float3 sun_to = normalize(-SunDirection.xyz);
+    const float phase = mie_phase_hg(cos_theta, clamp(FogParams2.z, -0.95f, 0.95f));
+    float3 radiance = FogSunColor.rgb * max(FogParams2.y, 0.0f) * kFogSunGain * phase;
+#if FOG_CLOUD_SHADOW_ENABLE
+    radiance *= clamp(FogParams3.y, 0.0f, 1.0f) * cloud_transmittance(sun_to);
+#endif
+#if FOG_SKY_ENABLE
+    if (SunDirection.w <= 0.5f) {
+        radiance *= sun_transmittance_at(p.y);
+    }
+#endif
+    return radiance;
+}
+
+// Unit view ray and the distance the medium is integrated over. Sky pixels have
+// no surface, so they use the view direction and a scaled fraction of the
+// cutoff distance.
+void fog_ray_from_uv(float2 uv, out float3 ray, out float distance) {
+    const float cutoff = max(FogParams1.w, 1.0f);
+    const float depth_value = DepthTex.SampleLevel(PointSampler, uv, 0).r;
+    if (depth_value >= 0.99999f) {
+        ray = sky_view_direction(uv);
+        distance = cutoff * kFogSkyDistanceScale;
+        return;
+    }
+    const float3 view_pos = reconstruct_view(uv, depth_value);
+    distance = min(length(view_pos), cutoff);
+    // reconstruct_view returns a view-space position, so the direction has to be
+    // rotated into world space before the medium is sampled along it.
+    ray = normalize(mul(float4(view_pos / max(distance, 1.0e-4f), 0.0f), InverseView).xyz);
+}
+
+// Closed form of the two layers over `distance`, no shadowing and no noise.
+// Also used by the volumetric path for the distance past the march budget.
+FogSample fog_analytical(float3 origin, float3 ray, float distance) {
+    FogSample sample;
+    sample.radiance = float3(0.0f, 0.0f, 0.0f);
+    sample.shafts = float3(0.0f, 0.0f, 0.0f);
+    sample.transmittance = 1.0f;
+    sample.optical_depth = 0.0f;
+    if (distance <= 1.0e-4f) {
+        return sample;
+    }
+
+    const float optical_depth = fog_optical_depth(origin, ray, distance);
+    sample.optical_depth = optical_depth;
+    sample.transmittance = exp(-optical_depth);
+    const float weight = 1.0f - sample.transmittance;
+
+    const float3 mid = origin + ray * (distance * 0.5f);
+    float3 shaft = fog_sun_shaft(mid, dot(ray, normalize(-SunDirection.xyz))) *
+                   max(FogSunColor.w, 0.0f) * max(FogColor.w, 0.0f);
+    shaft *= fog_sun_visibility(mid);
+
+    const float3 haze = FogColor.rgb * kFogAmbientWeight;
+    sample.radiance = weight * (haze + shaft);
+    sample.shafts = weight * shaft;
+    return sample;
+}
+
+FogOut FogRaymarchPS(FSOut input) {
+    FogOut output;
+    float3 ray;
+    float distance;
+    fog_ray_from_uv(input.uv, ray, distance);
+
+    const float3 origin = CameraPos.xyz;
+    const float cos_theta = dot(ray, normalize(-SunDirection.xyz));
+    const float3 haze = FogColor.rgb * kFogAmbientWeight;
+    const float shaft_gain = max(FogSunColor.w, 0.0f) * max(FogColor.w, 0.0f);
+
+    const float start = max(FogParams1.z, 0.0f);
+    const float span = max(distance - start, 0.0f);
+    const float marched = min(span, max(FogParams2.w, 1.0f));
+    const float step_length = marched / float(FOG_STEPS);
+    const float3 march_origin = origin + ray * start;
+    // Interleaved gradient noise offsets the first sample inside the first step,
+    // which turns the residual banding into noise the denoiser can remove.
+    const float jitter = cloud_bayer_dither(input.pos.xy);
+
+    float transmittance = 1.0f;
+    float3 radiance = float3(0.0f, 0.0f, 0.0f);
+    float3 shafts = float3(0.0f, 0.0f, 0.0f);
+    float optical_depth = 0.0f;
+
+    if (step_length > 1.0e-4f) {
+        [loop]
+        for (int i = 0; i < FOG_STEPS; ++i) {
+            const float t = (float(i) + jitter) * step_length;
+            const float3 p = march_origin + ray * t;
+            const float density = fog_density_at(p, fog_mist_noise(p));
+            if (density > 1.0e-7f) {
+                const float3 shaft = fog_sun_shaft(p, cos_theta) * shaft_gain;
+                const float extinction = density * step_length;
+                const float weight = transmittance * extinction;
+                const float3 step_shaft = shaft * fog_sun_visibility(p);
+                radiance += weight * (haze + step_shaft);
+                shafts += weight * step_shaft;
+                optical_depth += extinction;
+                transmittance *= exp(-extinction);
+            }
+            if (transmittance <= 0.002f) {
+                break;
+            }
+        }
+    }
+
+    const FogSample tail =
+        fog_analytical(march_origin + ray * marched, ray, max(span - marched, 0.0f));
+    radiance += transmittance * tail.radiance;
+    shafts += transmittance * tail.shafts;
+    optical_depth += tail.optical_depth;
+    transmittance *= tail.transmittance;
+
+    output.volume = float4(radiance, transmittance);
+#if FOG_DEBUG == 1
+    output.debug = float4(transmittance, transmittance, transmittance, 1.0f);
+#elif FOG_DEBUG == 2
+    const float3 tonemapped = radiance / (1.0f + radiance);
+    output.debug = float4(tonemapped, 1.0f);
+#elif FOG_DEBUG == 3
+    const float depth_view = saturate(optical_depth * 0.25f);
+    output.debug = float4(depth_view, depth_view, depth_view, 1.0f);
+#elif FOG_DEBUG == 4
+    const float3 shaft_view = shafts / (1.0f + shafts);
+    output.debug = float4(shaft_view, 1.0f);
+#else
+    output.debug = float4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
+    return output;
+}
+
+// Separable cross-bilateral blur over the volume. The depth weight is relative
+// so the denoiser smooths the marching noise without dragging fog across a
+// silhouette or spilling it from a near surface onto the sky.
+void fog_blur_accumulate(float2 uv, float2 offset, float center_depth, float depth_scale,
+                         float spatial, inout float3 radiance, inout float transmittance_sum,
+                         inout float weight_sum) {
+    const float2 tap_uv = uv + offset;
+    const float tap_depth = linear_view_depth(phase5_depth(tap_uv));
+    const float4 tap = BlurSourceTex.SampleLevel(LinearSampler, tap_uv, 0);
+    const float w = spatial * exp(-abs(tap_depth - center_depth) * depth_scale);
+    radiance += max(tap.rgb, 0.0f) * w;
+    transmittance_sum += saturate(tap.a) * w;
+    weight_sum += w;
+}
+
+float4 FogBlurPS(FSOut input) : SV_Target {
+    const float2 texel =
+        float2(1.0f / max(Params1.y, 1.0f), 1.0f / max(Params1.z, 1.0f));
+    const float2 axis = (FOG_BLUR_DIR == 0) ? float2(texel.x, 0.0f) : float2(0.0f, texel.y);
+
+    const float center_depth = linear_view_depth(phase5_depth(input.uv));
+    const float4 center = BlurSourceTex.SampleLevel(LinearSampler, input.uv, 0);
+    const float depth_scale = 1.0f / max(0.03f * center_depth, 0.02f);
+
+    float3 radiance = max(center.rgb, 0.0f);
+    float transmittance_sum = saturate(center.a);
+    float weight_sum = 1.0f;
+
+    [unroll]
+    for (int i = 1; i <= 4; ++i) {
+        const float spatial = exp(-float(i * i) * 0.125f);
+        const float2 offset = axis * float(i);
+        fog_blur_accumulate(input.uv, offset, center_depth, depth_scale, spatial, radiance,
+                            transmittance_sum, weight_sum);
+        fog_blur_accumulate(input.uv, -offset, center_depth, depth_scale, spatial, radiance,
+                            transmittance_sum, weight_sum);
+    }
+
+    const float inverse = 1.0f / max(weight_sum, 1.0e-4f);
+    return float4(radiance * inverse, transmittance_sum * inverse);
+}
+
+float4 FogCopyPS(FSOut input) : SV_Target {
+    return float4(HdrTex.SampleLevel(PointSampler, input.uv, 0).rgb, 1.0f);
+}
+
+float4 FogCompositePS(FSOut input) : SV_Target {
+#if FOG_DEBUG > 0 && FOG_ENABLE >= 2
+    return float4(FogDebugTex.SampleLevel(PointSampler, input.uv, 0).rgb, 1.0f);
+#else
+    const float3 scene = max(FogSceneTex.SampleLevel(PointSampler, input.uv, 0).rgb, 0.0f);
+
+    float3 radiance;
+    float transmittance;
+#if FOG_ENABLE >= 2
+    const float4 volume = BlurSourceTex.SampleLevel(LinearSampler, input.uv, 0);
+    radiance = max(volume.rgb, 0.0f);
+    transmittance = saturate(volume.a);
+#else
+    float3 ray;
+    float distance;
+    fog_ray_from_uv(input.uv, ray, distance);
+    const float start = max(FogParams1.z, 0.0f);
+    const FogSample sample =
+        fog_analytical(CameraPos.xyz + ray * start, ray, max(distance - start, 0.0f));
+    radiance = sample.radiance;
+    transmittance = sample.transmittance;
+#endif
+
+    // max_opacity caps how much of the scene the fog may hide. The scattered
+    // light is rescaled to the capped coverage so a dense medium saturates into
+    // a haze instead of turning into an opaque wall.
+    const float coverage = 1.0f - transmittance;
+    const float opacity = min(coverage, clamp(FogParams2.x, 0.0f, 1.0f));
+    const float scale = opacity / max(coverage, 1.0e-4f);
+    return float4(scene * (1.0f - opacity) + radiance * scale, 1.0f);
+#endif
+}

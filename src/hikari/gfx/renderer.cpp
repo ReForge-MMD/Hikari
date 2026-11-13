@@ -15,6 +15,7 @@
 #endif
 
 #include "hikari/gfx/ao_ssr_gi.hpp"
+#include "hikari/gfx/fog.hpp"
 #include "hikari/gfx/ibl.hpp"
 #include "hikari/gfx/sky.hpp"
 #include "hikari/gfx/sky_assets.hpp"
@@ -272,6 +273,17 @@ void Renderer::create_buffers() {
                                              ao_ssr_gi_buffer_.GetAddressOf()))) {
         throw std::runtime_error("CreateBuffer AO/SSR/GI constants failed");
     }
+
+    // FogParams buffer (b7)
+    D3D11_BUFFER_DESC fog_desc{};
+    fog_desc.ByteWidth = sizeof(FogConstants);
+    fog_desc.Usage = D3D11_USAGE_DYNAMIC;
+    fog_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    fog_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(context_.device->CreateBuffer(&fog_desc, nullptr,
+                                             fog_buffer_.GetAddressOf()))) {
+        throw std::runtime_error("CreateBuffer fog constants failed");
+    }
 }
 
 void Renderer::build_grid() {
@@ -398,6 +410,22 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
             context_.context->ClearRenderTargetView(target->rtv.Get(), clear);
         }
     }
+    // Phase 6 fog: the volume holds RGB in-scattering and A transmittance, the
+    // blur pair denoises it, and the scene copy keeps the lit image readable
+    // while the composite writes back over Hdr.
+    for (const char* name : {"FogVolume", "FogBlurTmp", "FogBlur", "FogSceneCopy"}) {
+        targets_.create_target(context_.device.Get(), name, width, height,
+                                DXGI_FORMAT_R16G16B16A16_FLOAT);
+    }
+    // RGBA8 so the lab can capture the debug channels directly with --target.
+    targets_.create_target(context_.device.Get(), "FogDebug", width, height,
+                            DXGI_FORMAT_R8G8B8A8_UNORM);
+    const float fog_clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    for (const char* name : {"FogVolume", "FogBlurTmp", "FogBlur"}) {
+        if (const Target* target = targets_.get(name)) {
+            context_.context->ClearRenderTargetView(target->rtv.Get(), fog_clear);
+        }
+    }
 }
 
 void Renderer::ensure_shadow_map(int quality) {
@@ -447,6 +475,7 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     update_sky_constants(settings, view);
     update_ibl_constants(settings);
     update_ao_ssr_gi_constants(settings, view);
+    update_fog_constants(settings);
     draw_shadow_cascades(settings, view);
     draw_sky_visibility(settings, view);
     draw_sun_transmittance(settings, view);
@@ -490,6 +519,10 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     }
     draw_sky_background(settings, view);
     draw_lighting(settings, view);
+    // Fog resolves over the opaque lit scene and before transparent geometry, so
+    // transparent surfaces blend over a fogged background instead of being
+    // overwritten by a later fog pass.
+    draw_fog(settings, view);
     draw_transparent(view);
     draw_tonemap(settings, view, final_rtv, !view.show_tonemap);
     draw_grid(view, final_rtv);
@@ -641,6 +674,27 @@ std::vector<ShaderDefine> Renderer::ao_ssr_gi_defines(const GraphicsSettings& se
                        std::to_string(std::clamp(settings.gi.prefilter_radius, 1, 3))});
     defines.push_back({"SSGI_SPECULAR_GI", settings.gi.specular_gi ? "1" : "0"});
     defines.push_back({"GI_BOUNCES", settings.gi.bounces ? "1" : "0"});
+    return defines;
+}
+
+std::vector<ShaderDefine> Renderer::fog_defines(const GraphicsSettings& settings) const {
+    const int enable = std::clamp(settings.fog.enable, 0, 3);
+    const int quality = std::clamp(settings.fog.quality, 0, 3);
+    const int debug = std::clamp(settings.fog.debug, 0, 4);
+
+    std::vector<ShaderDefine> defines;
+    defines.push_back({"FOG_ENABLE", std::to_string(enable)});
+    defines.push_back({"FOG_QUALITY", std::to_string(quality)});
+    defines.push_back({"FOG_DEBUG", std::to_string(debug)});
+    defines.push_back({"FOG_STEPS",
+                       std::to_string(std::max(fog_step_count(enable, quality), 1))});
+    // Cloud shadowing only means something when the sky owns a cloud layer, and
+    // sun shadowing only when the cascades were rendered this frame.
+    defines.push_back({"FOG_CLOUD_SHADOW_ENABLE",
+                       (settings.fog.cloud_shadow && settings.sky.enabled) ? "1" : "0"});
+    defines.push_back({"FOG_SUN_SHADOW",
+                       settings.shadows.quality > 0 ? "1" : "0"});
+    defines.push_back({"FOG_SKY_ENABLE", settings.sky.enabled ? "1" : "0"});
     return defines;
 }
 
@@ -1819,6 +1873,236 @@ void Renderer::bind_half_res_state() {
         context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
     bind_frame_constants();
     bind_ao_ssr_gi_constants();
+}
+
+void Renderer::update_fog_constants(const GraphicsSettings& settings) {
+    if (fog_buffer_ == nullptr) {
+        return;
+    }
+    const FogSettings& fog = settings.fog;
+    FogConstants constants;
+    constants.fog_params0 = {fog.density, fog.height, fog.falloff, fog.ground_density};
+    constants.fog_params1 = {fog.ground_height, fog.ground_falloff, fog.start_distance,
+                             fog.cutoff_distance};
+    constants.fog_params2 = {fog.max_opacity, fog.sun_intensity, fog.mie_phase,
+                             fog_raymarch_max_distance()};
+    constants.fog_params3 = {static_cast<float>(std::clamp(fog.debug, 0, 4)),
+                             fog.cloud_shadow ? 1.0f : 0.0f, fog.mist_noise,
+                             fog.wind_speed};
+    constants.fog_color = {fog.color.x, fog.color.y, fog.color.z, fog.godray_intensity};
+    constants.fog_sun_color = {fog.sun_color.x, fog.sun_color.y, fog.sun_color.z,
+                               fog.ray_density};
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_.context->Map(fog_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                     &mapped))) {
+        throw std::runtime_error("Map fog constants failed");
+    }
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context_.context->Unmap(fog_buffer_.Get(), 0);
+}
+
+void Renderer::bind_fog_constants() {
+    if (fog_buffer_ == nullptr) {
+        return;
+    }
+    ID3D11Buffer* buffers[] = {fog_buffer_.Get()};
+    context_.context->VSSetConstantBuffers(7, 1, buffers);
+    context_.context->PSSetConstantBuffers(7, 1, buffers);
+}
+
+// Fog passes run at render resolution and write a full-screen quad over their
+// own target, so depth testing and blending stay off.
+void Renderer::bind_fog_state() {
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
+    auto* linear = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    context_.context->PSSetSamplers(0, 1, &linear);
+    auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    context_.context->PSSetSamplers(1, 1, &point);
+    auto* wrap = context_.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
+    context_.context->PSSetSamplers(3, 1, &wrap);
+    // The shaft visibility comparisons sample the shadow cascades, so the
+    // comparison sampler has to be bound here and not only in the lighting pass.
+    auto* comparison =
+        context_.state_manager->get_sampler(core::SamplerPreset::ComparisonLinearClamp);
+    context_.context->PSSetSamplers(2, 1, &comparison);
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+    context_.context->RSSetState(
+        context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+    bind_frame_constants();
+    bind_fog_constants();
+}
+
+void Renderer::draw_fog(const GraphicsSettings& settings, const FrameView& view) {
+    if (settings.fog.enable <= 0) {
+        return;
+    }
+    if (settings.fog.enable >= 2) {
+        draw_fog_volume(settings, view);
+        draw_fog_blur(settings);
+    }
+    draw_fog_scene_copy(settings);
+    draw_fog_composite(settings, view);
+}
+
+// Binds the resources the fog shaders read that are not owned by the fog chain:
+// the shadow cascades for the shafts, the sun transmittance LUT for the aerial
+// extinction, and the cloud textures for both the cloud shadow and the mist
+// noise. The mist noise needs the noise texture even when the sky is off, so
+// that one is bound unconditionally.
+void Renderer::bind_fog_environment(const GraphicsSettings& settings) {
+    if (settings.shadows.quality > 0) {
+        if (const DepthTarget* shadow = targets_.get_depth("ShadowMap")) {
+            ID3D11ShaderResourceView* shadow_srv = shadow->srv.Get();
+            context_.context->PSSetShaderResources(7, 1, &shadow_srv);
+        }
+    }
+    ensure_sky_textures();
+    ID3D11ShaderResourceView* cloud_srv = cloud_texture_.srv.Get();
+    context_.context->PSSetShaderResources(12, 1, &cloud_srv);
+    if (!settings.sky.enabled) {
+        return;
+    }
+    if (const Target* lut = targets_.get("SunTransmittance")) {
+        ID3D11ShaderResourceView* lut_srv = lut->srv.Get();
+        context_.context->PSSetShaderResources(11, 1, &lut_srv);
+    }
+    ID3D11ShaderResourceView* cover_srv =
+        cloud_cover_texture_.srv ? cloud_cover_texture_.srv.Get() : cloud_texture_.srv.Get();
+    context_.context->PSSetShaderResources(18, 1, &cover_srv);
+}
+
+void Renderer::draw_fog_volume(const GraphicsSettings& settings, const FrameView& view) {
+    (void)view;
+    const Target* volume = targets_.get("FogVolume");
+    const Target* debug = targets_.get("FogDebug");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (volume == nullptr || debug == nullptr || depth == nullptr) {
+        return;
+    }
+    const auto defines = fog_defines(settings);
+    const ShaderProgram& program =
+        shaders_.get("fog_volume", kShaderSource, "FullscreenVS", "FogRaymarchPS", defines,
+                     nullptr);
+
+    ID3D11RenderTargetView* views[2] = {volume->rtv.Get(), debug->rtv.Get()};
+    context_.context->OMSetRenderTargets(2, views, nullptr);
+
+    ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+    context_.context->PSSetShaderResources(5, 1, &depth_srv);
+    bind_fog_environment(settings);
+
+    bind_fog_state();
+    bind_shadow_constants();
+    bind_sky_constants();
+    draw_fullscreen(program);
+}
+
+void Renderer::draw_fog_blur(const GraphicsSettings& settings) {
+    const Target* raw = targets_.get("FogVolume");
+    const Target* temp = targets_.get("FogBlurTmp");
+    const Target* blurred = targets_.get("FogBlur");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (raw == nullptr || temp == nullptr || blurred == nullptr || depth == nullptr) {
+        return;
+    }
+    auto defines = fog_defines(settings);
+    defines.push_back({"FOG_BLUR_DIR", "0"});
+    const ShaderProgram& horizontal =
+        shaders_.get("fog_blur_x", kShaderSource, "FullscreenVS", "FogBlurPS", defines,
+                     nullptr);
+    defines.back().value = "1";
+    const ShaderProgram& vertical =
+        shaders_.get("fog_blur_y", kShaderSource, "FullscreenVS", "FogBlurPS", defines,
+                     nullptr);
+
+    ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+    context_.context->PSSetShaderResources(5, 1, &depth_srv);
+
+    ID3D11RenderTargetView* temp_view[] = {temp->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, temp_view, nullptr);
+    ID3D11ShaderResourceView* source = raw->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &source);
+    bind_fog_state();
+    draw_fullscreen(horizontal);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(24, 1, &null_srv);
+
+    ID3D11RenderTargetView* blurred_view[] = {blurred->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, blurred_view, nullptr);
+    source = temp->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &source);
+    bind_fog_state();
+    draw_fullscreen(vertical);
+    context_.context->PSSetShaderResources(24, 1, &null_srv);
+}
+
+// The composite cannot read and write Hdr in the same pass, so the lit scene is
+// copied first and the composite resolves the fog over that copy.
+void Renderer::draw_fog_scene_copy(const GraphicsSettings& settings) {
+    (void)settings;
+    const Target* hdr = targets_.get("Hdr");
+    const Target* copy = targets_.get("FogSceneCopy");
+    if (hdr == nullptr || copy == nullptr) {
+        return;
+    }
+    const ShaderProgram& program =
+        shaders_.get("fog_copy", kShaderSource, "FullscreenVS", "FogCopyPS", {}, nullptr);
+
+    ID3D11RenderTargetView* views[] = {copy->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    ID3D11ShaderResourceView* hdr_srv = hdr->srv.Get();
+    context_.context->PSSetShaderResources(6, 1, &hdr_srv);
+    bind_fog_state();
+    draw_fullscreen(program);
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(6, 1, &null_srv);
+}
+
+void Renderer::draw_fog_composite(const GraphicsSettings& settings, const FrameView& view) {
+    (void)view;
+    const Target* hdr = targets_.get("Hdr");
+    const Target* scene = targets_.get("FogSceneCopy");
+    const Target* fog = targets_.get("FogBlur");
+    const Target* debug = targets_.get("FogDebug");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (hdr == nullptr || scene == nullptr || fog == nullptr || debug == nullptr ||
+        depth == nullptr) {
+        return;
+    }
+    const auto defines = fog_defines(settings);
+    const ShaderProgram& program =
+        shaders_.get("fog_composite", kShaderSource, "FullscreenVS", "FogCompositePS",
+                     defines, nullptr);
+
+    ID3D11RenderTargetView* views[] = {hdr->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, nullptr);
+    ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+    context_.context->PSSetShaderResources(5, 1, &depth_srv);
+    ID3D11ShaderResourceView* fog_srv = fog->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &fog_srv);
+    ID3D11ShaderResourceView* scene_srv = scene->srv.Get();
+    context_.context->PSSetShaderResources(26, 1, &scene_srv);
+    ID3D11ShaderResourceView* debug_srv = debug->srv.Get();
+    context_.context->PSSetShaderResources(27, 1, &debug_srv);
+    // The analytic path evaluates the same medium in this pass, so it needs the
+    // shadow and sky resources the volume pass binds.
+    bind_fog_environment(settings);
+
+    bind_fog_state();
+    bind_shadow_constants();
+    bind_sky_constants();
+    draw_fullscreen(program);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(24, 1, &null_srv);
+    context_.context->PSSetShaderResources(26, 1, &null_srv);
+    context_.context->PSSetShaderResources(27, 1, &null_srv);
+    context_.context->PSSetShaderResources(5, 1, &null_srv);
 }
 
 void Renderer::draw_ao(const GraphicsSettings& settings) {

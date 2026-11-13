@@ -35,6 +35,10 @@ struct LabScene {
     // Closed room with a metal floor, coloured walls, and a bright emitter. It
     // exercises AO corners, SSR parallax, and GI colour bleed.
     static LabScene phase5_room(hikari::core::D3D11Context& context);
+    // Stone hall with three window openings, a pillar, and a low mist base. The
+    // sun enters only through the openings, so the volumetric fog shows the
+    // shafts and the pillar shadow.
+    static LabScene phase6_room(hikari::core::D3D11Context& context);
 
     hikari::Vec3 center() const { return (bounds_min + bounds_max) * 0.5f; }
     float radius() const { return (bounds_max - bounds_min).length() * 0.5f; }

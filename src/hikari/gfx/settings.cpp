@@ -283,6 +283,10 @@ int GraphicsSettings::validate() {
     clamp_float(fog.max_opacity, 0.0f, 1.0f);
     clamp_float(fog.sun_intensity, 0.0f, 100.0f);
     clamp_float(fog.mie_phase, -1.0f, 1.0f);
+    clamp_float(fog.mist_noise, 0.0f, 1.0f);
+    clamp_float(fog.wind_speed, 0.0f, 10.0f);
+    clamp_float(fog.godray_intensity, 0.0f, 10.0f);
+    clamp_float(fog.ray_density, 0.0f, 10.0f);
 
     clamp_float(brdf.specular_sin_alpha, 0.0f, 1.0f);
 
@@ -487,6 +491,10 @@ std::string GraphicsSettings::to_json() const {
     put_vec3(out, "fog.sun_color", fog.sun_color, true);
     put_float(out, "fog.sun_intensity", fog.sun_intensity, true);
     put_float(out, "fog.mie_phase", fog.mie_phase, true);
+    put_float(out, "fog.mist_noise", fog.mist_noise, true);
+    put_float(out, "fog.wind_speed", fog.wind_speed, true);
+    put_float(out, "fog.godray_intensity", fog.godray_intensity, true);
+    put_float(out, "fog.ray_density", fog.ray_density, true);
     put_int(out, "brdf.diffuse_type", static_cast<int>(brdf.diffuse_type), true);
     put_float(out, "brdf.specular_sin_alpha", brdf.specular_sin_alpha, true);
     put_int(out, "brdf.fresnel_type", static_cast<int>(brdf.fresnel_type), true);
@@ -650,6 +658,11 @@ bool GraphicsSettings::from_json(const std::string& json) {
     fog.sun_color = read_vec3(values, "fog.sun_color", fog.sun_color);
     fog.sun_intensity = read_float(values, "fog.sun_intensity", fog.sun_intensity);
     fog.mie_phase = read_float(values, "fog.mie_phase", fog.mie_phase);
+    fog.mist_noise = read_float(values, "fog.mist_noise", fog.mist_noise);
+    fog.wind_speed = read_float(values, "fog.wind_speed", fog.wind_speed);
+    fog.godray_intensity =
+        read_float(values, "fog.godray_intensity", fog.godray_intensity);
+    fog.ray_density = read_float(values, "fog.ray_density", fog.ray_density);
     brdf.diffuse_type = static_cast<DiffuseBrdf>(
         read_int(values, "brdf.diffuse_type", static_cast<int>(brdf.diffuse_type)));
     brdf.specular_sin_alpha =

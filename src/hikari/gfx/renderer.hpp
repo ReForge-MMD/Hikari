@@ -134,6 +134,17 @@ struct AoSsrGiConstants {
     std::array<float, 4> vxgi_params1{}; // voxel_size, inv_range, grid_dim, num_cones
 };
 
+// Must match FogParams in shaders/gfx_core.hlsl. The step budget comes from
+// fog.hpp so the renderer and the tests agree on the quality mapping.
+struct FogConstants {
+    std::array<float, 4> fog_params0{};   // density, height, falloff, ground density
+    std::array<float, 4> fog_params1{};   // ground height, ground falloff, start, cutoff
+    std::array<float, 4> fog_params2{};   // max opacity, sun intensity, mie phase, raymarch max
+    std::array<float, 4> fog_params3{};   // debug, cloud shadow, mist noise, wind speed
+    std::array<float, 4> fog_color{};     // haze colour RGB, godray intensity
+    std::array<float, 4> fog_sun_color{}; // sun colour RGB, ray density
+};
+
 struct ShadowDrawConstants {
     std::array<std::array<float, 4>, 4> matrix{};
     std::array<float, 4> params{};
@@ -202,6 +213,18 @@ private:
     void update_ao_ssr_gi_constants(const GraphicsSettings& settings);
     void bind_ao_ssr_gi_constants();
     void bind_half_res_state();
+    // Phase 6 fog chain. draw_fog runs the volume, denoiser, scene copy, and
+    // composite in that order and leaves the HDR target holding the fogged
+    // opaque scene, which the transparent pass then blends over.
+    void draw_fog(const GraphicsSettings& settings, const FrameView& view);
+    void draw_fog_volume(const GraphicsSettings& settings, const FrameView& view);
+    void draw_fog_blur(const GraphicsSettings& settings);
+    void draw_fog_scene_copy(const GraphicsSettings& settings);
+    void draw_fog_composite(const GraphicsSettings& settings, const FrameView& view);
+    void update_fog_constants(const GraphicsSettings& settings);
+    void bind_fog_constants();
+    void bind_fog_state();
+    void bind_fog_environment(const GraphicsSettings& settings);
     void draw_transparent(const FrameView& view);
     void draw_tonemap(const GraphicsSettings& settings, const FrameView& view,
                       ID3D11RenderTargetView* final_rtv, bool linear);
@@ -211,6 +234,7 @@ private:
     std::vector<ShaderDefine> lighting_defines(const GraphicsSettings& settings,
                                                bool linear_tonemap) const;
     std::vector<ShaderDefine> ao_ssr_gi_defines(const GraphicsSettings& settings) const;
+    std::vector<ShaderDefine> fog_defines(const GraphicsSettings& settings) const;
 
     // Shadow pass methods
     void draw_shadow_cascades(const GraphicsSettings& settings, const FrameView& view);
@@ -268,6 +292,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> sky_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> ibl_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> ao_ssr_gi_buffer_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> fog_buffer_;
     // Nine diffuse irradiance coefficients, three floats each, written by the
     // sky SH compute pass and read by the lighting pass.
     Microsoft::WRL::ComPtr<ID3D11Buffer> sky_sh_buffer_;

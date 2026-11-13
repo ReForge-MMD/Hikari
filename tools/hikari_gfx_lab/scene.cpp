@@ -261,4 +261,155 @@ LabScene LabScene::phase5_room(hikari::core::D3D11Context& context) {
     return scene;
 }
 
+LabScene LabScene::phase6_room(hikari::core::D3D11Context& context) {
+    LabScene scene;
+    scene.name = "Phase 6 room";
+    scene.bounds_min = hikari::Vec3(-6.0f, 0.0f, -6.0f);
+    scene.bounds_max = hikari::Vec3(6.0f, 8.0f, 6.0f);
+
+    struct Surface {
+        hikari::Vec3 color;
+        float roughness;
+        float alpha;
+    };
+    const Surface surfaces[] = {
+        {{0.30f, 0.29f, 0.27f}, 0.88f, 1.0f},  // stone floor
+        {{0.34f, 0.33f, 0.30f}, 0.92f, 1.0f},  // walls
+        {{0.19f, 0.19f, 0.20f}, 0.95f, 1.0f},  // ceiling
+        {{0.58f, 0.55f, 0.48f}, 0.55f, 1.0f},  // pillar
+        {{0.30f, 0.36f, 0.40f}, 0.06f, 0.22f},  // glass pane, translucent
+    };
+    for (const Surface& surface : surfaces) {
+        hikari::formats::PmxMaterial pmx_material;
+        pmx_material.diffuse = {surface.color.x, surface.color.y, surface.color.z, surface.alpha};
+        pmx_material.specular = {0.2f, 0.2f, 0.2f};
+        pmx_material.shininess = 8.0f;
+        scene.pmx.materials.push_back(pmx_material);
+        scene.materials.push_back(
+            hikari::render::GpuMaterial::from_pmx_material(context, pmx_material));
+        scene.textures.emplace_back(std::nullopt);
+        hikari::gfx::MaterialConstants constants =
+            hikari::gfx::material_from_pmx(scene.pmx.materials.back());
+        constants.specular_roughness = {0.04f, 0.04f, 0.04f, surface.roughness};
+        constants.emissive_metallic = {0.0f, 0.0f, 0.0f, 0.0f};
+        scene.material_overrides.push_back(constants);
+    }
+
+    std::vector<hikari::render::ModelVertex> vertices;
+    std::vector<std::uint32_t> indices;
+    std::size_t subset_start = 0;
+    // Quads of one material accumulate into a single subset, so the tiled walls
+    // stay one draw call per material.
+    const auto begin_surface = [&] { subset_start = indices.size(); };
+    const auto end_surface = [&](std::size_t material_index) {
+        const std::uint32_t count = static_cast<std::uint32_t>(indices.size() - subset_start);
+        if (count == 0) {
+            return;
+        }
+        scene.mesh.subsets.push_back(
+            {material_index, static_cast<std::uint32_t>(subset_start), count});
+    };
+    const auto add_quad = [&](const hikari::Vec3& a, const hikari::Vec3& b,
+                              const hikari::Vec3& c, const hikari::Vec3& d,
+                              const hikari::Vec3& normal) {
+        const std::uint32_t base = static_cast<std::uint32_t>(vertices.size());
+        const hikari::Vec3 corners[4] = {a, b, c, d};
+        for (int i = 0; i < 4; ++i) {
+            hikari::render::ModelVertex vertex;
+            vertex.position = corners[i].to_array();
+            vertex.normal = normal.to_array();
+            vertex.uv = {(i == 1 || i == 2) ? 1.0f : 0.0f, i >= 2 ? 1.0f : 0.0f};
+            vertices.push_back(vertex);
+        }
+        const std::uint32_t quad_indices[6] = {base, base + 1, base + 2,
+                                               base, base + 2, base + 3};
+        indices.insert(indices.end(), quad_indices, quad_indices + 6);
+    };
+
+    begin_surface();
+    add_quad({-6.0f, 0.0f, -6.0f}, {-6.0f, 0.0f, 6.0f}, {6.0f, 0.0f, 6.0f},
+             {6.0f, 0.0f, -6.0f}, {0.0f, 1.0f, 0.0f});
+    end_surface(0);
+
+    begin_surface();
+    add_quad({-6.0f, 8.0f, -6.0f}, {6.0f, 8.0f, -6.0f}, {6.0f, 8.0f, 6.0f},
+             {-6.0f, 8.0f, 6.0f}, {0.0f, -1.0f, 0.0f});
+    end_surface(2);
+
+    // Window wall at +x. Three openings between y 2.4 and 6.4 pass the sun, and
+    // the piers between them keep the rest of the wall in shadow.
+    begin_surface();
+    add_quad({6.0f, 0.0f, -6.0f}, {6.0f, 0.0f, 6.0f}, {6.0f, 2.4f, 6.0f}, {6.0f, 2.4f, -6.0f},
+             {-1.0f, 0.0f, 0.0f});
+    add_quad({6.0f, 6.4f, -6.0f}, {6.0f, 6.4f, 6.0f}, {6.0f, 8.0f, 6.0f}, {6.0f, 8.0f, -6.0f},
+             {-1.0f, 0.0f, 0.0f});
+    add_quad({6.0f, 2.4f, -6.0f}, {6.0f, 2.4f, -3.8f}, {6.0f, 6.4f, -3.8f}, {6.0f, 6.4f, -6.0f},
+             {-1.0f, 0.0f, 0.0f});
+    add_quad({6.0f, 2.4f, -2.2f}, {6.0f, 2.4f, -0.8f}, {6.0f, 6.4f, -0.8f}, {6.0f, 6.4f, -2.2f},
+             {-1.0f, 0.0f, 0.0f});
+    add_quad({6.0f, 2.4f, 0.8f}, {6.0f, 2.4f, 2.2f}, {6.0f, 6.4f, 2.2f}, {6.0f, 6.4f, 0.8f},
+             {-1.0f, 0.0f, 0.0f});
+    add_quad({6.0f, 2.4f, 3.8f}, {6.0f, 2.4f, 6.0f}, {6.0f, 6.4f, 6.0f}, {6.0f, 6.4f, 3.8f},
+             {-1.0f, 0.0f, 0.0f});
+    add_quad({-6.0f, 0.0f, -6.0f}, {-6.0f, 0.0f, 6.0f}, {-6.0f, 8.0f, 6.0f},
+             {-6.0f, 8.0f, -6.0f}, {1.0f, 0.0f, 0.0f});
+    add_quad({-6.0f, 0.0f, -6.0f}, {6.0f, 0.0f, -6.0f}, {6.0f, 8.0f, -6.0f}, {-6.0f, 8.0f, -6.0f},
+             {0.0f, 0.0f, 1.0f});
+    add_quad({-6.0f, 0.0f, 6.0f}, {6.0f, 0.0f, 6.0f}, {6.0f, 8.0f, 6.0f}, {-6.0f, 8.0f, 6.0f},
+             {0.0f, 0.0f, -1.0f});
+    end_surface(1);
+
+    // Pillar beside the first beam: it breaks that shaft and gives the mist a
+    // silhouette, while the three windows stay visible in the camera frame.
+    begin_surface();
+    const hikari::Vec3 pillar_min(1.0f, 0.0f, -4.0f);
+    const hikari::Vec3 pillar_max(2.6f, 5.2f, -2.6f);
+    add_quad({pillar_max.x, pillar_min.y, pillar_min.z}, {pillar_max.x, pillar_min.y, pillar_max.z},
+             {pillar_max.x, pillar_max.y, pillar_max.z}, {pillar_max.x, pillar_max.y, pillar_min.z},
+             {1.0f, 0.0f, 0.0f});
+    add_quad({pillar_min.x, pillar_min.y, pillar_min.z}, {pillar_min.x, pillar_min.y, pillar_max.z},
+             {pillar_min.x, pillar_max.y, pillar_max.z}, {pillar_min.x, pillar_max.y, pillar_min.z},
+             {-1.0f, 0.0f, 0.0f});
+    add_quad({pillar_min.x, pillar_min.y, pillar_max.z}, {pillar_max.x, pillar_min.y, pillar_max.z},
+             {pillar_max.x, pillar_max.y, pillar_max.z}, {pillar_min.x, pillar_max.y, pillar_max.z},
+             {0.0f, 0.0f, 1.0f});
+    add_quad({pillar_min.x, pillar_min.y, pillar_min.z}, {pillar_max.x, pillar_min.y, pillar_min.z},
+             {pillar_max.x, pillar_max.y, pillar_min.z}, {pillar_min.x, pillar_max.y, pillar_min.z},
+             {0.0f, 0.0f, -1.0f});
+    add_quad({pillar_min.x, pillar_max.y, pillar_min.z}, {pillar_max.x, pillar_max.y, pillar_min.z},
+             {pillar_max.x, pillar_max.y, pillar_max.z}, {pillar_min.x, pillar_max.y, pillar_max.z},
+             {0.0f, 1.0f, 0.0f});
+    end_surface(3);
+
+    // Glass pane across the middle beam. It is drawn by the transparent pass,
+    // which runs after the fog composite, so the shafts behind it must stay
+    // visible through the tint instead of being painted over.
+    begin_surface();
+    add_quad({-1.2f, 0.4f, -2.4f}, {-1.2f, 0.4f, -0.4f}, {-1.2f, 2.0f, -0.4f},
+             {-1.2f, 2.0f, -2.4f}, {1.0f, 0.0f, 0.0f});
+    end_surface(4);
+
+    D3D11_BUFFER_DESC vertex_desc{};
+    vertex_desc.ByteWidth = static_cast<UINT>(vertices.size() * sizeof(hikari::render::ModelVertex));
+    vertex_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    vertex_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    scene.mesh.vertex_buffer = context.create_buffer(
+        vertex_desc, vertices.data(), vertices.size() * sizeof(hikari::render::ModelVertex));
+
+    D3D11_BUFFER_DESC index_desc{};
+    index_desc.ByteWidth = static_cast<UINT>(indices.size() * sizeof(std::uint32_t));
+    index_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    index_desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    scene.mesh.index_buffer = context.create_buffer(
+        index_desc, indices.data(), indices.size() * sizeof(std::uint32_t));
+
+    scene.mesh.vertex_count = static_cast<std::uint32_t>(vertices.size());
+    scene.mesh.index_count = static_cast<std::uint32_t>(indices.size());
+    scene.pmx.indices = indices;
+    scene.mesh.base_vertices = vertices;
+    scene.mesh.current_vertices = std::move(vertices);
+    scene.skinning.update(context, {hikari::Mat4::identity()});
+    return scene;
+}
+
 } // namespace hikari::gfx_lab

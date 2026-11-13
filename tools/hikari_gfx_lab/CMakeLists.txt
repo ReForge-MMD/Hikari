@@ -17,6 +17,7 @@ target_link_libraries(hikari_gfx_lab
 target_include_directories(hikari_gfx_lab PRIVATE ${Stb_INCLUDE_DIR})
 
 if(WIN32)
+  target_sources(hikari_gfx_lab PRIVATE hikari_gfx_lab.rc)
   target_link_libraries(hikari_gfx_lab PRIVATE d3d11 dxgi dxguid d3dcompiler user32 gdi32)
 endif()
 

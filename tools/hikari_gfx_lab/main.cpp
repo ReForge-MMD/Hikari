@@ -66,6 +66,12 @@ struct Options {
     int ssr_debug_mode = -1;
     int gi_enable = -1;
     int gi_quality = -1;
+    // Phase 6 fog overrides, same convention.
+    int fog_enable = -1;
+    int fog_quality = -1;
+    int fog_debug = -1;
+    int fog_cloud_shadow = -1;
+    float fog_density = -1.0f;
     bool help = false;
 };
 
@@ -97,8 +103,8 @@ void print_help() {
         << "  hikari_gfx_lab --phase 2 --scene room --pmx <stage.pmx>\n"
         << "  hikari_gfx_lab --phase 2 --scene character --pmx <model.pmx>\n\n"
         << "Options:\n"
-        << "  --phase <n>        Phase scenario. This build implements phase 1 to 5.\n"
-        << "  --scene <name>     synthetic, phase5, room, or character.\n"
+        << "  --phase <n>        Phase scenario. This build implements phase 1 to 6.\n"
+        << "  --scene <name>     synthetic, phase5, phase6, room, or character.\n"
         << "  --pmx <path>       Override the scene PMX path.\n"
         << "  --capture <path>   Headless BMP capture.\n"
         << "  --probe <path>     Headless JSON probe.\n"
@@ -136,6 +142,11 @@ void print_help() {
         << "  --ssr-debug-mode <n> SSR trace debug output, 0 to 4.\n"
         << "  --gi <n>           GI mode (0=off, 1=SSGI, 2=SSGI+, 3=SSPT, 4=SSRC, 5=VXGI).\n"
         << "  --gi-quality <n>   GI quality, 1 to 4.\n"
+        << "  --fog <n>          Fog mode (0=off, 1=analytical, 2/3=volumetric).\n"
+        << "  --fog-quality <n>  Fog raymarch budget (0=low, 1=medium, 2=high, 3=ultra).\n"
+        << "  --fog-debug <n>    Fog debug view (0=off, 1=opacity, 2=shafts, 3=depth, 4=steps).\n"
+        << "  --fog-cloud-shadow <n> Cloud and sun visibility in the fog (0/1).\n"
+        << "  --fog-density <n>  Base fog density in inverse metres (phase 6).\n"
         << "  --expect-mean-min <v> Fail unless the capture mean is at least v (0..1).\n"
         << "  --expect-mean-max <v> Fail unless the capture mean is at most v (0..1).\n"
         << "  --help             Show this text.\n\n"
@@ -236,6 +247,16 @@ Options parse_options(int argc, char** argv) {
             options.gi_enable = std::stoi(next("--gi"));
         } else if (argument == "--gi-quality") {
             options.gi_quality = std::stoi(next("--gi-quality"));
+        } else if (argument == "--fog") {
+            options.fog_enable = std::stoi(next("--fog"));
+        } else if (argument == "--fog-quality") {
+            options.fog_quality = std::stoi(next("--fog-quality"));
+        } else if (argument == "--fog-debug") {
+            options.fog_debug = std::stoi(next("--fog-debug"));
+        } else if (argument == "--fog-cloud-shadow") {
+            options.fog_cloud_shadow = std::stoi(next("--fog-cloud-shadow"));
+        } else if (argument == "--fog-density") {
+            options.fog_density = std::stof(next("--fog-density"));
         } else if (argument == "--expect-mean-min") {
             options.expect_mean_min = std::stof(next("--expect-mean-min"));
         } else if (argument == "--expect-mean-max") {
@@ -325,6 +346,58 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
             settings.sky.ambient_intensity = 0.55f;
         }
     }
+    // Fog is the Phase 6 deliverable. Earlier phases must keep their goldens, so
+    // the pass is switched off there.
+    if (options.phase < 6) {
+        settings.fog.enable = 0;
+    }
+    if (options.phase == 6) {
+        settings.sky.enabled = true;
+        settings.sky.quality = 3;
+        settings.sky.cloud_coverage = 0.45f;
+        settings.ibl.quality = 1;
+        // The hall is lit by the sky through the openings; the screen space
+        // chains add noise to the shafts without adding readable detail.
+        settings.ao.quality = 3;
+        settings.ssr.quality = 0;
+        settings.gi.enable = 0;
+        // Room scale fog. The defaults are tuned for kilometres of open air, so
+        // density, ground slab, and distances are set for a 12 m hall here.
+        settings.fog.enable = 2;
+        settings.fog.quality = 2;
+        settings.fog.density = 0.0022f;
+        settings.fog.height = 0.0f;
+        settings.fog.falloff = 0.02f;
+        settings.fog.ground_density = 0.35f;
+        settings.fog.ground_height = 0.05f;
+        settings.fog.ground_falloff = 1.2f;
+        settings.fog.start_distance = 0.6f;
+        settings.fog.cutoff_distance = 40.0f;
+        settings.fog.max_opacity = 0.95f;
+        settings.fog.color = hikari::Vec3(0.45f, 0.52f, 0.62f);
+        settings.fog.sun_intensity = 34.0f;
+        settings.fog.mie_phase = 0.45f;
+        settings.fog.godray_intensity = 1.0f;
+        settings.fog.ray_density = 1.0f;
+        settings.fog.mist_noise = 0.55f;
+        settings.fog.wind_speed = 0.5f;
+        settings.sky.ambient_intensity = options.ambient >= 0.0f ? options.ambient : 0.45f;
+    }
+    if (options.fog_enable >= 0) {
+        settings.fog.enable = options.fog_enable;
+    }
+    if (options.fog_quality >= 0) {
+        settings.fog.quality = options.fog_quality;
+    }
+    if (options.fog_debug >= 0) {
+        settings.fog.debug = options.fog_debug;
+    }
+    if (options.fog_cloud_shadow >= 0) {
+        settings.fog.cloud_shadow = options.fog_cloud_shadow != 0;
+    }
+    if (options.fog_density >= 0.0f) {
+        settings.fog.density = options.fog_density;
+    }
     if (options.ao_type >= 0) {
         settings.ao.type = options.ao_type;
     }
@@ -385,8 +458,15 @@ hikari::render::Camera frame_camera(const hikari::gfx_lab::LabScene& scene,
     const float distance = radius / std::tan(fov * 0.5f) * 1.12f;
     float sky_fov = fov;
     const bool room_view =
-        options.camera == "room" || (options.phase == 5 && options.camera == "default");
-    if (room_view) {
+        options.camera == "room" || (options.phase == 5 && options.camera == "default") ||
+        (options.phase == 6 && options.camera == "default");
+    if (options.phase == 6 && (options.camera == "room" || options.camera == "default")) {
+        // Inside the Phase 6 hall, across the beams so the three shafts, the
+        // pillar silhouette, and the ground mist are all in frame.
+        camera.position = center + hikari::Vec3(-5.4f, -2.0f, -4.2f);
+        camera.target = center + hikari::Vec3(2.6f, -1.4f, 1.4f);
+        sky_fov = 1.3089969f;
+    } else if (room_view) {
         // Inside the Phase 5 room, low enough to see the metal floor and its
         // reflections with the emitter and the coloured walls in frame.
         const float room_height = scene.bounds_max.y - scene.bounds_min.y;
@@ -488,6 +568,15 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
         view.sun_direction = -hikari::Vec3(std::cos(el) * std::sin(az),
                                            std::sin(el),
                                            std::cos(el) * std::cos(az)).normalize();
+    } else if (options.phase == 6) {
+        // 30 degrees elevation from the +x side sends the sun through the three
+        // window openings and across the hall floor.
+        constexpr float kDegToRad = 3.1415926535f / 180.0f;
+        const float el = 30.0f * kDegToRad;
+        const float az = 90.0f * kDegToRad;
+        view.sun_direction = -hikari::Vec3(std::cos(el) * std::sin(az), std::sin(el),
+                                          std::cos(el) * std::cos(az))
+                                  .normalize();
     } else if (options.phase == 4) {
         view.sun_direction = -hikari::gfx::sun_direction_from_time_of_day(
             settings.sky.time_of_day);
@@ -543,7 +632,7 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
 }
 
 int run_headless(const Options& options) {
-    if (options.phase < 1 || options.phase > 5) {
+    if (options.phase < 1 || options.phase > 6) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -556,6 +645,8 @@ int run_headless(const Options& options) {
             scene = hikari::gfx_lab::LabScene::synthetic(context);
         } else if (options.scene == "phase5") {
             scene = hikari::gfx_lab::LabScene::phase5_room(context);
+        } else if (options.scene == "phase6") {
+            scene = hikari::gfx_lab::LabScene::phase6_room(context);
         } else {
             const std::string path = scene_path(options);
             if (path.empty()) {
@@ -740,7 +831,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 }
 
 int run_window(const Options& options) {
-    if (options.phase < 1 || options.phase > 5) {
+    if (options.phase < 1 || options.phase > 6) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -770,6 +861,8 @@ int run_window(const Options& options) {
             scene = hikari::gfx_lab::LabScene::synthetic(context);
         } else if (options.scene == "phase5") {
             scene = hikari::gfx_lab::LabScene::phase5_room(context);
+        } else if (options.scene == "phase6") {
+            scene = hikari::gfx_lab::LabScene::phase6_room(context);
         } else {
             const std::string path = scene_path(options);
             if (path.empty()) {
@@ -866,7 +959,8 @@ int main(int argc, char** argv) {
     }
     if (options.list_targets) {
         std::cout << "GB0\nGB1\nGB2\nGB3\nGB4\nDepth\nHdr\nFinalLdr\n"
-                     "AoBlur\nSsrTrace\nSsrColor\nGiFiltered\n";
+                     "AoBlur\nSsrTrace\nSsrColor\nGiFiltered\n"
+                     "FogVolume\nFogBlurTmp\nFogBlur\nFogSceneCopy\nFogDebug\n";
         return 0;
     }
     if (options.validate) {

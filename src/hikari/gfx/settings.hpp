@@ -125,6 +125,14 @@ struct FogSettings {
     Vec3 sun_color{1.0f, 1.0f, 1.0f};
     float sun_intensity = 1.5f;
     float mie_phase = 0.75f;
+    // Animated mist noise amplitude and wind scroll speed for the ground layer.
+    float mist_noise = 0.35f;
+    float wind_speed = 0.5f;
+    // Artistic gain on the sun in-scattering shafts and on the medium that
+    // carries them, kept separate so shafts can be pushed without thickening
+    // the fog.
+    float godray_intensity = 1.0f;
+    float ray_density = 1.0f;
 };
 
 struct BrdfSettings {

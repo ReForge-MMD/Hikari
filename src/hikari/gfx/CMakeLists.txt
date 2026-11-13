@@ -1,5 +1,6 @@
 add_library(hikari_gfx STATIC
   ao_ssr_gi.cpp
+  fog.cpp
   frame_graph.cpp
   gbuffer.cpp
   ibl.cpp

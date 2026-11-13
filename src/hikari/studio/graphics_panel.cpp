@@ -443,6 +443,116 @@ void GraphicsPanel::build_controls() {
     ibl_form->addRow(ibl_status_);
     layout->addWidget(make_group(QStringLiteral("Image based lighting"), ibl));
 
+    auto make_color_row = [](QDoubleSpinBox*& r, QDoubleSpinBox*& g, QDoubleSpinBox*& b) {
+        r = make_spin(0.0, 10.0, 0.01, 3);
+        g = make_spin(0.0, 10.0, 0.01, 3);
+        b = make_spin(0.0, 10.0, 0.01, 3);
+        auto* row = new QWidget();
+        auto* row_layout = new QHBoxLayout(row);
+        row_layout->setContentsMargins(0, 0, 0, 0);
+        row_layout->setSpacing(4);
+        row_layout->addWidget(r);
+        row_layout->addWidget(g);
+        row_layout->addWidget(b);
+        return row;
+    };
+
+    fog_enable_ = new QComboBox();
+    fog_enable_->addItems({QStringLiteral("Off"), QStringLiteral("Analytical"),
+                           QStringLiteral("Volumetric")});
+    fog_enable_->setToolTip(QStringLiteral(
+        "Off skips the pass, Analytical evaluates the closed form, and Volumetric marches "
+        "the medium so it can shadow the shafts and animate the mist."));
+    fog_quality_ = new QComboBox();
+    fog_quality_->addItems({QStringLiteral("Low (12 steps)"),
+                            QStringLiteral("Medium (20 steps)"), QStringLiteral("High (32 steps)"),
+                            QStringLiteral("Cinematic (48 steps)")});
+    fog_quality_->setToolTip(
+        QStringLiteral("Raymarch step budget of the volumetric mode."));
+    fog_debug_ = new QComboBox();
+    fog_debug_->addItems({QStringLiteral("Off"), QStringLiteral("Transmittance"),
+                          QStringLiteral("In-scattering"), QStringLiteral("Optical depth"),
+                          QStringLiteral("Sun shafts")});
+    fog_debug_->setToolTip(QStringLiteral(
+        "Replaces the image with one fog channel. Only the volumetric mode produces these."));
+    fog_cloud_shadow_ = new QCheckBox(QStringLiteral("Cloud shadow"));
+    fog_cloud_shadow_->setToolTip(
+        QStringLiteral("Attenuates the sun shafts with the cloud coverage of the sky layer."));
+
+    fog_density_ = make_spin(0.0, 1.0, 0.0005, 4);
+    fog_density_->setToolTip(
+        QStringLiteral("Extinction of the upper haze at the reference height."));
+    fog_height_ = make_spin(-1000.0, 1000.0, 1.0, 2);
+    fog_height_->setToolTip(
+        QStringLiteral("Altitude where the upper haze reaches its full density."));
+    fog_falloff_ = make_spin(0.0, 10.0, 0.005, 3);
+    fog_falloff_->setToolTip(QStringLiteral("How quickly the upper haze thins with altitude."));
+    fog_ground_density_ = make_spin(0.0, 1.0, 0.001, 4);
+    fog_ground_density_->setToolTip(QStringLiteral("Extinction of the ground mist slab."));
+    fog_ground_height_ = make_spin(-1000.0, 1000.0, 0.5, 2);
+    fog_ground_height_->setToolTip(QStringLiteral("Altitude where the ground mist starts."));
+    fog_ground_falloff_ = make_spin(0.0, 10.0, 0.01, 3);
+    fog_ground_falloff_->setToolTip(
+        QStringLiteral("How quickly the ground mist thins above its base."));
+    fog_start_ = make_spin(0.0, 10000.0, 0.5, 2);
+    fog_start_->setToolTip(QStringLiteral("Distance from the camera before the medium starts."));
+    fog_cutoff_ = make_spin(0.0, 100000.0, 10.0, 1);
+    fog_cutoff_->setToolTip(QStringLiteral("Longest distance the medium is integrated over."));
+    fog_max_opacity_ = make_spin(0.0, 1.0, 0.01, 2);
+    fog_max_opacity_->setToolTip(
+        QStringLiteral("Upper bound on how much of the scene the fog may hide."));
+    fog_sun_intensity_ = make_spin(0.0, 100.0, 0.05, 2);
+    fog_sun_intensity_->setToolTip(QStringLiteral("Radiance the sun injects into the medium."));
+    fog_mie_phase_ = make_spin(-1.0, 1.0, 0.01, 2);
+    fog_mie_phase_->setToolTip(
+        QStringLiteral("Henyey-Greenstein anisotropy. Positive values tighten the shafts "
+                       "around the sun."));
+    fog_mist_noise_ = make_spin(0.0, 1.0, 0.01, 2);
+    fog_mist_noise_->setToolTip(
+        QStringLiteral("How strongly the animated noise breaks up the ground mist."));
+    fog_wind_speed_ = make_spin(0.0, 10.0, 0.05, 2);
+    fog_wind_speed_->setToolTip(QStringLiteral("Scroll speed of the mist noise."));
+    fog_godray_intensity_ = make_spin(0.0, 10.0, 0.05, 2);
+    fog_godray_intensity_->setToolTip(QStringLiteral("Gain on the sun in-scattering shafts."));
+    fog_ray_density_ = make_spin(0.0, 10.0, 0.05, 2);
+    fog_ray_density_->setToolTip(
+        QStringLiteral("Gain on the medium that carries the shafts, without thickening the fog."));
+
+    auto* haze_row = make_color_row(fog_color_r_, fog_color_g_, fog_color_b_);
+    fog_color_r_->setToolTip(QStringLiteral("Haze colour, red channel."));
+    fog_color_g_->setToolTip(QStringLiteral("Haze colour, green channel."));
+    fog_color_b_->setToolTip(QStringLiteral("Haze colour, blue channel."));
+    auto* fog_sun_row = make_color_row(fog_sun_color_r_, fog_sun_color_g_, fog_sun_color_b_);
+    fog_sun_color_r_->setToolTip(QStringLiteral("Sun colour used by the shafts, red channel."));
+    fog_sun_color_g_->setToolTip(QStringLiteral("Sun colour used by the shafts, green channel."));
+    fog_sun_color_b_->setToolTip(QStringLiteral("Sun colour used by the shafts, blue channel."));
+
+    auto* fog = new QWidget();
+    auto* fog_form = new QFormLayout(fog);
+    fog_form->setContentsMargins(0, 0, 0, 0);
+    fog_form->addRow(QStringLiteral("Mode"), fog_enable_);
+    fog_form->addRow(QStringLiteral("Quality"), fog_quality_);
+    fog_form->addRow(fog_cloud_shadow_);
+    fog_form->addRow(QStringLiteral("Haze density"), fog_density_);
+    fog_form->addRow(QStringLiteral("Haze height"), fog_height_);
+    fog_form->addRow(QStringLiteral("Haze falloff"), fog_falloff_);
+    fog_form->addRow(QStringLiteral("Mist density"), fog_ground_density_);
+    fog_form->addRow(QStringLiteral("Mist height"), fog_ground_height_);
+    fog_form->addRow(QStringLiteral("Mist falloff"), fog_ground_falloff_);
+    fog_form->addRow(QStringLiteral("Start distance"), fog_start_);
+    fog_form->addRow(QStringLiteral("Cutoff distance"), fog_cutoff_);
+    fog_form->addRow(QStringLiteral("Max opacity"), fog_max_opacity_);
+    fog_form->addRow(QStringLiteral("Haze colour"), haze_row);
+    fog_form->addRow(QStringLiteral("Sun colour"), fog_sun_row);
+    fog_form->addRow(QStringLiteral("Sun intensity"), fog_sun_intensity_);
+    fog_form->addRow(QStringLiteral("Phase"), fog_mie_phase_);
+    fog_form->addRow(QStringLiteral("Mist noise"), fog_mist_noise_);
+    fog_form->addRow(QStringLiteral("Wind speed"), fog_wind_speed_);
+    fog_form->addRow(QStringLiteral("Godray gain"), fog_godray_intensity_);
+    fog_form->addRow(QStringLiteral("Ray density"), fog_ray_density_);
+    fog_form->addRow(QStringLiteral("Debug channel"), fog_debug_);
+    layout->addWidget(make_group(QStringLiteral("Fog and atmosphere"), fog));
+
     ambient_intensity_ = make_spin(0.0, 10.0, 0.05, 2);
     exposure_ = make_spin(0.0, 100.0, 0.05, 2);
     tonemap_ = new QComboBox();
@@ -495,8 +605,8 @@ void GraphicsPanel::build_controls() {
     auto* reset = new QPushButton(QStringLiteral("Reset to Medium"));
     layout->addWidget(reset);
     status_ = new QLabel(QStringLiteral(
-        "Phase 5: ambient occlusion, screen-space reflections, and global "
-        "illumination on top of the phase 4 sky and image based lighting."));
+        "Phase 6: atmospheric fog with dual-layer height profiles, raymarched sun "
+        "shafts, cloud shadows, and ground mist on top of the phase 5 lighting."));
     status_->setWordWrap(true);
 
     auto bind_sky_spin = [this](QDoubleSpinBox* spin, float gfx::SkySettings::*member) {
@@ -509,6 +619,19 @@ void GraphicsPanel::build_controls() {
         connect(spin, &QDoubleSpinBox::valueChanged, this, [this, member](double value) {
             push_edit();
             state_.graphics.ibl.*member = static_cast<float>(value);
+        });
+    };
+    auto bind_fog_spin = [this](QDoubleSpinBox* spin, float gfx::FogSettings::*member) {
+        connect(spin, &QDoubleSpinBox::valueChanged, this, [this, member](double value) {
+            push_edit();
+            state_.graphics.fog.*member = static_cast<float>(value);
+        });
+    };
+    auto bind_fog_color = [this](QDoubleSpinBox* spin, Vec3 gfx::FogSettings::*member,
+                                 float Vec3::*channel) {
+        connect(spin, &QDoubleSpinBox::valueChanged, this, [this, member, channel](double value) {
+            push_edit();
+            (state_.graphics.fog.*member).*channel = static_cast<float>(value);
         });
     };
 
@@ -696,6 +819,44 @@ void GraphicsPanel::build_controls() {
         push_edit();
         state_.graphics.gi.specular_gi = checked;
     });
+    connect(fog_enable_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.fog.enable = index;
+        refresh_from_state();
+    });
+    connect(fog_quality_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.fog.quality = index;
+    });
+    connect(fog_debug_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        push_edit();
+        state_.graphics.fog.debug = index;
+    });
+    connect(fog_cloud_shadow_, &QCheckBox::toggled, this, [this](bool checked) {
+        push_edit();
+        state_.graphics.fog.cloud_shadow = checked;
+    });
+    bind_fog_spin(fog_density_, &gfx::FogSettings::density);
+    bind_fog_spin(fog_height_, &gfx::FogSettings::height);
+    bind_fog_spin(fog_falloff_, &gfx::FogSettings::falloff);
+    bind_fog_spin(fog_ground_density_, &gfx::FogSettings::ground_density);
+    bind_fog_spin(fog_ground_height_, &gfx::FogSettings::ground_height);
+    bind_fog_spin(fog_ground_falloff_, &gfx::FogSettings::ground_falloff);
+    bind_fog_spin(fog_start_, &gfx::FogSettings::start_distance);
+    bind_fog_spin(fog_cutoff_, &gfx::FogSettings::cutoff_distance);
+    bind_fog_spin(fog_max_opacity_, &gfx::FogSettings::max_opacity);
+    bind_fog_spin(fog_sun_intensity_, &gfx::FogSettings::sun_intensity);
+    bind_fog_spin(fog_mie_phase_, &gfx::FogSettings::mie_phase);
+    bind_fog_spin(fog_mist_noise_, &gfx::FogSettings::mist_noise);
+    bind_fog_spin(fog_wind_speed_, &gfx::FogSettings::wind_speed);
+    bind_fog_spin(fog_godray_intensity_, &gfx::FogSettings::godray_intensity);
+    bind_fog_spin(fog_ray_density_, &gfx::FogSettings::ray_density);
+    bind_fog_color(fog_color_r_, &gfx::FogSettings::color, &Vec3::x);
+    bind_fog_color(fog_color_g_, &gfx::FogSettings::color, &Vec3::y);
+    bind_fog_color(fog_color_b_, &gfx::FogSettings::color, &Vec3::z);
+    bind_fog_color(fog_sun_color_r_, &gfx::FogSettings::sun_color, &Vec3::x);
+    bind_fog_color(fog_sun_color_g_, &gfx::FogSettings::sun_color, &Vec3::y);
+    bind_fog_color(fog_sun_color_b_, &gfx::FogSettings::sun_color, &Vec3::z);
     connect(ambient_intensity_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
         push_edit();
         state_.graphics.sky.ambient_intensity = static_cast<float>(value);
@@ -846,6 +1007,31 @@ void GraphicsPanel::refresh_from_state() {
     const QSignalBlocker block_ibl_intensity(ibl_intensity_);
     const QSignalBlocker block_ibl_rotation(ibl_rotation_);
     const QSignalBlocker block_ibl_hz(ibl_update_hz_);
+    const QSignalBlocker block_fog_enable(fog_enable_);
+    const QSignalBlocker block_fog_quality(fog_quality_);
+    const QSignalBlocker block_fog_debug(fog_debug_);
+    const QSignalBlocker block_fog_cloud_shadow(fog_cloud_shadow_);
+    const QSignalBlocker block_fog_density(fog_density_);
+    const QSignalBlocker block_fog_height(fog_height_);
+    const QSignalBlocker block_fog_falloff(fog_falloff_);
+    const QSignalBlocker block_fog_ground_density(fog_ground_density_);
+    const QSignalBlocker block_fog_ground_height(fog_ground_height_);
+    const QSignalBlocker block_fog_ground_falloff(fog_ground_falloff_);
+    const QSignalBlocker block_fog_start(fog_start_);
+    const QSignalBlocker block_fog_cutoff(fog_cutoff_);
+    const QSignalBlocker block_fog_max_opacity(fog_max_opacity_);
+    const QSignalBlocker block_fog_color_r(fog_color_r_);
+    const QSignalBlocker block_fog_color_g(fog_color_g_);
+    const QSignalBlocker block_fog_color_b(fog_color_b_);
+    const QSignalBlocker block_fog_sun_r(fog_sun_color_r_);
+    const QSignalBlocker block_fog_sun_g(fog_sun_color_g_);
+    const QSignalBlocker block_fog_sun_b(fog_sun_color_b_);
+    const QSignalBlocker block_fog_sun_intensity(fog_sun_intensity_);
+    const QSignalBlocker block_fog_mie_phase(fog_mie_phase_);
+    const QSignalBlocker block_fog_mist(fog_mist_noise_);
+    const QSignalBlocker block_fog_wind(fog_wind_speed_);
+    const QSignalBlocker block_fog_godray(fog_godray_intensity_);
+    const QSignalBlocker block_fog_ray_density(fog_ray_density_);
 
     const gfx::GraphicsSettings& graphics = state_.graphics;
 
@@ -901,6 +1087,34 @@ void GraphicsPanel::refresh_from_state() {
     ibl_rotation_->setValue(graphics.ibl.rotation_degrees);
     ibl_update_hz_->setValue(std::clamp(graphics.sky.ibl_update_hz, 1, 60));
     ibl_path_->setText(QString::fromStdString(graphics.ibl.custom_path));
+
+    // Enable 3 is behaviourally the same as 2, so the mode list collapses them
+    // and the step budget lives in the quality control.
+    fog_enable_->setCurrentIndex(graphics.fog.enable >= 2 ? 2 : std::clamp(graphics.fog.enable, 0, 1));
+    fog_quality_->setCurrentIndex(std::clamp(graphics.fog.quality, 0, 3));
+    fog_debug_->setCurrentIndex(std::clamp(graphics.fog.debug, 0, 4));
+    fog_cloud_shadow_->setChecked(graphics.fog.cloud_shadow);
+    fog_density_->setValue(graphics.fog.density);
+    fog_height_->setValue(graphics.fog.height);
+    fog_falloff_->setValue(graphics.fog.falloff);
+    fog_ground_density_->setValue(graphics.fog.ground_density);
+    fog_ground_height_->setValue(graphics.fog.ground_height);
+    fog_ground_falloff_->setValue(graphics.fog.ground_falloff);
+    fog_start_->setValue(graphics.fog.start_distance);
+    fog_cutoff_->setValue(graphics.fog.cutoff_distance);
+    fog_max_opacity_->setValue(graphics.fog.max_opacity);
+    fog_color_r_->setValue(graphics.fog.color.x);
+    fog_color_g_->setValue(graphics.fog.color.y);
+    fog_color_b_->setValue(graphics.fog.color.z);
+    fog_sun_color_r_->setValue(graphics.fog.sun_color.x);
+    fog_sun_color_g_->setValue(graphics.fog.sun_color.y);
+    fog_sun_color_b_->setValue(graphics.fog.sun_color.z);
+    fog_sun_intensity_->setValue(graphics.fog.sun_intensity);
+    fog_mie_phase_->setValue(graphics.fog.mie_phase);
+    fog_mist_noise_->setValue(graphics.fog.mist_noise);
+    fog_wind_speed_->setValue(graphics.fog.wind_speed);
+    fog_godray_intensity_->setValue(graphics.fog.godray_intensity);
+    fog_ray_density_->setValue(graphics.fog.ray_density);
 
     const bool shadows_enabled = graphics.shadows.quality > 0;
     shadow_pcss_->setEnabled(shadows_enabled);
@@ -958,6 +1172,26 @@ void GraphicsPanel::refresh_from_state() {
     gate_control(ibl_rotation_, ibl_enabled, ibl_reason);
     gate_control(ibl_update_hz_, sky_on && graphics.ibl.quality > 0,
                  QStringLiteral("Enable the analytic sky to capture it."));
+
+    const bool fog_on = graphics.fog.enable > 0;
+    const bool fog_volumetric = graphics.fog.enable >= 2;
+    const QString fog_reason = QStringLiteral("Choose a fog mode above Off to edit the medium.");
+    for (QWidget* widget : std::array<QWidget*, 15>{
+             fog_density_, fog_height_, fog_falloff_, fog_ground_density_, fog_ground_height_,
+             fog_ground_falloff_, fog_start_, fog_cutoff_, fog_max_opacity_, fog_color_r_,
+             fog_color_g_, fog_color_b_, fog_sun_color_r_, fog_sun_color_g_, fog_sun_color_b_}) {
+        gate_control(widget, fog_on, fog_reason);
+    }
+    const QString fog_volume_reason =
+        QStringLiteral("Choose the volumetric mode to march the medium.");
+    for (QWidget* widget : std::array<QWidget*, 8>{
+             fog_quality_, fog_debug_, fog_sun_intensity_, fog_mie_phase_, fog_mist_noise_,
+             fog_wind_speed_, fog_godray_intensity_, fog_ray_density_}) {
+        gate_control(widget, fog_volumetric, fog_volume_reason);
+    }
+    gate_control(fog_cloud_shadow_, fog_volumetric && sky_on,
+                 sky_on ? fog_volume_reason
+                        : QStringLiteral("Enable the analytic sky so there are clouds to shadow."));
 
     refresh_preview();
 
