@@ -18,6 +18,7 @@ add_executable(hikari_studio WIN32
   main.cpp
   main_window.cpp
   main_window.hpp
+  material_section.hpp
   model_instance.hpp
   project_io.cpp
   project_io.hpp

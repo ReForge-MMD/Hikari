@@ -320,9 +320,21 @@ int GraphicsSettings::validate() {
 
     clamp_int(ssr.quality, 0, 4);
     clamp_int(ssr.debug_mode, 0, 4);
-    clamp_int(ssr.glass_refraction, 0, 1);
+    clamp_int(ssr.glass_refraction, 0, 2);
     clamp_float(ssr.water_surface_y, -10000.0f, 10000.0f);
     clamp_float(ssr.caustics_intensity, 0.0f, 100.0f);
+
+    clamp_int(outline.mode, 0, 3);
+    clamp_float(outline.width_pixels, 0.0f, 16.0f);
+    clamp_float(outline.width_scale, 0.0f, 20.0f);
+    clamp_float(outline.depth_threshold, 0.0f, 1.0f);
+    clamp_float(outline.normal_threshold, 0.0f, 2.0f);
+
+    clamp_float(glass.absorption.x, 0.0f, 10.0f);
+    clamp_float(glass.absorption.y, 0.0f, 10.0f);
+    clamp_float(glass.absorption.z, 0.0f, 10.0f);
+    clamp_float(glass.ior, 1.0f, 3.0f);
+    clamp_float(glass.dispersion, 0.0f, 0.2f);
 
     clamp_int(gi.enable, 0, 5);
     clamp_int(gi.quality, 1, 4);
@@ -405,6 +417,8 @@ std::uint64_t GraphicsSettings::permutation_key() const {
     mix(hash, ssr.debug);
     mix(hash, ssr.debug_mode);
     mix(hash, ssr.glass_refraction);
+    mix(hash, ssr.water_caustics);
+    mix(hash, outline.mode);
     mix(hash, gi.enable);
     mix(hash, gi.quality);
     mix(hash, gi.filter_radius);
@@ -535,6 +549,15 @@ std::string GraphicsSettings::to_json() const {
     put_bool(out, "ssr.water_caustics", ssr.water_caustics, true);
     put_float(out, "ssr.water_surface_y", ssr.water_surface_y, true);
     put_float(out, "ssr.caustics_intensity", ssr.caustics_intensity, true);
+    put_int(out, "outline.mode", outline.mode, true);
+    put_float(out, "outline.width_pixels", outline.width_pixels, true);
+    put_float(out, "outline.width_scale", outline.width_scale, true);
+    put_vec3(out, "outline.color", outline.color, true);
+    put_float(out, "outline.depth_threshold", outline.depth_threshold, true);
+    put_float(out, "outline.normal_threshold", outline.normal_threshold, true);
+    put_vec3(out, "glass.absorption", glass.absorption, true);
+    put_float(out, "glass.ior", glass.ior, true);
+    put_float(out, "glass.dispersion", glass.dispersion, true);
     put_int(out, "gi.enable", gi.enable, true);
     put_int(out, "gi.quality", gi.quality, true);
     put_int(out, "gi.filter_radius", gi.filter_radius, true);
@@ -707,6 +730,17 @@ bool GraphicsSettings::from_json(const std::string& json) {
     ssr.water_caustics = read_bool(values, "ssr.water_caustics", ssr.water_caustics);
     ssr.water_surface_y = read_float(values, "ssr.water_surface_y", ssr.water_surface_y);
     ssr.caustics_intensity = read_float(values, "ssr.caustics_intensity", ssr.caustics_intensity);
+    outline.mode = read_int(values, "outline.mode", outline.mode);
+    outline.width_pixels = read_float(values, "outline.width_pixels", outline.width_pixels);
+    outline.width_scale = read_float(values, "outline.width_scale", outline.width_scale);
+    outline.color = read_vec3(values, "outline.color", outline.color);
+    outline.depth_threshold =
+        read_float(values, "outline.depth_threshold", outline.depth_threshold);
+    outline.normal_threshold =
+        read_float(values, "outline.normal_threshold", outline.normal_threshold);
+    glass.absorption = read_vec3(values, "glass.absorption", glass.absorption);
+    glass.ior = read_float(values, "glass.ior", glass.ior);
+    glass.dispersion = read_float(values, "glass.dispersion", glass.dispersion);
     gi.enable = read_int(values, "gi.enable", gi.enable);
     gi.quality = read_int(values, "gi.quality", gi.quality);
     gi.filter_radius = read_int(values, "gi.filter_radius", gi.filter_radius);

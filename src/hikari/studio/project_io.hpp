@@ -9,6 +9,7 @@
 #include <QString>
 
 #include "hikari/formats/vmd.hpp"
+#include "hikari/gfx/material.hpp"
 #include "hikari/math.hpp"
 #include "hikari/studio/app_state.hpp"
 
@@ -31,6 +32,14 @@ struct HikariMotion {
     std::vector<ModelTransformKey> model_keys;
 };
 
+// One per-subset material response override stored in the project. The subset
+// index follows the PMX material order, and the response is serialized by name
+// so a reordered ShadingModel enum cannot silently change a saved project.
+struct ProjectMaterialOverride {
+    int subset = 0;
+    gfx::MaterialResponse response;
+};
+
 struct ProjectModel {
     QString path;
     QString name;
@@ -38,6 +47,7 @@ struct ProjectModel {
     Quat rotation{0.0f, 0.0f, 0.0f, 1.0f};
     float scale = 1.0f;
     bool visible = true;
+    std::vector<ProjectMaterialOverride> materials;
 };
 
 struct ProjectScene {

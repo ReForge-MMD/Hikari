@@ -9,6 +9,7 @@
 #include "hikari/animation/morph.hpp"
 #include "hikari/animation/skeleton.hpp"
 #include "hikari/formats/pmx.hpp"
+#include "hikari/gfx/material.hpp"
 #include "hikari/math.hpp"
 #include "hikari/physics/rig.hpp"
 #include "hikari/render/material.hpp"
@@ -54,6 +55,12 @@ struct ModelInstance {
     float shadow_radius = 10.0f;
     bool visible = true;
     std::vector<SubsetBounds> subset_bounds;
+    // Per-subset material response overrides, indexed like mesh.subsets. An
+    // empty entry keeps the authored PMX material for that subset. The response
+    // only replaces the shading model and the PBR response, so the authored
+    // colour, edge ink and texture slots keep coming from the PMX material and
+    // material morphs still reach the surface.
+    std::vector<std::optional<gfx::MaterialResponse>> material_overrides;
 
     // Row-vector model matrix: scale, then rotation, then translation.
     Mat4 model_matrix() const {

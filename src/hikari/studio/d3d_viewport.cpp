@@ -16,12 +16,15 @@
 #include <iterator>
 #include <limits>
 #include <set>
+#include <string_view>
 #include <utility>
 
 #include "hikari/animation/bezier.hpp"
 #include "hikari/audio/audio_player.hpp"
 #include "hikari/audio/audio_track.hpp"
 #include "hikari/core/log.hpp"
+#include "hikari/gfx/material_import.hpp"
+#include "hikari/gfx/material_presets.hpp"
 #include "hikari/gfx/sky.hpp"
 #include "hikari/render/frustum.hpp"
 #include "hikari/studio/viewport_chrome.hpp"
@@ -224,6 +227,7 @@ void D3DViewport::sync_model_transforms() {
         transform.rotation = model->rotation;
         transform.scale = model->scale;
         transform.visible = model->visible;
+        transform.material_overrides = model->material_overrides;
         state_.model_transforms.push_back(transform);
     }
     state_.snapshot_active_model = active_model_;
@@ -238,6 +242,7 @@ void D3DViewport::restore_model_transforms() {
         model.rotation = transform.rotation;
         model.scale = transform.scale;
         model.visible = transform.visible;
+        model.material_overrides = transform.material_overrides;
     }
     if (ModelInstance* model = active_model(); model != nullptr) {
         state_.model_offset = model->offset;
@@ -504,6 +509,7 @@ bool D3DViewport::load_model(const QString& path) {
         }
 
         instance->mesh = render::GpuMesh::from_pmx(*context_, instance->pmx);
+        instance->material_overrides.resize(instance->mesh.subsets.size());
         instance->materials.reserve(instance->pmx.materials.size());
         for (const auto& material : instance->pmx.materials) {
             try {
@@ -621,6 +627,116 @@ QStringList D3DViewport::model_names() const {
         names.push_back(model->name);
     }
     return names;
+}
+
+namespace {
+
+ModelInstance* model_at(std::vector<std::unique_ptr<ModelInstance>>& models, int index) {
+    if (index < 0 || index >= static_cast<int>(models.size())) {
+        return nullptr;
+    }
+    return models[static_cast<std::size_t>(index)].get();
+}
+
+} // namespace
+
+std::vector<MaterialSubsetEntry> D3DViewport::material_subsets(int model_index) const {
+    std::vector<MaterialSubsetEntry> entries;
+    if (model_index < 0 || model_index >= static_cast<int>(models_.size())) {
+        return entries;
+    }
+    const ModelInstance& model = *models_[static_cast<std::size_t>(model_index)];
+    entries.reserve(model.mesh.subsets.size());
+    for (std::size_t i = 0; i < model.mesh.subsets.size(); ++i) {
+        const render::MeshSubset& subset = model.mesh.subsets[i];
+        MaterialSubsetEntry entry;
+        if (subset.material_index < model.materials.size()) {
+            entry.name = QString::fromStdString(model.materials[subset.material_index].name);
+        }
+        if (entry.name.isEmpty()) {
+            entry.name = QStringLiteral("subset %1").arg(static_cast<int>(i));
+        }
+        if (i < model.material_overrides.size() && model.material_overrides[i]) {
+            entry.overridden = true;
+            entry.shading_model = model.material_overrides[i]->shading_model;
+        } else if (subset.material_index < model.materials.size()) {
+            entry.shading_model = gfx::shading_model_from_constants(
+                gfx::material_from_gpu(model.materials[subset.material_index]));
+        }
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+void D3DViewport::set_material_shading_model(int model_index, int subset, int shading_model) {
+    ModelInstance* model = model_at(models_, model_index);
+    if (model == nullptr || subset < 0 ||
+        static_cast<std::size_t>(subset) >= model->material_overrides.size()) {
+        return;
+    }
+    std::optional<gfx::MaterialResponse>& slot =
+        model->material_overrides[static_cast<std::size_t>(subset)];
+    if (!slot) {
+        const render::MeshSubset& mesh_subset = model->mesh.subsets[static_cast<std::size_t>(subset)];
+        if (mesh_subset.material_index >= model->materials.size()) {
+            return;
+        }
+        slot = gfx::response_from_constants(
+            gfx::material_from_gpu(model->materials[mesh_subset.material_index]));
+    }
+    slot->shading_model = std::clamp(shading_model, 0,
+                                     static_cast<int>(gfx::ShadingModel::Eye));
+}
+
+void D3DViewport::apply_material_preset(int model_index, int subset, int preset_index) {
+    ModelInstance* model = model_at(models_, model_index);
+    const std::vector<gfx::MaterialPreset>& presets = gfx::material_presets();
+    if (model == nullptr || preset_index < 0 ||
+        static_cast<std::size_t>(preset_index) >= presets.size() || subset < 0 ||
+        static_cast<std::size_t>(subset) >= model->material_overrides.size()) {
+        return;
+    }
+    const render::MeshSubset& mesh_subset = model->mesh.subsets[static_cast<std::size_t>(subset)];
+    if (mesh_subset.material_index >= model->materials.size()) {
+        return;
+    }
+    gfx::MaterialConstants constants = gfx::material_from_gpu(
+        model->materials[mesh_subset.material_index]);
+    gfx::apply_material_preset(presets[static_cast<std::size_t>(preset_index)], constants);
+    model->material_overrides[static_cast<std::size_t>(subset)] =
+        gfx::response_from_constants(constants);
+}
+
+void D3DViewport::clear_material_override(int model_index, int subset) {
+    ModelInstance* model = model_at(models_, model_index);
+    if (model == nullptr || subset < 0 ||
+        static_cast<std::size_t>(subset) >= model->material_overrides.size()) {
+        return;
+    }
+    model->material_overrides[static_cast<std::size_t>(subset)].reset();
+}
+
+gfx::ImportReport D3DViewport::import_ray_mmd(int model_index, int subset, const QString& path) {
+    gfx::ImportReport report;
+    ModelInstance* model = model_at(models_, model_index);
+    if (model == nullptr || subset < 0 ||
+        static_cast<std::size_t>(subset) >= model->material_overrides.size()) {
+        report.error = "no material subset is selected";
+        return report;
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        report.error = QStringLiteral("cannot read %1").arg(path).toStdString();
+        return report;
+    }
+    const QByteArray bytes = file.readAll();
+    const gfx::RayMmdImport imported = gfx::import_ray_mmd_material(
+        std::string_view(bytes.constData(), static_cast<std::size_t>(bytes.size())));
+    if (!imported.report.ok) {
+        return imported.report;
+    }
+    model->material_overrides[static_cast<std::size_t>(subset)] = imported.response;
+    return imported.report;
 }
 
 void D3DViewport::update_stats() {
@@ -1369,6 +1485,15 @@ bool D3DViewport::save_project(const QString& path) {
         entry.rotation = model->rotation;
         entry.scale = model->scale;
         entry.visible = model->visible;
+        for (std::size_t i = 0; i < model->material_overrides.size(); ++i) {
+            if (!model->material_overrides[i]) {
+                continue;
+            }
+            ProjectMaterialOverride material;
+            material.subset = static_cast<int>(i);
+            material.response = *model->material_overrides[i];
+            entry.materials.push_back(material);
+        }
         project.models.push_back(std::move(entry));
     }
 
@@ -1421,6 +1546,13 @@ bool D3DViewport::load_project(const QString& path) {
         model.rotation = entry.rotation.normalize();
         model.scale = entry.scale;
         model.visible = entry.visible;
+        for (const ProjectMaterialOverride& material : entry.materials) {
+            const auto index = static_cast<std::size_t>(material.subset);
+            if (material.subset < 0 || index >= model.material_overrides.size()) {
+                continue;
+            }
+            model.material_overrides[index] = material.response;
+        }
     }
     if (models_.empty()) {
         sync_active_model_state();
@@ -3504,6 +3636,16 @@ void D3DViewport::render_scene_native() {
     view.width = width;
     view.height = height;
 
+    // DrawItem carries a raw pointer to its override, so the per-frame storage is
+    // sized once before any item is built and never reallocated afterwards.
+    std::size_t override_count = 0;
+    for (const auto& model : models_) {
+        for (const auto& entry : model->material_overrides) {
+            override_count += entry.has_value() ? 1 : 0;
+        }
+    }
+    view.material_overrides.reserve(override_count);
+
     const Vec3 view_forward = camera_.target - camera_.position;
     const render::Frustum frustum =
         render::Frustum::from_view_projection(camera_.view_projection_matrix());
@@ -3562,7 +3704,27 @@ void D3DViewport::render_scene_native() {
             draw.textures = &model->textures;
             draw.skinning = &model->skinning;
             draw.subset = i;
-            if (transparent) {
+            const render::GpuMaterial* authored =
+                subset.material_index < model->materials.size()
+                    ? &model->materials[subset.material_index]
+                    : nullptr;
+            if (i < model->material_overrides.size() && model->material_overrides[i]) {
+                // The response rides on top of the authored material so material
+                // morphs keep tinting the subset that was assigned a preset.
+                const gfx::MaterialConstants authored_constants =
+                    authored != nullptr ? gfx::material_from_gpu(*authored)
+                                        : gfx::MaterialConstants{};
+                view.material_overrides.push_back(gfx::apply_material_response(
+                    authored_constants, *model->material_overrides[i]));
+                draw.material_override = &view.material_overrides.back();
+            }
+            // Glass always takes the forward path, even when the authored
+            // diffuse is opaque.
+            const bool glass =
+                draw.material_override != nullptr &&
+                gfx::shading_model_from_constants(*draw.material_override) ==
+                    static_cast<int>(gfx::ShadingModel::Glass);
+            if (glass || transparent) {
                 if (subset_in_camera) {
                     const Vec3 center = subset_world_center(
                         model->pmx.indices, model->mesh.current_vertices, subset, render_palette_);

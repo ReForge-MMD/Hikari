@@ -200,6 +200,73 @@ TEST_CASE("HKP round trips scene, models, authored tracks and motion", "[project
     REQUIRE(parsed->motion->model_keys.size() == 2);
 }
 
+TEST_CASE("HKP round trips per-subset material overrides by name", "[project]") {
+    hikari::studio::ProjectData project;
+    hikari::studio::ProjectModel model;
+    model.path = "models/coat.pmx";
+    model.name = "Coat";
+    hikari::studio::ProjectMaterialOverride first;
+    first.subset = 3;
+    first.response.specular = {0.11f, 0.12f, 0.13f};
+    first.response.roughness = 0.27f;
+    first.response.emissive = {0.5f, 0.25f, 0.125f};
+    first.response.metallic = 0.9f;
+    first.response.custom_a = 2.5f;
+    first.response.custom_b = -0.5f;
+    first.response.shading_model = static_cast<int>(hikari::gfx::ShadingModel::ClearCoat);
+    hikari::studio::ProjectMaterialOverride second;
+    second.subset = 0;
+    second.response.shading_model = static_cast<int>(hikari::gfx::ShadingModel::Eye);
+    model.materials = {first, second};
+    project.models = {model};
+
+    const QByteArray bytes = hikari::studio::hkp_to_json(project);
+    QString error;
+    const auto parsed = hikari::studio::hkp_from_json(bytes, &error);
+    REQUIRE(parsed.has_value());
+    REQUIRE(error.isEmpty());
+    REQUIRE(parsed->models.size() == 1);
+    const std::vector<hikari::studio::ProjectMaterialOverride>& materials =
+        parsed->models[0].materials;
+    REQUIRE(materials.size() == 2);
+    REQUIRE(materials[0].subset == 3);
+    REQUIRE(materials[0].response.shading_model ==
+            static_cast<int>(hikari::gfx::ShadingModel::ClearCoat));
+    REQUIRE(materials[0].response.specular[2] == Catch::Approx(0.13f));
+    REQUIRE(materials[0].response.roughness == Catch::Approx(0.27f));
+    REQUIRE(materials[0].response.emissive[1] == Catch::Approx(0.25f));
+    REQUIRE(materials[0].response.metallic == Catch::Approx(0.9f));
+    REQUIRE(materials[0].response.custom_a == Catch::Approx(2.5f));
+    REQUIRE(materials[0].response.custom_b == Catch::Approx(-0.5f));
+    REQUIRE(materials[1].subset == 0);
+    REQUIRE(materials[1].response.shading_model ==
+            static_cast<int>(hikari::gfx::ShadingModel::Eye));
+
+    // The enum travels as a stable name, so the payload carries the name and not
+    // the number.
+    REQUIRE(bytes.contains("\"coat\""));
+}
+
+TEST_CASE("An unknown shading model name falls back to the default", "[project]") {
+    const QByteArray bytes = R"({
+        "format": "hikari-project",
+        "version": 1,
+        "models": [{
+            "path": "future.pmx",
+            "name": "Future",
+            "materials": [{"subset": 2, "shading_model": "unobtainium", "roughness": 0.4}]
+        }]
+    })";
+    QString error;
+    const auto parsed = hikari::studio::hkp_from_json(bytes, &error);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->models.size() == 1);
+    REQUIRE(parsed->models[0].materials.size() == 1);
+    REQUIRE(parsed->models[0].materials[0].subset == 2);
+    REQUIRE(parsed->models[0].materials[0].response.shading_model == 0);
+    REQUIRE(parsed->models[0].materials[0].response.roughness == Catch::Approx(0.4f));
+}
+
 TEST_CASE("Old HKP files without model rotation load as identity", "[project]") {
     const QByteArray bytes = R"({
         "format": "hikari-project",
@@ -212,4 +279,6 @@ TEST_CASE("Old HKP files without model rotation load as identity", "[project]") 
     REQUIRE(parsed->models.size() == 1);
     REQUIRE(parsed->models[0].rotation.w == Catch::Approx(1.0f));
     REQUIRE(parsed->models[0].rotation.x == Catch::Approx(0.0f));
+    // No materials array means no overrides, not an error.
+    REQUIRE(parsed->models[0].materials.empty());
 }

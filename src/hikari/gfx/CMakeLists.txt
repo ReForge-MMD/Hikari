@@ -5,12 +5,15 @@ add_library(hikari_gfx STATIC
   gbuffer.cpp
   ibl.cpp
   material.cpp
+  material_import.cpp
+  material_presets.cpp
   renderer.cpp
   settings.cpp
   shader_library.cpp
   sky.cpp
   sky_assets.cpp
   target_pool.cpp
+  toon_ramp.cpp
 )
 
 target_link_libraries(hikari_gfx

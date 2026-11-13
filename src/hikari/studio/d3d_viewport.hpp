@@ -20,6 +20,7 @@
 #include "hikari/render/camera.hpp"
 #include "hikari/render/scene_renderer.hpp"
 #include "hikari/studio/app_state.hpp"
+#include "hikari/studio/material_section.hpp"
 #include "hikari/studio/model_instance.hpp"
 #include "hikari/studio/project_io.hpp"
 #include "hikari/video/video_encoder.hpp"
@@ -120,6 +121,17 @@ public:
     int model_count() const { return static_cast<int>(models_.size()); }
     int active_model_index() const { return active_model_; }
     QStringList model_names() const;
+
+    // Materials dock: per-subset response overrides of one loaded model. The
+    // response replaces the shading model and the PBR response; the authored
+    // colour, edge ink and texture slots stay with the PMX material.
+    std::vector<MaterialSubsetEntry> material_subsets(int model_index) const;
+    void set_material_shading_model(int model_index, int subset, int shading_model);
+    void apply_material_preset(int model_index, int subset, int preset_index);
+    void clear_material_override(int model_index, int subset);
+    // Imports a Ray-MMD material file as the subset override and reports which
+    // parameters converted. The file is parsed, never executed.
+    gfx::ImportReport import_ray_mmd(int model_index, int subset, const QString& path);
     const animation::Skeleton* skeleton() const;
     const physics::PhysicsRig* physics_rig() const;
     int vertex_count() const { return vertex_count_; }

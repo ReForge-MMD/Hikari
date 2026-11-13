@@ -24,6 +24,8 @@ cbuffer MaterialParams : register(b1) {
     float4 EmissiveMetallic;
     float4 CustomData; // customA, customB, visibility, packed shading model/flags
     float4 UvTransform; // scale xy, offset zw
+    float4 EdgeColorSize; // rgb outline ink, a PMX edge size in model units
+    float4 PmxParams; // sphere map mode, toon ramp slice, unused, unused
 };
 
 StructuredBuffer<float4> BoneRows : register(t8);
@@ -101,6 +103,21 @@ cbuffer AoSsrGiParams : register(b6) {
     float4 VxgiParams1; // voxel_size, inv_range, grid_dim, num_cones
 };
 
+// Phase 7 material globals. These are the per-feature settings that are not a
+// material property: they scale or switch a shading model for the whole scene.
+cbuffer SurfaceParams : register(b8) {
+    float4 SkinParams0;    // backlit strength, backlit g, backlit ior, sss mfp scale
+    float4 SkinParams1;    // spec lobe0 scale, lobe0 add, lobe1 scale, lobe1 add
+    float4 SkinParams2;    // lobe0 mix, lobe1 mix, unused, unused
+    float4 ToonParams0;    // shadow mul rgb, shadow hue degrees
+    float4 ToonParams1;    // shadow add rgb, autotint threshold
+    float4 ToonParams2;    // autotint colour rgb, autotint strength
+    float4 ToonParams3;    // self shadow power, rim strength, rim power, toon enable
+    float4 GlassParams0;   // caustics intensity, water surface y, ior, outline width
+    float4 GlassParams1;   // absorption rgb per metre, dispersion
+    float4 OutlineColor;   // rgb ink colour for the edge detector, a unused
+};
+
 // Phase 5 half-resolution chains. A register is reused across passes because
 // each pass has its own shader and bindings: t21 is the raw SSR trace while the
 // resolve runs and the resolved colour when lighting reads it.
@@ -110,8 +127,14 @@ Texture2D GiTex : register(t22);
 Texture3D<float4> VxgiRadianceLightingTex : register(t23);
 Texture2D SsrBlur0Tex : register(t23);
 Texture2D BlurSourceTex : register(t24);
+// Lit scene copy made before the fog composite. Alpha holds the scene depth.
+Texture2D FogSceneTex : register(t26);
 // Hierarchical Z-Buffer depth pyramid covering all mip levels, used by the Hi-Z SSR trace.
 Texture2D HzbTex : register(t25);
+// PMX sphere map, sampled by the G-buffer pass with the view-space normal as UV.
+Texture2D SphereMapTex : register(t28);
+// PMX toon ramps, one slice per ramp. The lighting pass samples it along NoL.
+Texture2DArray ToonRampTex : register(t29);
 RWTexture2D<float4> GiOutUAV : register(u0);
 RWTexture2D<float4> GiHistoryUAV : register(u2);
 
@@ -216,6 +239,73 @@ RWTexture3D<float4> VxgiRadianceMipUav : register(u0);
 #endif
 #ifndef SSGI_SPECULAR_GI
 #define SSGI_SPECULAR_GI 0
+#endif
+// Phase 7 material features. OUTLINE_MODE 0 is off, 1 and 2 are inverted hull
+// passes, 3 is the depth and normal edge detector.
+#ifndef OUTLINE_MODE
+#define OUTLINE_MODE 0
+#endif
+#ifndef OUTLINE_WIDTH_PIXELS
+#define OUTLINE_WIDTH_PIXELS 2.0
+#endif
+#ifndef OUTLINE_DEPTH_THRESHOLD
+#define OUTLINE_DEPTH_THRESHOLD 0.02
+#endif
+#ifndef OUTLINE_NORMAL_THRESHOLD
+#define OUTLINE_NORMAL_THRESHOLD 0.35
+#endif
+#ifndef GLASS_REFRACTION
+#define GLASS_REFRACTION 0
+#endif
+// Virtual slab depth the refracted ray is integrated over, in metres. A real
+// sheet is millimetres thick and its displacement is sub-pixel at chart
+// distance, so the refraction uses an artistic thickness that stays visible
+// while the Beer-Lambert tint integrates over the same path.
+#ifndef GLASS_THICKNESS
+#define GLASS_THICKNESS 0.9
+#endif
+// Upper bound on the refracted sample offset in screen space. A grazing ray
+// would otherwise land far outside the sheet, which shows the backdrop through
+// a rim instead of the scene behind the glass.
+#ifndef GLASS_MAX_OFFSET
+#define GLASS_MAX_OFFSET 0.020
+#endif
+#ifndef BRDF_CLOTH_VIS_CHARLIE
+#define BRDF_CLOTH_VIS_CHARLIE 1
+#endif
+#ifndef SKIN_BACKLIT
+#define SKIN_BACKLIT 0
+#endif
+// Separable subsurface diffusion: SSSS_QUALITY 0 is off, 1 diffuses the lit
+// skin colour, SSSS_TEXSPACE follows the surface instead of the screen axes.
+#ifndef SSSS_QUALITY
+#define SSSS_QUALITY 0
+#endif
+#ifndef SSSS_TEXSPACE
+#define SSSS_TEXSPACE 0
+#endif
+#ifndef SSSS_DIR
+#define SSSS_DIR 0
+#endif
+#ifndef SSSS_RADIUS_PIXELS
+#define SSSS_RADIUS_PIXELS 6.0
+#endif
+#ifndef SSSS_STRENGTH
+#define SSSS_STRENGTH 0.55
+#endif
+#ifndef SSSS_DEPTH_TOLERANCE
+#define SSSS_DEPTH_TOLERANCE 0.35
+#endif
+#ifndef TOON_ENABLE
+#define TOON_ENABLE 0
+#endif
+// Half-width of the toon band edge in NoL units. Zero keeps a hard step; the
+// renderer derives it from toon.diffusion_quality.
+#ifndef TOON_RAMP_WIDTH
+#define TOON_RAMP_WIDTH 0.0
+#endif
+#ifndef WATER_CAUSTICS_ENABLE
+#define WATER_CAUSTICS_ENABLE 0
 #endif
 #ifndef GI_BOUNCES
 #define GI_BOUNCES 0
@@ -336,6 +426,34 @@ float pack_shading_model(int model, int flags) {
     return float(model) + float(flags) / 256.0f;
 }
 
+// PMX sphere map lookup: the map is a matcap indexed by the view-space normal,
+// so it follows the camera instead of the surface. v is flipped because the
+// texture origin is the top-left corner while view-space y points up.
+float2 sphere_map_uv(float3 normal_world) {
+    const float3 view_normal = normalize(mul(float4(normal_world, 0.0f), View).xyz);
+    return float2(view_normal.x, -view_normal.y) * 0.5f + 0.5f;
+}
+
+// Applies the authored sphere map to the albedo. Mode 1 multiplies, mode 2 adds,
+// and mode 3 adds the map modulated by the base texture sampled with the same
+// matcap UV. Any other mode leaves the albedo as authored.
+float3 pmx_sphere_modulate(float3 base_linear, float3 normal_world) {
+    const float sphere_mode = PmxParams.x;
+    if (sphere_mode < 0.5f) {
+        return base_linear;
+    }
+    const float2 sphere_uv = sphere_map_uv(normal_world);
+    const float3 sphere = SphereMapTex.Sample(LinearSampler, sphere_uv).rgb;
+    if (sphere_mode < 1.5f) {
+        return base_linear * sphere;
+    }
+    if (sphere_mode < 2.5f) {
+        return base_linear + sphere;
+    }
+    const float3 sub = srgb_to_linear(DiffuseMap.Sample(LinearSampler, sphere_uv).rgb);
+    return base_linear + sub * sphere;
+}
+
 GBufferOut GBufferPS(VSOut input) {
     GBufferOut output;
     const float4 texel = DiffuseMap.Sample(LinearSampler, input.uv);
@@ -343,13 +461,16 @@ GBufferOut GBufferPS(VSOut input) {
     if (alpha < 0.02f) {
         discard;
     }
-    const float3 base_linear = srgb_to_linear(texel.rgb) * BaseColor.rgb;
     const float3 normal = normalize(input.normal_world);
+    const float3 base_linear =
+        pmx_sphere_modulate(srgb_to_linear(texel.rgb) * BaseColor.rgb, normal);
 
     output.gb0 = float4(base_linear, alpha);
     output.gb1 = float4(encode_octahedral(normal), SpecularRoughness.a, EmissiveMetallic.a);
     output.gb2 = float4(SpecularRoughness.rgb, CustomData.x);
-    output.gb3 = float4(CustomData.y, CustomData.y, CustomData.y, CustomData.z);
+    // GB3.g carries the PMX toon ramp slice; GB3.rb stay the replicated
+    // CustomData.y the shading models read as their second free float.
+    output.gb3 = float4(CustomData.y, PmxParams.y, CustomData.y, CustomData.z);
     output.gb4 = float4(EmissiveMetallic.rgb, CustomData.w);
     return output;
 }
@@ -379,6 +500,41 @@ float4 ShadowPS(VSOut input) : SV_Target {
         discard;
     }
     return float4(0.0f, 0.0f, 0.0f, 1.0f);
+}
+
+// Inverted hull outline. The shell is pushed along the skinned normal by the
+// per-material PMX edge size plus a screen-space minimum width, and it is drawn
+// with front faces culled so only the silhouette survives the depth test.
+VSOut OutlineVS(VSIn input) {
+    VSOut output;
+    const float total_weight = input.bone_weights.x + input.bone_weights.y +
+                               input.bone_weights.z + input.bone_weights.w;
+    const float4 weights = (total_weight > 0.0001f)
+                               ? (input.bone_weights / total_weight)
+                               : float4(1.0f, 0.0f, 0.0f, 0.0f);
+    const float4x4 skin = load_bone(input.bone_indices.x) * weights.x +
+                          load_bone(input.bone_indices.y) * weights.y +
+                          load_bone(input.bone_indices.z) * weights.z +
+                          load_bone(input.bone_indices.w) * weights.w;
+    const float4 pos_world = mul(float4(input.position, 1.0f), skin);
+    const float3 normal_world = normalize(mul(float4(input.normal, 0.0f), skin).xyz);
+    // OUTLINE_MODE 2 ignores the per-material size and uses one uniform width,
+    // which is what a scene wants when the model has no authored edge sizes.
+    const float authored = (OUTLINE_MODE == 2) ? 0.0f : EdgeColorSize.a;
+    const float view_distance = length(pos_world.xyz - CameraPos.xyz);
+    // World size of one pixel at this depth, from the vertical field of view.
+    const float pixel_world = view_distance * 2.0f /
+                              max(Params1.z, 1.0f) * (1.0f / max(Params2.y, 1.0e-4f));
+    const float offset = authored * GlassParams0.w + OUTLINE_WIDTH_PIXELS * pixel_world;
+    output.pos_world = pos_world.xyz + normal_world * offset;
+    output.normal_world = normal_world;
+    output.uv = input.uv * UvTransform.xy + UvTransform.zw;
+    output.pos_clip = mul(float4(output.pos_world, 1.0f), ViewProjection);
+    return output;
+}
+
+float4 OutlinePS(VSOut input) : SV_Target {
+    return float4(EdgeColorSize.rgb, 1.0f);
 }
 
 float4 SkyHeightPS(VSOut input) : SV_Target {
@@ -462,6 +618,34 @@ float linear_view_depth(float depth_value) {
     }
     return (Params0.x * Params0.y) /
            max(Params0.y - depth_value * (Params0.y - Params0.x), 1.0e-6f);
+}
+
+// Mode 3: depth and normal discontinuity detection over the opaque G-buffer.
+// The result is blended over the lit image, so no extra colour target is needed.
+float4 OutlineEdgePS(FSOut input) : SV_Target {
+    const float2 texel = 1.0f / float2(Params1.y, Params1.z);
+    const float center_depth = linear_view_depth(DepthTex.SampleLevel(PointSampler, input.uv, 0).r);
+    const float3 center_normal = decode_octahedral(GB1Tex.SampleLevel(PointSampler, input.uv, 0).xy);
+    const float2 offsets[4] = {float2(texel.x, 0.0f), float2(-texel.x, 0.0f),
+                               float2(0.0f, texel.y), float2(0.0f, -texel.y)};
+    float depth_edge = 0.0f;
+    float normal_edge = 0.0f;
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        const float2 uv = input.uv + offsets[i];
+        const float sample_depth = linear_view_depth(DepthTex.SampleLevel(PointSampler, uv, 0).r);
+        const float3 sample_normal = decode_octahedral(GB1Tex.SampleLevel(PointSampler, uv, 0).xy);
+        // Relative depth jump keeps the threshold scale independent.
+        depth_edge = max(depth_edge, abs(sample_depth - center_depth) /
+                                        max(center_depth, 0.05f));
+        normal_edge = max(normal_edge, 1.0f - saturate(dot(sample_normal, center_normal)));
+    }
+    const float ink = step(OUTLINE_DEPTH_THRESHOLD, depth_edge) +
+                      step(OUTLINE_NORMAL_THRESHOLD, normal_edge);
+    if (ink <= 0.0f || center_depth <= 0.0f) {
+        discard;
+    }
+    return float4(OutlineColor.rgb, saturate(ink));
 }
 
 int choose_cascade(float view_z) {
@@ -3601,6 +3785,447 @@ void GiTemporalCS(uint3 tid : SV_DispatchThreadID) {
     GiHistoryUAV[tid.xy] = float4(denoised, z_center);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 7 shared surface library.
+//
+// All eleven shading models evaluate in this one lighting pass. The model
+// integer is the whole part of GB4.a, so the deferred shader selects a surface
+// function per pixel instead of compiling a full shader per material. Every
+// model fills the same lobe struct, which keeps the sun, sky, IBL, AO, GI, and
+// emission composites in LightingPS identical for every material.
+//
+// Ported math: GGX D/V and Schlick Fresnel follow Filament (Apache-2.0) and
+// Burley's physically based shading notes. Charlie NDF and Neubelt visibility
+// follow Filament's cloth model, itself from Neubelt and Pettineo 2013.
+// ---------------------------------------------------------------------------
+
+#define SHADING_MODEL_DEFAULT 0
+#define SHADING_MODEL_SKIN 1
+#define SHADING_MODEL_EMISSIVE 2
+#define SHADING_MODEL_ANISOTROPY 3
+#define SHADING_MODEL_GLASS 4
+#define SHADING_MODEL_CLOTH 5
+#define SHADING_MODEL_CLEARCOAT 6
+#define SHADING_MODEL_SUBSURFACE 7
+#define SHADING_MODEL_CEL 8
+#define SHADING_MODEL_TONEBASED 9
+#define SHADING_MODEL_EYE 10
+
+// Per-model defaults. CustomData.xy carry the two free floats a PMX material
+// cannot express; a zero there means "use the model default", because a zero
+// weight would switch off the very feature the model exists for.
+#define SURFACE_COAT_WEIGHT 0.70f
+#define SURFACE_COAT_ROUGHNESS 0.12f
+#define SURFACE_ANISO_STRENGTH 0.60f
+#define SURFACE_CEL_THRESHOLD 0.50f
+
+struct SurfaceInput {
+    float3 base;
+    float3 n;
+    float3 v;
+    float3 l;
+    float3 h;
+    float roughness;
+    float specular_roughness;
+    float metallic;
+    float3 specular;
+    float3 f0;
+    float3 fresnel;
+    float3 emissive;
+    float no_l;
+    float no_v;
+    float no_h;
+    // PMX toon ramp slice, 0 when the material has no ramp.
+    int toon_slice;
+    float4 custom; // customA, customB, visibility, packed model/flags
+};
+
+struct SurfaceLobes {
+    float3 albedo;       // diffuse albedo for ambient, GI, and multi-bounce
+    float3 diffuse;      // diffuse BRDF, excluding the NoL factor
+    float3 specular;     // specular BRDF, excluding the NoL factor
+    float3 emission;     // additive emission, replaces the raw GB4.rgb term
+    float3 backlight;    // two-sided transmission, gated by the surface facing
+    float diffuse_no_l;  // NoL factor of the diffuse lobe, wrapped or banded
+    float ao_scale;      // 0 bypasses ambient occlusion for this surface
+};
+
+float3 specular_ggx(float3 fresnel, float no_h, float no_v, float no_l, float roughness) {
+    const float d = D_GGX(no_h, roughness);
+    const float vis = V_SmithGGXCorrelated(max(no_v, 1.0e-4f), max(no_l, 1.0e-4f), roughness);
+    return d * vis * fresnel;
+}
+
+SurfaceLobes surface_default(SurfaceInput s) {
+    SurfaceLobes o;
+    o.albedo = s.base * (1.0f - s.metallic);
+#if DIFFUSE_BRDF_TYPE == 0
+    o.diffuse = diffuse_burley(o.albedo, s.no_l, s.no_v, s.roughness);
+#else
+    o.diffuse = diffuse_eon(o.albedo, s.n, s.l, s.v, s.no_l, s.no_v, s.roughness);
+#endif
+    o.specular = specular_ggx(s.fresnel, s.no_h, s.no_v, s.no_l, s.specular_roughness);
+    o.emission = s.emissive;
+    o.backlight = float3(0.0f, 0.0f, 0.0f);
+    o.diffuse_no_l = s.no_l;
+    o.ao_scale = 1.0f;
+    return o;
+}
+
+// Skin: wrapped diffuse pushes the terminator past the geometric horizon, the
+// dual specular lobe separates the tight surface sheen from the broad dermal
+// scatter, and the dermal tint keeps the red channel alive in the shadow side.
+// The two specular lobes are the SKIN_SPEC_* controls from the settings.
+float henyey_greenstein(float cos_theta, float g) {
+    // Normalised phase function of the dermal scatter. g is the mean cosine of
+    // the scattering angle; skin scatters forward, so g stays positive.
+    const float gg = g * g;
+    const float denom = 1.0f + gg - 2.0f * g * cos_theta;
+    return (1.0f - gg) / (4.0f * PI * max(denom * sqrt(max(denom, 1.0e-6f)), 1.0e-6f));
+}
+
+SurfaceLobes surface_skin(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float wrap = 0.5f;
+    o.diffuse_no_l = saturate((s.no_l + wrap) / (1.0f + wrap));
+    const float3 skin_f0 = s.f0 * SkinParams1.x + SkinParams1.y * 0.04f;
+    const float3 skin_fresnel = F_Schlick(saturate(dot(s.h, s.v)), skin_f0);
+    const float3 tight = specular_ggx(skin_fresnel, s.no_h, s.no_v, s.no_l,
+                                      max(s.specular_roughness, 0.04f)) *
+                         SkinParams1.x;
+    const float3 broad = specular_ggx(skin_fresnel, s.no_h, s.no_v, s.no_l,
+                                      min(s.specular_roughness * 1.7f, 1.0f)) *
+                         SkinParams1.z;
+    o.specular = tight * SkinParams2.x + broad * SkinParams2.y;
+    // The dermal mask keeps the diffuse response red-shifted, which is what the
+    // subdermal layer of real skin does with the light it scatters.
+    const float3 dermal = o.albedo * float3(1.0f, 0.72f, 0.66f);
+    o.diffuse = diffuse_burley(dermal, s.no_l, s.no_v, s.roughness);
+#if SKIN_BACKLIT
+    // Backlit transmission: light entering the far side of a thin surface is
+    // refracted through it and leaves toward the eye. The refracted direction
+    // comes from the backlit IOR, and the Henyey-Greenstein phase with
+    // backlit_g weights how much of it reaches the viewer. The phase is
+    // normalised to its forward peak so the setting is a plain strength.
+    if (SkinParams0.x > 0.0f) {
+        const float ior = max(SkinParams0.z, 1.0f);
+        // The eye ray is what crosses the surface: it bends at the front face and
+        // leaves along the refracted view direction. The phase compares that
+        // direction with the way to the light, so a backlit surface is one where
+        // the transmitted ray points at the sun.
+        const float3 through = refract(s.v, -s.n, 1.0f / ior);
+        const float3 forward = (dot(through, through) > 1.0e-6f) ? normalize(through) : -s.v;
+        const float g = saturate(SkinParams0.y);
+        const float phase = henyey_greenstein(saturate(dot(-s.l, forward)), g);
+        const float peak = max(henyey_greenstein(1.0f, g), 1.0e-5f);
+        // Transmission only reads on the side the light passes through, so the
+        // term fades out where the surface already faces the sun.
+        const float gate = saturate(1.0f - s.no_l);
+        // The light also crosses the object, so the path it travels through the
+        // body dims the glow toward the middle: a silhouette is thin, the centre
+        // of a closed surface is the thickest part. No thickness is measured, so
+        // the view cosine stands in for it, and the floor keeps the middle of the
+        // surface glowing instead of punching a hole through it.
+        const float thickness = 0.30f + 0.70f * saturate(1.0f - s.no_v);
+        o.backlight =
+            dermal * SkinParams0.x * (phase / peak) * gate * gate * thickness;
+    }
+#endif
+    return o;
+}
+
+// Emissive: a lamp is not also a diffuse card, so most of the albedo response
+// drops and the emission takes over. CustomData.x scales the emission.
+SurfaceLobes surface_emissive(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float gain = (s.custom.x > 0.0f) ? s.custom.x : 1.0f;
+    o.emission = s.emissive * gain;
+    o.albedo *= 0.25f;
+    o.diffuse *= 0.25f;
+    return o;
+}
+
+// Anisotropic GGX with the Filament tangent-space parameterisation: at and ab
+// stretch the microfacet distribution along and across the tangent.
+float3 specular_anisotropic(float3 fresnel, SurfaceInput s, float3 tangent, float anisotropy) {
+    const float at = max(s.specular_roughness * (1.0f + anisotropy), 0.001f);
+    const float ab = max(s.specular_roughness * (1.0f - anisotropy), 0.001f);
+    const float3 bitangent = cross(s.n, tangent);
+    const float to_h = dot(tangent, s.h);
+    const float bo_h = dot(bitangent, s.h);
+    const float3 local_h = float3(at * to_h, ab * bo_h, s.no_h);
+    const float d = (at * ab) / max(PI * pow(dot(local_h, local_h), 2.0f), 1.0e-7f);
+    const float to_v = dot(tangent, s.v);
+    const float bo_v = dot(bitangent, s.v);
+    const float to_l = dot(tangent, s.l);
+    const float bo_l = dot(bitangent, s.l);
+    const float lambda_v = s.no_l * length(float3(at * to_v, ab * bo_v, s.no_v));
+    const float lambda_l = s.no_v * length(float3(at * to_l, ab * bo_l, s.no_l));
+    const float vis = 0.5f / max(lambda_v + lambda_l, 1.0e-6f);
+    return d * vis * fresnel;
+}
+
+// Anisotropy: deferred lighting has no mesh tangent, so the tangent frame comes
+// from the world up vector rotated by CustomData.y. That matches combed hair and
+// brushed metal whose strands run along one direction per material.
+SurfaceLobes surface_anisotropy(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float strength =
+        (s.custom.x != 0.0f) ? clamp(s.custom.x, -0.95f, 0.95f) : SURFACE_ANISO_STRENGTH;
+    const float3 reference = (abs(s.n.y) < 0.99f) ? float3(0.0f, 1.0f, 0.0f)
+                                                  : float3(1.0f, 0.0f, 0.0f);
+    float3 tangent = normalize(cross(reference, s.n));
+    const float c = cos(s.custom.y);
+    const float sn = sin(s.custom.y);
+    tangent = normalize(tangent * c + cross(s.n, tangent) * sn);
+    o.specular = specular_anisotropic(s.fresnel, s, tangent, strength);
+    return o;
+}
+
+// Glass: a dielectric sheet has almost no diffuse response. The refraction
+// itself needs the scene copy and lives in the forward path, so the deferred
+// lobe is the Fresnel reflection of the same sheet.
+SurfaceLobes surface_glass(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float3 glass_f0 = float3(0.04f, 0.04f, 0.04f);
+    const float3 glass_fresnel = F_Schlick(saturate(dot(s.h, s.v)), glass_f0);
+    o.specular =
+        specular_ggx(glass_fresnel, s.no_h, s.no_v, s.no_l, max(s.specular_roughness, 0.02f));
+    // A sheet of glass has almost no diffuse response, but it must not read as a
+    // hole: 12 percent keeps the silhouette and the tint visible.
+    o.albedo *= 0.12f;
+    o.diffuse *= 0.12f;
+    return o;
+}
+
+float D_Charlie(float no_h, float roughness) {
+    const float alpha = max(roughness * roughness, 1.0e-3f);
+    const float inv_alpha = 1.0f / alpha;
+    const float cos2 = no_h * no_h;
+    const float sin2 = max(1.0f - cos2, 0.0078125f);
+    return (2.0f + inv_alpha) * pow(sin2, inv_alpha * 0.5f) / (2.0f * PI);
+}
+
+float V_Neubelt(float no_v, float no_l) {
+    return saturate(1.0f / (4.0f * (no_l + no_v - no_l * no_v)));
+}
+
+// Cloth: Charlie NDF with a sheen tint that brightens at grazing angles.
+// CustomData.x scales the sheen colour. BRDF_CLOTH_VIS_CHARLIE selects the
+// Neubelt visibility that pairs with Charlie; the alternative is the Smith GGX
+// correlated term, which keeps the sheen wider at the terminator.
+SurfaceLobes surface_cloth(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float3 sheen = (s.custom.x > 0.0f) ? s.specular * s.custom.x : s.specular;
+    const float fresnel = pow(saturate(1.0f - s.no_v), 5.0f);
+    const float3 sheen_fresnel = sheen + (1.0f - sheen) * fresnel;
+#if BRDF_CLOTH_VIS_CHARLIE
+    const float visibility = V_Neubelt(s.no_v, s.no_l);
+#else
+    const float visibility = V_SmithGGXCorrelated(max(s.no_v, 1.0e-4f), max(s.no_l, 1.0e-4f),
+                                                 s.specular_roughness);
+#endif
+    o.specular = D_Charlie(s.no_h, s.specular_roughness) * visibility * sheen_fresnel;
+    return o;
+}
+
+// ClearCoat: a thin dielectric layer over the base surface. The coat keeps its
+// own tight highlight and takes its energy out of the base specular lobe.
+SurfaceLobes surface_clearcoat(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float weight = (s.custom.x > 0.0f) ? saturate(s.custom.x) : SURFACE_COAT_WEIGHT;
+    const float coat_roughness =
+        (s.custom.y > 0.0f) ? saturate(s.custom.y) : SURFACE_COAT_ROUGHNESS;
+    const float3 coat_f0 = float3(0.04f, 0.04f, 0.04f);
+    const float3 coat_fresnel = F_Schlick(saturate(dot(s.h, s.v)), coat_f0);
+    const float3 coat =
+        specular_ggx(coat_fresnel, s.no_h, s.no_v, s.no_l, coat_roughness) * weight;
+    o.specular = o.specular * (1.0f - weight) + coat;
+    return o;
+}
+
+// Subsurface: wrapped diffuse plus two-sided wrapped transmission, so light
+// entering the back face leaves through the front. The backlight term is added
+// directly instead of being gated by the sun shadow: the visible side of a
+// closed mesh is always self-shadowed when the sun is behind it.
+SurfaceLobes surface_subsurface(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float wrap = 1.0f / 3.0f;
+    o.diffuse_no_l = saturate((s.no_l + wrap) / (1.0f + wrap));
+    const float back = saturate(dot(-s.n, s.l));
+    o.backlight = o.albedo * back * 0.5f;
+    return o;
+}
+
+// Toon shadow grading, shared by Cel and ToneBased. The native pipeline has no
+// shadow ramp texture, so the diffusion blur is the width of the band edge
+// itself: TOON_RAMP_WIDTH softens the terminator instead of blurring a ramp
+// lookup, and toon.diffusion_quality sets that width. The graded band is then
+// tinted by the multiplier, the additive lift, and an optional hue rotation,
+// auto-tint pulls dark albedo toward the tint colour, and self-shadow power
+// hardens the terminator before banding.
+float3 toon_rotate_hue(float3 color, float degrees) {
+    const float angle = radians(degrees);
+    const float c = cos(angle);
+    const float sn = sin(angle);
+    const float3 axis = float3(0.577350269f, 0.577350269f, 0.577350269f);
+    return color * c + cross(axis, color) * sn + axis * dot(axis, color) * (1.0f - c);
+}
+
+float3 toon_grade(float3 albedo, float band) {
+    const float3 graded =
+        toon_rotate_hue(albedo * ToonParams0.rgb + ToonParams1.rgb, ToonParams0.w);
+    // The automatic tint only applies where the albedo is darker than the
+    // threshold, so a dark costume keeps its own shadow instead of going muddy.
+    const float albedo_luma = dot(albedo, float3(0.2126f, 0.7152f, 0.0722f));
+    const float dark = saturate((ToonParams1.w - albedo_luma) * 4.0f);
+    const float3 tinted = lerp(graded, ToonParams2.rgb * albedo, dark * ToonParams2.w);
+    return lerp(tinted, albedo, band);
+}
+
+float toon_band(float no_l, float threshold) {
+    // self_power_shadow hardens the NoL terminator before the band is taken, so
+    // the band edge lands where the artist drew it instead of at the cosine.
+    const float shaped = pow(saturate(no_l), 1.0f + max(ToonParams3.x, 0.0f));
+    return step(threshold, shaped);
+}
+
+// PMX toon ramp: the authored row runs from the shadow band at NoL 0 to the lit
+// end at NoL 1, so it replaces the procedural band with the artist's curve.
+float3 toon_ramp_color(float shaped_no_l, int slice) {
+    if (slice <= 0) {
+        return float3(1.0f, 1.0f, 1.0f);
+    }
+    return ToonRampTex.SampleLevel(PointSampler,
+                                   float3(saturate(shaped_no_l), 0.5f, float(slice)), 0).rgb;
+}
+
+// Cel: a two-band ramp on NoL. The diffuse BRDF becomes flat Lambert so the
+// band, not the cosine, sets the level, and the shadow band keeps a floor so a
+// cel material still reads as a lit surface instead of a black silhouette.
+// CustomData.x moves the threshold.
+SurfaceLobes surface_cel(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float threshold = (s.custom.x > 0.0f) ? saturate(s.custom.x) : SURFACE_CEL_THRESHOLD;
+    const float shaped = pow(saturate(s.no_l), 1.0f + max(ToonParams3.x, 0.0f));
+    const float3 ramp = toon_ramp_color(shaped, s.toon_slice);
+    // A PMX ramp already carries the whole terminator, so it replaces both the
+    // band and the graded shadow instead of stacking on top of them.
+    const bool has_ramp = s.toon_slice > 0;
+    const float lit = has_ramp ? dot(ramp, float3(0.2126f, 0.7152f, 0.0722f))
+                               : toon_band(s.no_l, threshold);
+    o.diffuse_no_l = has_ramp ? 1.0f : lerp(0.30f, 1.0f, lit);
+#if TOON_ENABLE > 0
+    o.diffuse = (has_ramp ? o.albedo * ramp : toon_grade(o.albedo, lit)) * (1.0f / PI);
+    // The rim is a back-facing wrap term, so it survives on the shadow side
+    // where the sun highlight is already banded out.
+    const float rim =
+        pow(saturate(1.0f - s.no_v), max(ToonParams3.z, 0.5f)) * ToonParams3.y;
+    o.backlight = o.albedo * rim * (1.0f - lit * 0.5f);
+#else
+    o.diffuse = (has_ramp ? o.albedo * ramp : o.albedo) * (1.0f / PI);
+#endif
+    o.specular *= lit;
+    return o;
+}
+// ToneBased: the same controls as Cel but the ramp is smooth, so the terminator
+// keeps a soft gradient while the shadow side stays lifted.
+SurfaceLobes surface_tonebased(SurfaceInput s) {
+    SurfaceLobes o = surface_default(s);
+    const float shaped = pow(saturate(s.no_l), 1.0f + max(ToonParams3.x, 0.0f));
+    const float3 ramp_color = toon_ramp_color(shaped, s.toon_slice);
+    const bool has_ramp = s.toon_slice > 0;
+#if TOON_ENABLE > 0
+    // The diffusion blur is the width of the ramp edge: a lower diffusion
+    // quality widens the terminator, a higher one tightens it toward a band.
+    const float width = clamp(TOON_RAMP_WIDTH, 0.02f, 0.45f);
+    const float ramp = has_ramp ? dot(ramp_color, float3(0.2126f, 0.7152f, 0.0722f))
+                                : smoothstep(0.5f - width, 0.5f + width, shaped);
+#else
+    const float ramp = has_ramp ? dot(ramp_color, float3(0.2126f, 0.7152f, 0.0722f))
+                                : smoothstep(0.05f, 0.95f, shaped);
+#endif
+    o.diffuse_no_l = has_ramp ? 1.0f : lerp(0.30f, 1.0f, ramp);
+#if TOON_ENABLE > 0
+    o.diffuse = (has_ramp ? o.albedo * ramp_color : toon_grade(o.albedo, ramp)) * (1.0f / PI);
+    const float rim =
+        pow(saturate(1.0f - s.no_v), max(ToonParams3.z, 0.5f)) * ToonParams3.y;
+    o.backlight = o.albedo * rim * (1.0f - ramp * 0.5f);
+#else
+    o.diffuse = (has_ramp ? o.albedo * ramp_color : o.albedo) * (1.0f / PI);
+#endif
+    return o;
+}
+
+// Eye: the cornea carries the highlight as a clear coat, the iris glows when
+// light passes through it at a grazing angle, and ambient occlusion is bypassed
+// because a socket would otherwise darken the sclera into mud.
+SurfaceLobes surface_eye(SurfaceInput s) {
+    SurfaceLobes o = surface_clearcoat(s);
+    const float iris = pow(saturate(1.0f - s.no_v), 3.0f) * saturate(s.no_l + 0.5f);
+    o.emission = s.emissive + s.base * iris * 0.35f;
+    o.ao_scale = 0.0f;
+    return o;
+}
+
+SurfaceLobes eval_surface(int model, SurfaceInput s) {
+    if (model == SHADING_MODEL_SKIN) {
+        return surface_skin(s);
+    }
+    if (model == SHADING_MODEL_EMISSIVE) {
+        return surface_emissive(s);
+    }
+    if (model == SHADING_MODEL_ANISOTROPY) {
+        return surface_anisotropy(s);
+    }
+    if (model == SHADING_MODEL_GLASS) {
+        return surface_glass(s);
+    }
+    if (model == SHADING_MODEL_CLOTH) {
+        return surface_cloth(s);
+    }
+    if (model == SHADING_MODEL_CLEARCOAT) {
+        return surface_clearcoat(s);
+    }
+    if (model == SHADING_MODEL_SUBSURFACE) {
+        return surface_subsurface(s);
+    }
+    if (model == SHADING_MODEL_CEL) {
+        return surface_cel(s);
+    }
+    if (model == SHADING_MODEL_TONEBASED) {
+        return surface_tonebased(s);
+    }
+    if (model == SHADING_MODEL_EYE) {
+        return surface_eye(s);
+    }
+    return surface_default(s);
+}
+
+// Water caustics: sunlight focused by a rippling water surface onto whatever
+// sits under it. The pattern is the ridged interference of two travelling waves
+// projected on the horizontal plane, so it stays deterministic and needs no
+// texture. GlassParams0 holds the intensity, the water height, and the IOR;
+// GlassParams1.w is unused by this term.
+float water_caustic(float3 world_pos) {
+    if (GlassParams0.x <= 0.0f) {
+        return 0.0f;
+    }
+    const float below = GlassParams0.y - world_pos.y;
+    if (below <= 0.0f) {
+        return 0.0f;
+    }
+    const float time = Params0.w;
+    const float2 p = world_pos.xz * 1.7f;
+    const float a = sin(p.x * 1.7f + time * 0.9f) * sin(p.y * 1.9f - time * 0.7f);
+    const float b = sin((p.x + p.y) * 1.3f - time * 1.1f) * sin((p.x - p.y) * 1.5f + time * 0.8f);
+    // Ridged interference makes the thin bright filaments of a real caustic.
+    const float pattern = saturate(1.0f - abs(a + b) * 1.4f);
+    // The focus blurs out as the water gets deeper below the surface.
+    const float depth_fade = saturate(1.0f - below / 2.5f);
+    return pattern * pattern * depth_fade * GlassParams0.x;
+}
+
 float4 LightingPS(FSOut input) : SV_Target {
     const float4 gb0 = GB0Tex.Sample(LinearSampler, input.uv);
     const float4 gb1 = GB1Tex.Sample(LinearSampler, input.uv);
@@ -3720,17 +4345,30 @@ float4 LightingPS(FSOut input) : SV_Target {
         sqrt(specular_roughness * specular_roughness + sin_alpha * sin_alpha);
 #endif
 
-    const float3 diffuse_base = base * (1.0f - metallic);
-#if DIFFUSE_BRDF_TYPE == 0
-    const float3 diffuse = diffuse_burley(diffuse_base, no_l, no_v, roughness);
-#else
-    const float3 diffuse = diffuse_eon(diffuse_base, n, l, v, no_l, no_v, roughness);
-#endif
+    // Phase 7: the shading model is the whole part of GB4.a. One shared library
+    // fills the lobes, so the composites below stay identical for all models.
+    const int shading_model = (int)floor(max(gb4.a, 0.0f));
+    SurfaceInput surface;
+    surface.base = base;
+    surface.n = n;
+    surface.v = v;
+    surface.l = l;
+    surface.h = h;
+    surface.roughness = roughness;
+    surface.specular_roughness = specular_roughness;
+    surface.metallic = metallic;
+    surface.specular = specular;
+    surface.f0 = f0;
+    surface.fresnel = fresnel;
+    surface.emissive = emissive;
+    surface.no_l = no_l;
+    surface.no_v = no_v;
+    surface.no_h = no_h;
+    surface.custom = float4(gb2.a, gb3.r, gb3.a, gb4.a);
+    // GB3.g holds the PMX toon ramp slice the G-buffer pass resolved.
+    surface.toon_slice = (int)round(gb3.g);
+    const SurfaceLobes lobes = eval_surface(shading_model, surface);
 
-    const float d = D_GGX(no_h, specular_roughness);
-    const float vis = V_SmithGGXCorrelated(max(no_v, 1.0e-4f), max(no_l, 1.0e-4f),
-                                           specular_roughness);
-    const float3 specular_term = d * vis * fresnel;
     float sun_limb = 1.0f;
 #if SUN_LIMB_DARKENING
     sun_limb = lerp(0.82f, 1.0f, saturate(no_l));
@@ -3738,6 +4376,7 @@ float4 LightingPS(FSOut input) : SV_Target {
 
     float3 sun_diffuse = float3(0.0f, 0.0f, 0.0f);
     float3 sun_specular = float3(0.0f, 0.0f, 0.0f);
+    float3 sun_backlight = float3(0.0f, 0.0f, 0.0f);
     float4 shadow_mask = float4(1.0f, 1.0f, 1.0f, 0.125f);
 #if SHADOW_MASK_ENABLE
     shadow_mask = ShadowMaskTex.SampleLevel(PointSampler, input.uv, 0);
@@ -3748,10 +4387,22 @@ float4 LightingPS(FSOut input) : SV_Target {
     cloud_shadow = cloud_transmittance(l);
 #endif
 #if SUN_LIGHT_ENABLE != 0
-    sun_diffuse = diffuse * SunColor.rgb * no_l * sun_shadow * cloud_shadow;
-    sun_specular = specular_term * SunColor.rgb * no_l * sun_limb * sun_shadow * cloud_shadow;
+    sun_diffuse =
+        lobes.diffuse * SunColor.rgb * lobes.diffuse_no_l * sun_shadow * cloud_shadow;
+    sun_specular =
+        lobes.specular * SunColor.rgb * no_l * sun_limb * sun_shadow * cloud_shadow;
+    // Transmission crosses the surface, so the shadow of the front face would
+    // always cancel it on a closed mesh. The sun shadow is therefore not applied
+    // to the backlight term; the surface gate keeps it on the far side.
+    sun_backlight = lobes.backlight * SunColor.rgb * cloud_shadow;
     sun_diffuse *= sun_attenuation;
     sun_specular *= sun_attenuation;
+    sun_backlight *= sun_attenuation;
+#if WATER_CAUSTICS_ENABLE
+    // Caustics are focused sunlight, so they belong to the direct term and are
+    // already gated by the sun shadow: no sun, no caustic.
+    sun_diffuse *= 1.0f + water_caustic(world_pos);
+#endif
 #endif
 
     float3 moon_diffuse = float3(0.0f, 0.0f, 0.0f);
@@ -3764,14 +4415,13 @@ float4 LightingPS(FSOut input) : SV_Target {
 #endif
     const float bent_hemi = saturate(bent_n.y * 0.5f + 0.5f);
     const float3 ambient_tint = lerp(float3(0.40f, 0.40f, 0.45f), float3(1.0f, 1.0f, 1.0f), bent_hemi);
-    float3 ambient = AmbientColor.rgb * ambient_tint * base * (1.0f - metallic) * sky_visibility;
+    float3 ambient = AmbientColor.rgb * ambient_tint * lobes.albedo * sky_visibility;
 #if SKY_ENABLE && IBL_QUALITY > 0
     // The captured sky is the ambient term once it exists: the SH9 irradiance
     // replaces the flat placeholder and carries the sky colour and the upward
     // bias. IblParams0.w is sky.ambient_intensity, so the same control scales it.
     const float3 sky_irradiance = max(sh_irradiance(bent_n), float3(0.0f, 0.0f, 0.0f)) * (0.25f / PI);
-    ambient = sky_irradiance * max(IblParams0.w, 0.0f) * base * (1.0f - metallic) *
-              sky_visibility;
+    ambient = sky_irradiance * max(IblParams0.w, 0.0f) * lobes.albedo * sky_visibility;
 #endif
 
     float3 ibl_specular = float3(0.0f, 0.0f, 0.0f);
@@ -3800,6 +4450,11 @@ float4 LightingPS(FSOut input) : SV_Target {
             ao = 1.0f;
         }
         ao = saturate(ao * gb3.a);
+        // The Eye model bypasses occlusion so the sclera stays readable inside
+        // the socket; every other model keeps the full AO term.
+        if (lobes.ao_scale <= 0.0f) {
+            ao = 1.0f;
+        }
         bent_normal = normalize(ao_sample.rgb);
     }
     // Directional specular occlusion from bent normal and roughness (Lagarde & Rousiers / Filament)
@@ -3808,7 +4463,7 @@ float4 LightingPS(FSOut input) : SV_Target {
     ibl_specular *= lerp(spec_occ, 1.0f, roughness * roughness);
 #endif
 #if AO_TYPE == 2
-    ambient *= gtao_multi_bounce(ao, base);
+    ambient *= gtao_multi_bounce(ao, lobes.albedo);
 #else
     ambient *= ao;
 #endif
@@ -3833,8 +4488,9 @@ float4 LightingPS(FSOut input) : SV_Target {
     }
 #endif
 
-    float3 color = sun_diffuse + sun_specular + moon_diffuse + moon_specular + ambient + emissive +
-                   ibl_specular + indirect_diffuse * diffuse_base + indirect_specular;
+    float3 color = sun_diffuse + sun_specular + sun_backlight + moon_diffuse + moon_specular +
+                   ambient + lobes.emission + ibl_specular + indirect_diffuse * lobes.albedo +
+                   indirect_specular;
 #if DEBUG_VIEW == 1
     color = base;
 #elif DEBUG_VIEW == 2
@@ -3932,16 +4588,175 @@ float4 LightingPS(FSOut input) : SV_Target {
     return float4(max(color, 0.0f), 1.0f);
 }
 
+// Refracts the scene copy through one glass fragment. The copy is the lit scene
+// before the fog composite, so the medium tint has to carry the absorption:
+// Beer-Lambert integrates over GLASS_THICKNESS per channel. GLASS_REFRACTION 1
+// offsets the sample by the analytic lateral displacement of the refracted ray;
+// 2 solves the displacement against the scene depth it actually samples with
+// damped Newton steps, so a curved sheet lands on what it really shows.
+float3 glass_refracted_color(float2 screen_uv, float view_depth, float3 v, float3 n, float ior) {
+    const float eta = 1.0f / max(ior, 1.0f);
+    float3 refracted = refract(-v, n, eta);
+    if (dot(refracted, refracted) < 1.0e-6f) {
+        // Total internal reflection has no transmitted ray; the sheet reflects.
+        refracted = reflect(-v, n);
+    }
+    const float3 view_ray = mul(float4(refracted, 0.0f), View).xyz;
+    const float2 ndc = float2(Params2.x, Params2.y) * (view_ray.xy / max(view_ray.z, 1.0e-3f));
+    const float2 delta = ndc * float2(0.5f, -0.5f);
+#if GLASS_REFRACTION > 0
+    // The offset is bounded in screen space: an unbounded grazing displacement
+    // samples the backdrop far outside the sheet and turns the rim into a ring.
+    const float2 offset = delta * (GLASS_THICKNESS / max(view_depth, 0.25f));
+    const float offset_length = length(offset);
+    const float2 bounded =
+        (offset_length > GLASS_MAX_OFFSET) ? offset * (GLASS_MAX_OFFSET / offset_length)
+                                           : offset;
+    float2 uv = saturate(screen_uv + bounded);
+#if GLASS_REFRACTION >= 2
+    // f(uv) = uv - screen_uv - delta * thickness / depth(uv). The copy carries
+    // the scene depth in alpha, so the solve needs no second depth binding. The
+    // Jacobian is approximated by the identity, which makes each step damped.
+    [unroll] for (int step_index = 0; step_index < 3; ++step_index) {
+        const float scene_depth = max(FogSceneTex.SampleLevel(PointSampler, uv, 0).a, 0.25f);
+        const float2 target = screen_uv + delta * (GLASS_THICKNESS / scene_depth);
+        const float target_length = length(target - screen_uv);
+        const float2 target_bounded =
+            (target_length > GLASS_MAX_OFFSET)
+                ? screen_uv + (target - screen_uv) * (GLASS_MAX_OFFSET / target_length)
+                : target;
+        uv = saturate(uv + (target_bounded - uv) * 0.5f);
+    }
+#endif
+#else
+    // Refraction off keeps the sheet transparent and tinted but does not bend
+    // what is behind it, which is the cheap look for distant or tiny glass.
+    const float2 uv = screen_uv;
+#endif
+    return max(FogSceneTex.SampleLevel(LinearSampler, uv, 0).rgb, 0.0f);
+}
+
+float3 glass_forward_color(VSOut input, float3 base, float3 n) {
+    const float3 v = normalize(CameraPos.xyz - input.pos_world);
+    const float no_v = saturate(dot(n, v));
+    const float2 screen_uv =
+        input.pos_clip.xy * float2(1.0f / max(Params1.y, 1.0f), 1.0f / max(Params1.z, 1.0f));
+    const float view_depth = linear_view_depth(input.pos_clip.z);
+    const float ior = max(GlassParams0.z, 1.0f);
+    const float3 absorption = max(GlassParams1.rgb, float3(0.0f, 0.0f, 0.0f));
+    const float dispersion = saturate(GlassParams1.w);
+
+    float3 refracted;
+    if (dispersion <= 1.0e-4f) {
+        refracted = glass_refracted_color(screen_uv, view_depth, v, n, ior);
+    } else {
+        // Chromatic dispersion: red bends least and blue bends most around the
+        // nominal index, so each channel samples its own ray.
+        const float3 ior_rgb = ior * float3(1.0f - dispersion, 1.0f, 1.0f + dispersion);
+        refracted = float3(glass_refracted_color(screen_uv, view_depth, v, n, ior_rgb.r).r,
+                           glass_refracted_color(screen_uv, view_depth, v, n, ior_rgb.g).g,
+                           glass_refracted_color(screen_uv, view_depth, v, n, ior_rgb.b).b);
+    }
+    const float3 transmittance = exp(-absorption * GLASS_THICKNESS);
+    // Fresnel of the dielectric sheet: the reflection is the prefiltered sky and
+    // the sun glint, the transmission is the scene copy behind it.
+    const float f0 = pow((ior - 1.0f) / (ior + 1.0f), 2.0f);
+    const float fresnel = f0 + (1.0f - f0) * pow(saturate(1.0f - no_v), 5.0f);
+    const float3 reflected_ray = reflect(-v, n);
+    float3 reflection = max(SkyPrefilterTex.SampleLevel(SkySampler, ibl_direction(reflected_ray), 0).rgb,
+                            0.0f) *
+                        max(IblParams0.x, 0.0f) * 0.5f;
+    reflection += SunColor.rgb * pow(saturate(dot(n, normalize(v + normalize(-SunDirection.xyz)))), 128.0f) * 6.0f;
+    return lerp(refracted * transmittance, reflection + base * 0.02f, fresnel);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 screen-space subsurface diffusion. Two separable passes diffuse the
+// lit colour of the scattering models; the mask comes from the shading model in
+// GB4.a and the depth gate stops the blur from leaking across a silhouette.
+// SSSS_TEXSPACE swaps the screen axes for the surface tangent and bitangent, so
+// the falloff follows the surface instead of the pixel grid.
+// ---------------------------------------------------------------------------
+
+float sss_scatter_mask(float4 gb4) {
+    const int model = (int)floor(max(gb4.a, 0.0f));
+    return (model == SHADING_MODEL_SKIN || model == SHADING_MODEL_SUBSURFACE) ? 1.0f : 0.0f;
+}
+
+float2 sss_diffusion_axis(float3 n) {
+#if SSSS_TEXSPACE
+    const float3 reference = (abs(n.y) < 0.99f) ? float3(0.0f, 1.0f, 0.0f)
+                                                : float3(1.0f, 0.0f, 0.0f);
+    const float3 tangent = normalize(cross(reference, n));
+    const float3 bitangent = cross(n, tangent);
+    const float3 axis = (SSSS_DIR == 0) ? tangent : bitangent;
+    const float2 projected = mul(float4(axis, 0.0f), View).xy;
+    const float length_sq = dot(projected, projected);
+    return (length_sq > 1.0e-6f) ? projected * rsqrt(length_sq) : float2(1.0f, 0.0f);
+#else
+    return (SSSS_DIR == 0) ? float2(1.0f, 0.0f) : float2(0.0f, 1.0f);
+#endif
+}
+
+float4 SssDiffusionPS(FSOut input) : SV_Target {
+    const float2 texel = 1.0f / float2(Params1.y, Params1.z);
+    const float4 center_gb4 = GB4Tex.SampleLevel(PointSampler, input.uv, 0);
+    const float center_mask = sss_scatter_mask(center_gb4);
+    const float3 center_normal = decode_octahedral(GB1Tex.SampleLevel(PointSampler, input.uv, 0).xy);
+    const float2 axis = sss_diffusion_axis(normalize(center_normal));
+    const float center_depth =
+        linear_view_depth(DepthTex.SampleLevel(PointSampler, input.uv, 0).r);
+
+    const float radius = max(SSSS_RADIUS_PIXELS, 0.5f);
+    float3 accum = BlurSourceTex.SampleLevel(LinearSampler, input.uv, 0).rgb;
+    float weight_sum = 1.0f;
+    [unroll]
+    for (int i = -4; i <= 4; ++i) {
+        if (i == 0) {
+            continue;
+        }
+        const float2 sample_uv =
+            saturate(input.uv + axis * texel * (float(i) * radius * 0.25f));
+        const float4 gb4 = GB4Tex.SampleLevel(PointSampler, sample_uv, 0);
+        const float sample_mask = sss_scatter_mask(gb4);
+        const float sample_depth =
+            linear_view_depth(DepthTex.SampleLevel(PointSampler, sample_uv, 0).r);
+        // The depth gate keeps the diffusion inside one surface: a neighbour on
+        // another body must not bleed in, which would smear the silhouette.
+        const float depth_gate =
+            saturate(1.0f - abs(sample_depth - center_depth) / max(SSSS_DEPTH_TOLERANCE, 1.0e-3f));
+        const float weight = exp(-0.5f * (float(i) * 0.5f) * (float(i) * 0.5f)) *
+                             sample_mask * depth_gate;
+        accum += BlurSourceTex.SampleLevel(LinearSampler, sample_uv, 0).rgb * weight;
+        weight_sum += weight;
+    }
+    return float4(accum / max(weight_sum, 1.0e-4f), center_mask);
+}
+
+// Blends the diffused colour back over the lit image. The pass draws with alpha
+// blending instead of sampling Hdr, because a pass cannot read the target it
+// writes. Alpha carries the scattering mask, so every other material keeps the
+// exact lighting it had.
+float4 SssCompositePS(FSOut input) : SV_Target {
+    const float4 diffused = BlurSourceTex.SampleLevel(LinearSampler, input.uv, 0);
+    return float4(max(diffused.rgb, 0.0f), saturate(diffused.a) * SSSS_STRENGTH);
+}
+
 float4 ForwardPS(VSOut input) : SV_Target {
     const float4 texel = DiffuseMap.Sample(LinearSampler, input.uv);
     const float alpha = texel.a * BaseColor.a;
     if (alpha < 0.01f) {
         discard;
     }
-    const float3 base = srgb_to_linear(texel.rgb) * BaseColor.rgb;
     const float3 n = normalize(input.normal_world);
+    const float3 base = pmx_sphere_modulate(srgb_to_linear(texel.rgb) * BaseColor.rgb, n);
     const float3 l = normalize(-SunDirection.xyz);
     const float no_l = saturate(dot(n, l));
+    // Glass always resolves through the forward path, because a sheet is
+    // transparent by definition and its look depends on the scene behind it.
+    if ((int)floor(max(CustomData.w, 0.0f)) == SHADING_MODEL_GLASS) {
+        return float4(max(glass_forward_color(input, base, n), 0.0f), alpha);
+    }
     const float3 color = base * (AmbientColor.rgb + SunColor.rgb * no_l * 0.75f) +
                          EmissiveMetallic.rgb;
     return float4(color, alpha);
@@ -4311,7 +5126,8 @@ cbuffer FogParams : register(b7) {
 
 // The composite cannot read Hdr while it writes it, so it resolves the fog over
 // the copy FogCopyPS made. FogDebug is the RGBA8 channel view of the volume.
-Texture2D FogSceneTex : register(t26);
+// FogSceneTex is declared with the shared targets because the glass refraction
+// in the forward pass reads the same copy.
 Texture2D FogDebugTex : register(t27);
 
 #ifndef FOG_ENABLE
@@ -4622,7 +5438,12 @@ float4 FogBlurPS(FSOut input) : SV_Target {
 }
 
 float4 FogCopyPS(FSOut input) : SV_Target {
-    return float4(HdrTex.SampleLevel(PointSampler, input.uv, 0).rgb, 1.0f);
+    const float3 scene = HdrTex.SampleLevel(PointSampler, input.uv, 0).rgb;
+    // Alpha carries the linear view depth of the copied pixel. The glass
+    // refraction solves its ray against that depth, and it cannot read DepthTex
+    // while the transparent pass holds it as the depth-stencil.
+    const float depth_value = DepthTex.SampleLevel(PointSampler, input.uv, 0).r;
+    return float4(scene, linear_view_depth(depth_value));
 }
 
 float4 FogCompositePS(FSOut input) : SV_Target {

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string_view>
 
 namespace hikari::studio {
 namespace {
@@ -466,6 +467,25 @@ QByteArray hkp_to_json(const ProjectData& project) {
         item[QStringLiteral("rotation")] = to_json(model.rotation.to_array());
         item[QStringLiteral("scale")] = model.scale;
         item[QStringLiteral("visible")] = model.visible;
+        if (!model.materials.empty()) {
+            QJsonArray materials;
+            for (const ProjectMaterialOverride& entry : model.materials) {
+                QJsonObject material;
+                material[QStringLiteral("subset")] = entry.subset;
+                const std::string_view model_name =
+                    gfx::shading_model_name(entry.response.shading_model);
+                material[QStringLiteral("shading_model")] =
+                    QString::fromUtf8(model_name.data(), static_cast<int>(model_name.size()));
+                material[QStringLiteral("specular")] = to_json(entry.response.specular);
+                material[QStringLiteral("roughness")] = entry.response.roughness;
+                material[QStringLiteral("emissive")] = to_json(entry.response.emissive);
+                material[QStringLiteral("metallic")] = entry.response.metallic;
+                material[QStringLiteral("custom")] =
+                    QJsonArray{entry.response.custom_a, entry.response.custom_b};
+                materials.append(material);
+            }
+            item[QStringLiteral("materials")] = materials;
+        }
         models.append(item);
     }
     root[QStringLiteral("models")] = models;
@@ -583,6 +603,35 @@ std::optional<ProjectData> hkp_from_json(const QByteArray& bytes, QString* error
                              .normalize();
         model.scale = static_cast<float>(item.value(QStringLiteral("scale")).toDouble(1.0));
         model.visible = item.value(QStringLiteral("visible")).toBool(true);
+        for (const QJsonValue& material_value : item.value(QStringLiteral("materials")).toArray()) {
+            const QJsonObject material = material_value.toObject();
+            ProjectMaterialOverride entry;
+            entry.subset = material.value(QStringLiteral("subset")).toInt(-1);
+            if (entry.subset < 0) {
+                continue;
+            }
+            const QByteArray model_name =
+                material.value(QStringLiteral("shading_model")).toString().toUtf8();
+            entry.response.shading_model = gfx::shading_model_from_name(
+                std::string_view(model_name.constData(),
+                                 static_cast<std::size_t>(model_name.size())));
+            if (entry.response.shading_model < 0) {
+                entry.response.shading_model = 0;
+            }
+            entry.response.specular =
+                read_vec3(material.value(QStringLiteral("specular")), {0.04f, 0.04f, 0.04f});
+            entry.response.roughness = static_cast<float>(
+                material.value(QStringLiteral("roughness")).toDouble(0.5));
+            entry.response.emissive = read_vec3(material.value(QStringLiteral("emissive")));
+            entry.response.metallic =
+                static_cast<float>(material.value(QStringLiteral("metallic")).toDouble(0.0));
+            const QJsonArray custom = material.value(QStringLiteral("custom")).toArray();
+            if (custom.size() >= 2) {
+                entry.response.custom_a = static_cast<float>(custom.at(0).toDouble());
+                entry.response.custom_b = static_cast<float>(custom.at(1).toDouble());
+            }
+            model.materials.push_back(entry);
+        }
         project.models.push_back(std::move(model));
     }
 

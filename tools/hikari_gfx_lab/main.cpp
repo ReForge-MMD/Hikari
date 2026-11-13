@@ -47,6 +47,9 @@ struct Options {
     float ibl_rotation = 0.0f;
     float ibl_intensity = -1.0f;
     int frames = 1;
+    // Capture resolution. The default is the size every phase golden uses.
+    std::uint32_t width = 1280;
+    std::uint32_t height = 720;
     // Optional energy band for the captured frame mean; -1 disables the check.
     float expect_mean_min = -1.0f;
     float expect_mean_max = -1.0f;
@@ -72,6 +75,21 @@ struct Options {
     int fog_debug = -1;
     int fog_cloud_shadow = -1;
     float fog_density = -1.0f;
+    // Phase 7 material overrides, same convention.
+    int outline_mode = -1;
+    float outline_width = -1.0f;
+    int glass_refraction = -1;
+    int skin_ssss_quality = -1;
+    float skin_backlit = -1.0f;
+    int toon_enable = -1;
+    int water_caustics = -1;
+    // Height of the caustic water plane; -1 keeps the settings default.
+    float water_surface_y = -1.0f;
+    // Adds the PMX sphere map and toon ramp rows to the phase 7 chart.
+    bool pmx_maps = false;
+    // Restricts the phase 7 chart to one shading model and frames it; -1 keeps
+    // the whole row.
+    int shading_model = -1;
     bool help = false;
 };
 
@@ -103,8 +121,8 @@ void print_help() {
         << "  hikari_gfx_lab --phase 2 --scene room --pmx <stage.pmx>\n"
         << "  hikari_gfx_lab --phase 2 --scene character --pmx <model.pmx>\n\n"
         << "Options:\n"
-        << "  --phase <n>        Phase scenario. This build implements phase 1 to 6.\n"
-        << "  --scene <name>     synthetic, phase5, phase6, room, or character.\n"
+        << "  --phase <n>        Phase scenario. This build implements phase 1 to 7.\n"
+        << "  --scene <name>     synthetic, phase5, phase6, phase7, room, or character.\n"
         << "  --pmx <path>       Override the scene PMX path.\n"
         << "  --capture <path>   Headless BMP capture.\n"
         << "  --probe <path>     Headless JSON probe.\n"
@@ -127,6 +145,8 @@ void print_help() {
         << "  --ibl-rotation <d> Rotate the environment around the vertical axis, degrees.\n"
         << "  --ibl-intensity <n> Environment specular intensity multiplier.\n"
         << "  --frames <n>       Render the headless capture n times and report the mean time.\n"
+        << "  --width <n>        Capture width (default 1280).\n"
+        << "  --height <n>       Capture height (default 720).\n"
         << "  --animate-sun      Continuously rotate the sun in preview mode.\n"
         << "  --camera <name>    Camera preset (default, close, inside, sky, band).\n"
         << "  --camera-azimuth <d> Orbit the camera preset around the scene center, degrees.\n"
@@ -147,6 +167,18 @@ void print_help() {
         << "  --fog-debug <n>    Fog debug view (0=off, 1=opacity, 2=shafts, 3=depth, 4=steps).\n"
         << "  --fog-cloud-shadow <n> Cloud and sun visibility in the fog (0/1).\n"
         << "  --fog-density <n>  Base fog density in inverse metres (phase 6).\n"
+        << "  --outline <n>      Outline mode (0=off, 1=PMX hull, 2=uniform hull, 3=edge detect).\n"
+        << "  --outline-width <n> Outline width in pixels (default 2).\n"
+        << "  --glass-refraction <n> Glass refraction (0=off, 1=fast, 2=Newton solve).\n"
+        << "  --skin-ssss <n>    Screen-space SSS quality (0=off, 1=on).\n"
+        << "  --skin-backlit <n> Skin backlit transmission strength.\n"
+        << "  --toon <n>         Toon grading preset (0=off, 1=graded shadows, 2=graded+rim).\n"
+        << "  --water-caustics <n> Water caustics under the surface plane (0/1).\n"
+        << "  --water-surface-y <n> Height of the caustic water plane (default 0).\n"
+        << "  --pmx-maps         Add the PMX sphere map and toon ramp rows to the chart\n"
+        << "                     and a checker floor sampled through UvTransform.\n"
+        << "  --shading-model <n> Capture one phase 7 sphere by shading model id (0..10),\n"
+        << "                     or override every subset of a loaded model.\n"
         << "  --expect-mean-min <v> Fail unless the capture mean is at least v (0..1).\n"
         << "  --expect-mean-max <v> Fail unless the capture mean is at most v (0..1).\n"
         << "  --help             Show this text.\n\n"
@@ -217,6 +249,10 @@ Options parse_options(int argc, char** argv) {
             options.ibl_intensity = std::stof(next("--ibl-intensity"));
         } else if (argument == "--frames") {
             options.frames = std::max(std::stoi(next("--frames")), 1);
+        } else if (argument == "--width") {
+            options.width = static_cast<std::uint32_t>(std::max(std::stoi(next("--width")), 16));
+        } else if (argument == "--height") {
+            options.height = static_cast<std::uint32_t>(std::max(std::stoi(next("--height")), 16));
         } else if (argument == "--animate-sun") {
             options.animate_sun = true;
         } else if (argument == "--camera") {
@@ -257,6 +293,26 @@ Options parse_options(int argc, char** argv) {
             options.fog_cloud_shadow = std::stoi(next("--fog-cloud-shadow"));
         } else if (argument == "--fog-density") {
             options.fog_density = std::stof(next("--fog-density"));
+        } else if (argument == "--outline") {
+            options.outline_mode = std::stoi(next("--outline"));
+        } else if (argument == "--outline-width") {
+            options.outline_width = std::stof(next("--outline-width"));
+        } else if (argument == "--glass-refraction") {
+            options.glass_refraction = std::stoi(next("--glass-refraction"));
+        } else if (argument == "--skin-ssss") {
+            options.skin_ssss_quality = std::stoi(next("--skin-ssss"));
+        } else if (argument == "--skin-backlit") {
+            options.skin_backlit = std::stof(next("--skin-backlit"));
+        } else if (argument == "--toon") {
+            options.toon_enable = std::stoi(next("--toon"));
+        } else if (argument == "--water-caustics") {
+            options.water_caustics = std::stoi(next("--water-caustics"));
+        } else if (argument == "--water-surface-y") {
+            options.water_surface_y = std::stof(next("--water-surface-y"));
+        } else if (argument == "--pmx-maps") {
+            options.pmx_maps = true;
+        } else if (argument == "--shading-model") {
+            options.shading_model = std::stoi(next("--shading-model"));
         } else if (argument == "--expect-mean-min") {
             options.expect_mean_min = std::stof(next("--expect-mean-min"));
         } else if (argument == "--expect-mean-max") {
@@ -284,6 +340,23 @@ std::string scene_path(const Options& options) {
         return value != nullptr ? value : "";
     }
     return {};
+}
+
+// Applies --shading-model to every subset of a loaded PMX model. The chart builds
+// its own overrides and always carries a full override array, so this skips any
+// scene that already has one; it is the same per-subset override the studio
+// Materials section writes, and it is what lets a character be profiled with the
+// skin or glass model.
+void override_scene_shading_model(hikari::gfx_lab::LabScene& scene, int shading_model) {
+    if (shading_model < 0 || scene.materials.empty() || !scene.material_overrides.empty()) {
+        return;
+    }
+    scene.material_overrides.reserve(scene.materials.size());
+    for (const hikari::render::GpuMaterial& material : scene.materials) {
+        hikari::gfx::MaterialConstants constants = hikari::gfx::material_from_gpu(material);
+        hikari::gfx::set_shading_model(constants, shading_model);
+        scene.material_overrides.push_back(constants);
+    }
 }
 
 hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
@@ -346,9 +419,9 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
             settings.sky.ambient_intensity = 0.55f;
         }
     }
-    // Fog is the Phase 6 deliverable. Earlier phases must keep their goldens, so
+    // Fog is the Phase 6 deliverable. Every other phase keeps its goldens, so
     // the pass is switched off there.
-    if (options.phase < 6) {
+    if (options.phase != 6) {
         settings.fog.enable = 0;
     }
     if (options.phase == 6) {
@@ -383,8 +456,62 @@ hikari::gfx::GraphicsSettings lab_settings(const Options& options) {
         settings.fog.wind_speed = 0.5f;
         settings.sky.ambient_intensity = options.ambient >= 0.0f ? options.ambient : 0.45f;
     }
+    if (options.phase == 7) {
+        // The chart is lit by the sun plus a soft sky fill; screen space chains
+        // add noise to a flat backdrop without adding readable detail.
+        settings.sky.enabled = true;
+        settings.sky.quality = 3;
+        settings.sky.cloud_coverage = 0.25f;
+        settings.ibl.quality = 1;
+        settings.ao.quality = 3;
+        settings.ssr.quality = 0;
+        settings.gi.enable = 0;
+        settings.shadows.quality = 2;
+        settings.shadows.pcss = true;
+        settings.shadows.blur = true;
+        settings.sky.ambient_intensity = options.ambient >= 0.0f ? options.ambient : 0.35f;
+    }
     if (options.fog_enable >= 0) {
         settings.fog.enable = options.fog_enable;
+    }
+    if (options.outline_mode >= 0) {
+        settings.outline.mode = options.outline_mode;
+    }
+    if (options.outline_width >= 0.0f) {
+        settings.outline.width_pixels = options.outline_width;
+    }
+    if (options.glass_refraction >= 0) {
+        settings.ssr.glass_refraction = options.glass_refraction;
+    }
+    if (options.skin_ssss_quality >= 0) {
+        settings.skin.ssss_quality = options.skin_ssss_quality;
+    }
+    if (options.skin_backlit >= 0.0f) {
+        settings.skin.backlit_strength = options.skin_backlit;
+    }
+    if (options.toon_enable >= 0) {
+        settings.toon.enable = options.toon_enable;
+        if (options.toon_enable > 0) {
+            // The settings defaults are deliberately neutral, so the chart needs
+            // a graded preset to show that the toon path is wired at all. Level
+            // 1 grades the shadow band, level 2 adds the rim and hardens the
+            // terminator.
+            settings.toon.shadow_mul = {0.74f, 0.80f, 0.96f};
+            settings.toon.shadow_hue = -10.0f;
+            settings.toon.autotint_color = {0.95f, 0.80f, 1.05f};
+            settings.toon.autotint_strength = 0.6f;
+            settings.toon.self_power_shadow = 0.6f;
+        }
+        if (options.toon_enable >= 2) {
+            settings.toon.rim_strength = 0.55f;
+            settings.toon.rim_power = 2.0f;
+        }
+    }
+    if (options.water_caustics >= 0) {
+        settings.ssr.water_caustics = options.water_caustics != 0;
+    }
+    if (options.water_surface_y >= 0.0f) {
+        settings.ssr.water_surface_y = options.water_surface_y;
     }
     if (options.fog_quality >= 0) {
         settings.fog.quality = options.fog_quality;
@@ -466,6 +593,18 @@ hikari::render::Camera frame_camera(const hikari::gfx_lab::LabScene& scene,
         camera.position = center + hikari::Vec3(-5.4f, -2.0f, -4.2f);
         camera.target = center + hikari::Vec3(2.6f, -1.4f, 1.4f);
         sky_fov = 1.3089969f;
+    } else if (options.phase == 7 && options.camera == "default") {
+        if (options.shading_model >= 0) {
+            // A single-model capture frames that sphere instead of the whole row.
+            const float x = -5.0f + static_cast<float>(options.shading_model);
+            camera.position = hikari::Vec3(x, 0.78f, -2.9f);
+            camera.target = hikari::Vec3(x, 0.55f, 0.0f);
+        } else {
+            // The chart is one wide row of spheres, so frame its width instead of
+            // the bounding sphere the default preset would use.
+            camera.position = hikari::Vec3(0.0f, 1.50f, -12.0f);
+            camera.target = hikari::Vec3(0.0f, 0.55f, 0.0f);
+        }
     } else if (room_view) {
         // Inside the Phase 5 room, low enough to see the metal floor and its
         // reflections with the emitter and the coloured walls in frame.
@@ -577,6 +716,10 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
         view.sun_direction = -hikari::Vec3(std::cos(el) * std::sin(az), std::sin(el),
                                           std::cos(el) * std::cos(az))
                                   .normalize();
+    } else if (options.phase == 7) {
+        // Key light above and in front of the chart, so every sphere shows both
+        // a highlight and a terminator. SunDirection points away from the sun.
+        view.sun_direction = hikari::Vec3(-0.45f, -1.0f, 0.55f).normalize();
     } else if (options.phase == 4) {
         view.sun_direction = -hikari::gfx::sun_direction_from_time_of_day(
             settings.sky.time_of_day);
@@ -590,8 +733,8 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
     view.far_z = camera.far_z;
     view.time_seconds = options.sky_time;
     view.orthographic = camera.orthographic;
-    view.draw_grid = true;
-    view.show_grid = true;
+    view.draw_grid = options.phase != 7;
+    view.show_grid = options.phase != 7;
     view.wireframe = false;
     view.width = width;
     view.height = height;
@@ -614,9 +757,14 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
             item.material_override = &view.material_overrides[subset.material_index];
         }
         item.depth = (subset_center(scene, subset) - camera.position).dot(forward);
+        const bool glass_model =
+            item.material_override != nullptr &&
+            hikari::gfx::shading_model_from_constants(*item.material_override) ==
+                static_cast<int>(hikari::gfx::ShadingModel::Glass);
         const bool transparent =
-            subset.material_index < scene.materials.size() &&
-            scene.materials[subset.material_index].constants.diffuse[3] < 0.999f;
+            glass_model ||
+            (subset.material_index < scene.materials.size() &&
+             scene.materials[subset.material_index].constants.diffuse[3] < 0.999f);
         if (transparent) {
             view.transparent.push_back(item);
         } else {
@@ -632,12 +780,12 @@ hikari::gfx::FrameView make_view(const hikari::gfx_lab::LabScene& scene,
 }
 
 int run_headless(const Options& options) {
-    if (options.phase < 1 || options.phase > 6) {
+    if (options.phase < 1 || options.phase > 7) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
-    const std::uint32_t width = 1280;
-    const std::uint32_t height = 720;
+    const std::uint32_t width = options.width;
+    const std::uint32_t height = options.height;
     try {
         hikari::core::D3D11Context context(nullptr, width, height);
         hikari::gfx_lab::LabScene scene;
@@ -647,6 +795,9 @@ int run_headless(const Options& options) {
             scene = hikari::gfx_lab::LabScene::phase5_room(context);
         } else if (options.scene == "phase6") {
             scene = hikari::gfx_lab::LabScene::phase6_room(context);
+        } else if (options.scene == "phase7") {
+            scene = hikari::gfx_lab::LabScene::phase7_chart(context, options.pmx_maps,
+                                                           options.shading_model);
         } else {
             const std::string path = scene_path(options);
             if (path.empty()) {
@@ -666,6 +817,7 @@ int run_headless(const Options& options) {
             settings.sun.light_mode = 1;
             settings.post.tonemap = hikari::gfx::TonemapOperator::Linear;
         }
+        override_scene_shading_model(scene, options.shading_model);
         std::cout << "scene bounds: center (" << scene.center().x << ", " << scene.center().y
                   << ", " << scene.center().z << ") radius " << scene.radius() << ", textures "
                   << scene.loaded_textures << '/' << scene.textures.size() << '\n';
@@ -689,6 +841,12 @@ int run_headless(const Options& options) {
             make_view(scene, camera, settings, options, width, height);
 
         const auto start = std::chrono::steady_clock::now();
+        // A frame is submitted, not executed, so a query event is what makes the
+        // reported cost the GPU cost instead of the CPU submission cost.
+        Microsoft::WRL::ComPtr<ID3D11Query> frame_done;
+        D3D11_QUERY_DESC query_desc{};
+        query_desc.Query = D3D11_QUERY_EVENT;
+        const bool can_sync = SUCCEEDED(context.device->CreateQuery(&query_desc, &frame_done));
         std::vector<double> frame_times;
         frame_times.reserve(static_cast<std::size_t>(options.frames));
         for (int frame = 0; frame < options.frames; ++frame) {
@@ -696,6 +854,11 @@ int run_headless(const Options& options) {
                 options.sky_time + options.sky_drift * static_cast<float>(frame);
             const auto frame_start = std::chrono::steady_clock::now();
             renderer.render(settings, view, final_pool.get("Final")->rtv.Get());
+            if (can_sync) {
+                context.context->End(frame_done.Get());
+                while (context.context->GetData(frame_done.Get(), nullptr, 0, 0) == S_FALSE) {
+                }
+            }
             frame_times.push_back(
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                           frame_start)
@@ -831,7 +994,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
 }
 
 int run_window(const Options& options) {
-    if (options.phase < 1 || options.phase > 6) {
+    if (options.phase < 1 || options.phase > 7) {
         std::cerr << "phase " << options.phase << " is not implemented in this build\n";
         return 2;
     }
@@ -863,6 +1026,9 @@ int run_window(const Options& options) {
             scene = hikari::gfx_lab::LabScene::phase5_room(context);
         } else if (options.scene == "phase6") {
             scene = hikari::gfx_lab::LabScene::phase6_room(context);
+        } else if (options.scene == "phase7") {
+            scene = hikari::gfx_lab::LabScene::phase7_chart(context, options.pmx_maps,
+                                                           options.shading_model);
         } else {
             const std::string path = scene_path(options);
             if (path.empty()) {
@@ -881,6 +1047,7 @@ int run_window(const Options& options) {
             settings.sun.light_mode = 1;
             settings.post.tonemap = hikari::gfx::TonemapOperator::Linear;
         }
+        override_scene_shading_model(scene, options.shading_model);
         hikari::gfx::Renderer renderer(context);
         update_window_title(hwnd);
 

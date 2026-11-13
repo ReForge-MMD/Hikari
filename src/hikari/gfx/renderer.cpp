@@ -16,6 +16,7 @@
 
 #include "hikari/gfx/ao_ssr_gi.hpp"
 #include "hikari/gfx/fog.hpp"
+#include "hikari/gfx/gbuffer.hpp"
 #include "hikari/gfx/ibl.hpp"
 #include "hikari/gfx/sky.hpp"
 #include "hikari/gfx/sky_assets.hpp"
@@ -192,6 +193,7 @@ uint32_t shadow_resolution_from_quality(int quality) {
 Renderer::Renderer(core::D3D11Context& context)
     : context_(context),
       shaders_(context),
+      toon_ramps_(context),
       white_texture_([&context] {
           const std::uint8_t white[4] = {255, 255, 255, 255};
           return render::GpuTexture::create_solid_color(context, white);
@@ -283,6 +285,17 @@ void Renderer::create_buffers() {
     if (FAILED(context_.device->CreateBuffer(&fog_desc, nullptr,
                                              fog_buffer_.GetAddressOf()))) {
         throw std::runtime_error("CreateBuffer fog constants failed");
+    }
+
+    // SurfaceParams buffer (b8)
+    D3D11_BUFFER_DESC surface_desc{};
+    surface_desc.ByteWidth = sizeof(SurfaceConstants);
+    surface_desc.Usage = D3D11_USAGE_DYNAMIC;
+    surface_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    surface_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(context_.device->CreateBuffer(&surface_desc, nullptr,
+                                             surface_buffer_.GetAddressOf()))) {
+        throw std::runtime_error("CreateBuffer surface constants failed");
     }
 }
 
@@ -420,6 +433,12 @@ void Renderer::ensure_targets(std::uint32_t width, std::uint32_t height) {
     // RGBA8 so the lab can capture the debug channels directly with --target.
     targets_.create_target(context_.device.Get(), "FogDebug", width, height,
                             DXGI_FORMAT_R8G8B8A8_UNORM);
+    // Phase 7 screen-space subsurface diffusion: one ping-pong pair for the two
+    // separable passes. Full resolution because the diffusion radius is small.
+    for (const char* name : {"SssTmp", "SssOut"}) {
+        targets_.create_target(context_.device.Get(), name, width, height,
+                                DXGI_FORMAT_R16G16B16A16_FLOAT);
+    }
     const float fog_clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     for (const char* name : {"FogVolume", "FogBlurTmp", "FogBlur"}) {
         if (const Target* target = targets_.get(name)) {
@@ -476,6 +495,7 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     update_ibl_constants(settings);
     update_ao_ssr_gi_constants(settings, view);
     update_fog_constants(settings);
+    update_surface_constants(settings);
     draw_shadow_cascades(settings, view);
     draw_sky_visibility(settings, view);
     draw_sun_transmittance(settings, view);
@@ -519,11 +539,22 @@ void Renderer::render(const GraphicsSettings& settings, const FrameView& view,
     }
     draw_sky_background(settings, view);
     draw_lighting(settings, view);
+    // Subsurface diffusion runs on the lit image, before the outline and fog, so
+    // the softened skin is what the ink and the medium see.
+    draw_sss(settings, view);
+    // Ink sits on the lit surface, so it is drawn before the fog composite and
+    // gets fogged with the geometry it belongs to.
+    draw_outline(settings, view);
     // Fog resolves over the opaque lit scene and before transparent geometry, so
     // transparent surfaces blend over a fogged background instead of being
     // overwritten by a later fog pass.
     draw_fog(settings, view);
-    draw_transparent(view);
+    // Glass refraction reads the scene copy, so a frame with glass but without
+    // fog still needs it produced before the transparent pass.
+    if (settings.fog.enable <= 0 && has_glass_item(view)) {
+        draw_fog_scene_copy(settings);
+    }
+    draw_transparent(settings, view);
     draw_tonemap(settings, view, final_rtv, !view.show_tonemap);
     draw_grid(view, final_rtv);
 
@@ -636,6 +667,9 @@ std::vector<ShaderDefine> Renderer::lighting_defines(const GraphicsSettings& set
     for (const ShaderDefine& define : ao_ssr_gi_defines(settings)) {
         defines.push_back(define);
     }
+    for (const ShaderDefine& define : surface_defines(settings)) {
+        defines.push_back(define);
+    }
     return defines;
 }
 
@@ -698,6 +732,132 @@ std::vector<ShaderDefine> Renderer::fog_defines(const GraphicsSettings& settings
     return defines;
 }
 
+std::vector<ShaderDefine> Renderer::surface_defines(const GraphicsSettings& settings) const {
+    std::vector<ShaderDefine> defines;
+    defines.push_back({"OUTLINE_MODE", std::to_string(std::clamp(settings.outline.mode, 0, 3))});
+    defines.push_back({"OUTLINE_WIDTH_PIXELS", std::to_string(settings.outline.width_pixels)});
+    defines.push_back(
+        {"OUTLINE_DEPTH_THRESHOLD", std::to_string(settings.outline.depth_threshold)});
+    defines.push_back(
+        {"OUTLINE_NORMAL_THRESHOLD", std::to_string(settings.outline.normal_threshold)});
+    defines.push_back(
+        {"GLASS_REFRACTION", std::to_string(std::clamp(settings.ssr.glass_refraction, 0, 2))});
+    defines.push_back({"BRDF_CLOTH_VIS_CHARLIE", settings.brdf.cloth_charlie ? "1" : "0"});
+    defines.push_back(
+        {"SKIN_BACKLIT", settings.skin.backlit_strength > 0.0f ? "1" : "0"});
+    defines.push_back({"SSSS_QUALITY", std::to_string(std::clamp(settings.skin.ssss_quality, 0, 1))});
+    defines.push_back({"SSSS_TEXSPACE", settings.skin.ssss_texspace ? "1" : "0"});
+    defines.push_back({"SSSS_STRENGTH", std::to_string(kSubsurfaceCompositeStrength)});
+    // The diffusion radius is the mean free path of the dermal scatter in
+    // pixels, so a larger mfp scale softens the falloff without a new target.
+    const float sss_radius =
+        std::clamp(6.0f * std::max(settings.skin.sss_mfp_scale, 0.05f), 0.5f, 48.0f);
+    defines.push_back({"SSSS_RADIUS_PIXELS", std::to_string(sss_radius)});
+    defines.push_back({"TOON_ENABLE", std::to_string(std::clamp(settings.toon.enable, 0, 2))});
+    // The native toon has no shadow ramp texture, so the diffusion blur is the
+    // width of the band edge: a lower diffusion quality softens the terminator.
+    const float toon_ramp_width = std::clamp(
+        256.0f / static_cast<float>(std::max(settings.toon.diffusion_quality, 256)), 0.02f,
+        0.40f);
+    defines.push_back({"TOON_RAMP_WIDTH", std::to_string(toon_ramp_width)});
+    defines.push_back({"WATER_CAUSTICS_ENABLE",
+                       settings.ssr.water_caustics ? "1" : "0"});
+    return defines;
+}
+
+void Renderer::draw_outline(const GraphicsSettings& settings, const FrameView& view) {
+    const int mode = std::clamp(settings.outline.mode, 0, 3);
+    if (mode == 0) {
+        return;
+    }
+    const Target* hdr = targets_.get("Hdr");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (hdr == nullptr || depth == nullptr) {
+        return;
+    }
+    ID3D11RenderTargetView* views[] = {hdr->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, views, depth->dsv.Get());
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
+    bind_frame_constants();
+    bind_material_constants();
+    bind_surface_constants();
+
+    if (mode == 3) {
+        // Edge detection reads the G-buffer and depth only, then blends the ink
+        // over the lit image, so the HDR target is never bound as a source.
+        std::vector<ShaderDefine> defines = surface_defines(settings);
+        const ShaderProgram& program =
+            shaders_.get("outline_edge", kShaderSource, "FullscreenVS", "OutlineEdgePS", defines,
+                         nullptr);
+        ID3D11ShaderResourceView* resources[2] = {targets_.get("GB1")->srv.Get(),
+                                                  depth->srv.Get()};
+        // GB1 is t1 and depth is t5.
+        context_.context->PSSetShaderResources(1, 1, &resources[0]);
+        context_.context->PSSetShaderResources(5, 1, &resources[1]);
+        auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+        context_.context->PSSetSamplers(1, 1, &point);
+        const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        context_.context->OMSetBlendState(
+            context_.state_manager->get_blend(core::BlendPreset::AlphaBlend), blend_factor,
+            0xFFFFFFFF);
+        context_.context->OMSetDepthStencilState(
+            context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+        context_.context->RSSetState(
+            context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
+        draw_fullscreen(program);
+        ID3D11ShaderResourceView* null_views[2] = {};
+        context_.context->PSSetShaderResources(1, 1, &null_views[0]);
+        context_.context->PSSetShaderResources(5, 1, &null_views[1]);
+        return;
+    }
+
+    if (view.opaque.empty()) {
+        return;
+    }
+    const D3D11_INPUT_ELEMENT_DESC layout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"BLENDINDICES", 0, DXGI_FORMAT_R32G32B32A32_UINT, 0, 32, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"BLENDWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    std::vector<D3D11_INPUT_ELEMENT_DESC> layout_vector(std::begin(layout), std::end(layout));
+    std::vector<ShaderDefine> defines = surface_defines(settings);
+    const ShaderProgram& program = shaders_.get("outline_hull", kShaderSource, "OutlineVS",
+                                                "OutlinePS", defines, &layout_vector);
+    context_.context->IASetInputLayout(program.input_layout.Get());
+    context_.context->VSSetShader(program.vertex.Get(), nullptr, 0);
+    context_.context->PSSetShader(program.pixel.Get(), nullptr, 0);
+    context_.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // Front faces are culled so the expanded shell only survives where the solid
+    // surface is not in front of it, which is the silhouette.
+    context_.context->RSSetState(
+        context_.state_manager->get_rasterizer(core::RasterizerPreset::CullFrontSolid));
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    context_.context->OMSetBlendState(
+        context_.state_manager->get_blend(core::BlendPreset::AlphaBlend), blend_factor,
+        0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::ReadOnlyLessEqual), 0);
+    for (const DrawItem& item : view.opaque) {
+        MaterialConstants constants;
+        ID3D11ShaderResourceView* srv = nullptr;
+        ID3D11ShaderResourceView* sphere_srv = nullptr;
+        if (!resolve_item_material(item, constants, srv, sphere_srv)) {
+            continue;
+        }
+        if (mode == 1 && constants.edge_color_size[3] <= 0.0f) {
+            continue;
+        }
+        const render::MeshSubset& subset = item.mesh->subsets[item.subset];
+        item.mesh->bind_to(context_.context.Get());
+        item.skinning->bind_vs_to(context_.context.Get(), 8);
+        update_material_constants(constants);
+        bind_material_constants();
+        context_.context->DrawIndexed(subset.index_count, subset.index_start, 0);
+    }
+}
+
 void Renderer::draw_geometry(const FrameView& view) {
     const Target* gb0 = targets_.get("GB0");
     const Target* gb1 = targets_.get("GB1");
@@ -757,32 +917,74 @@ void Renderer::draw_geometry(const FrameView& view) {
 }
 
 void Renderer::draw_item(const DrawItem& item, bool transparent) {
-    (void)transparent;
-    if (item.mesh == nullptr || item.materials == nullptr || item.textures == nullptr ||
-        item.skinning == nullptr || item.subset >= item.mesh->subsets.size()) {
+    MaterialConstants constants;
+    ID3D11ShaderResourceView* srv = nullptr;
+    ID3D11ShaderResourceView* sphere_srv = nullptr;
+    if (!resolve_item_material(item, constants, srv, sphere_srv)) {
         return;
     }
+    const render::MeshSubset& subset = item.mesh->subsets[item.subset];
     item.mesh->bind_to(context_.context.Get());
     item.skinning->bind_vs_to(context_.context.Get(), 8);
-
-    const render::MeshSubset& subset = item.mesh->subsets[item.subset];
-    MaterialConstants constants;
-    ID3D11ShaderResourceView* srv = white_texture_.srv.Get();
-    if (item.material_override != nullptr) {
-        constants = *item.material_override;
-    } else if (subset.material_index < item.materials->size()) {
-        const render::GpuMaterial& material = (*item.materials)[subset.material_index];
-        constants = material_from_gpu(material.constants);
-        if (material.texture_index >= 0 &&
-            static_cast<std::size_t>(material.texture_index) < item.textures->size() &&
-            (*item.textures)[static_cast<std::size_t>(material.texture_index)]) {
-            srv = (*item.textures)[static_cast<std::size_t>(material.texture_index)]->srv.Get();
-        }
+    if (transparent) {
+        // A closed transparent surface blends its own back faces over the front
+        // ones, which double-tints the interior and bands along the mesh rows.
+        // Only a material that authored two-sided rendering keeps both.
+        const int flags = unpack_material_flags(constants.custom_data[3]);
+        const bool two_sided = (flags & static_cast<int>(MaterialFlag::TwoSided)) != 0;
+        context_.context->RSSetState(context_.state_manager->get_rasterizer(
+            two_sided ? core::RasterizerPreset::CullNoneSolid
+                      : core::RasterizerPreset::CullBackSolid));
     }
     update_material_constants(constants);
     bind_material_constants();
     context_.context->PSSetShaderResources(8, 1, &srv);
+    context_.context->PSSetShaderResources(28, 1, &sphere_srv);
     context_.context->DrawIndexed(subset.index_count, subset.index_start, 0);
+}
+
+bool Renderer::resolve_item_material(const DrawItem& item, MaterialConstants& constants,
+                                     ID3D11ShaderResourceView*& srv,
+                                     ID3D11ShaderResourceView*& sphere_srv) const {
+    if (item.mesh == nullptr || item.materials == nullptr || item.textures == nullptr ||
+        item.skinning == nullptr || item.subset >= item.mesh->subsets.size()) {
+        return false;
+    }
+    const render::MeshSubset& subset = item.mesh->subsets[item.subset];
+    constants = MaterialConstants{};
+    srv = white_texture_.srv.Get();
+    sphere_srv = white_texture_.srv.Get();
+    const render::GpuMaterial* material = nullptr;
+    if (subset.material_index < item.materials->size()) {
+        material = &(*item.materials)[subset.material_index];
+    }
+    if (item.material_override != nullptr) {
+        constants = *item.material_override;
+    } else if (material != nullptr) {
+        constants = material_from_gpu(*material);
+    }
+    if (material == nullptr) {
+        return true;
+    }
+    const auto texture_srv = [&](std::int32_t index) -> ID3D11ShaderResourceView* {
+        if (index < 0 || static_cast<std::size_t>(index) >= item.textures->size()) {
+            return nullptr;
+        }
+        const std::optional<render::GpuTexture>& texture =
+            (*item.textures)[static_cast<std::size_t>(index)];
+        return texture ? texture->srv.Get() : nullptr;
+    };
+    // An override replaces the response but not the authored texture set, so the
+    // diffuse and sphere maps still come from the subset's PMX material.
+    if (ID3D11ShaderResourceView* diffuse = texture_srv(material->texture_index)) {
+        srv = diffuse;
+    }
+    if (constants.pmx_params[0] > 0.5f) {
+        if (ID3D11ShaderResourceView* sphere = texture_srv(material->sphere_texture_index)) {
+            sphere_srv = sphere;
+        }
+    }
+    return true;
 }
 
 void Renderer::ensure_sky_capture(const GraphicsSettings& settings) {
@@ -1260,10 +1462,15 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
         gi_filtered != nullptr ? gi_filtered->srv.Get() : nullptr,
         (vxgi_rad != nullptr) ? vxgi_rad->srv.Get() : nullptr};
     context_.context->PSSetShaderResources(20, 4, phase5);
+    // PMX toon ramps. The G-buffer pass stored the slice, so the lighting pass
+    // only needs the array itself.
+    ID3D11ShaderResourceView* toon_srv = toon_ramps_.srv();
+    context_.context->PSSetShaderResources(29, 1, &toon_srv);
     bind_shadow_constants();
     bind_sky_constants();
     bind_ibl_constants();
     bind_ao_ssr_gi_constants();
+    bind_surface_constants();
 
     auto* sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
     context_.context->PSSetSamplers(0, 1, &sampler);
@@ -1281,7 +1488,37 @@ void Renderer::draw_lighting(const GraphicsSettings& settings, const FrameView& 
     draw_fullscreen(program);
 }
 
-void Renderer::draw_transparent(const FrameView& view) {
+bool Renderer::has_glass_item(const FrameView& view) const {
+    for (const DrawItem& item : view.transparent) {
+        MaterialConstants constants;
+        ID3D11ShaderResourceView* srv = nullptr;
+        ID3D11ShaderResourceView* sphere_srv = nullptr;
+        if (!resolve_item_material(item, constants, srv, sphere_srv)) {
+            continue;
+        }
+        if (shading_model_from_constants(constants) == static_cast<int>(ShadingModel::Glass)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Renderer::has_sss_item(const FrameView& view) const {
+    for (const DrawItem& item : view.opaque) {
+        MaterialConstants constants;
+        ID3D11ShaderResourceView* srv = nullptr;
+        ID3D11ShaderResourceView* sphere_srv = nullptr;
+        if (!resolve_item_material(item, constants, srv, sphere_srv)) {
+            continue;
+        }
+        if (shading_model_scatters_subsurface(shading_model_from_constants(constants))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Renderer::draw_transparent(const GraphicsSettings& settings, const FrameView& view) {
     if (!view.show_transparent || view.transparent.empty()) {
         return;
     }
@@ -1304,16 +1541,36 @@ void Renderer::draw_transparent(const FrameView& view) {
          0},
     };
     std::vector<D3D11_INPUT_ELEMENT_DESC> layout_vector(std::begin(layout), std::end(layout));
-    const ShaderProgram& program =
-        shaders_.get("forward", kShaderSource, "GBufferVS", "ForwardPS", {}, &layout_vector);
+    const ShaderProgram& program = shaders_.get("forward", kShaderSource, "GBufferVS",
+                                                "ForwardPS", surface_defines(settings),
+                                                &layout_vector);
     context_.context->IASetInputLayout(program.input_layout.Get());
     context_.context->VSSetShader(program.vertex.Get(), nullptr, 0);
     context_.context->PSSetShader(program.pixel.Get(), nullptr, 0);
     context_.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     bind_frame_constants();
     bind_material_constants();
+    bind_surface_constants();
+    // The refraction reads the lit scene copy and the depth of the surface it
+    // lands on, both packed into FogSceneCopy by the fog scene copy pass.
+    if (const Target* scene = targets_.get("FogSceneCopy")) {
+        ID3D11ShaderResourceView* scene_srv = scene->srv.Get();
+        context_.context->PSSetShaderResources(26, 1, &scene_srv);
+    }
+    // The reflected half of the glass Fresnel samples the prefiltered sky.
+    if (settings.ibl.quality > 0) {
+        if (const Target* prefiltered = targets_.get("SkyPrefilter")) {
+            ID3D11ShaderResourceView* prefilter_srv = prefiltered->srv.Get();
+            context_.context->PSSetShaderResources(17, 1, &prefilter_srv);
+        }
+    }
+    bind_ibl_constants();
     auto* sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearWrap);
     context_.context->PSSetSamplers(0, 1, &sampler);
+    auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    context_.context->PSSetSamplers(1, 1, &point);
+    auto* sky_sampler = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    context_.context->PSSetSamplers(3, 1, &sky_sampler);
     context_.context->RSSetState(
         context_.state_manager->get_rasterizer(core::RasterizerPreset::CullNoneSolid));
     const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1325,6 +1582,86 @@ void Renderer::draw_transparent(const FrameView& view) {
     for (const DrawItem& item : view.transparent) {
         draw_item(item, true);
     }
+}
+
+// Phase 7 subsurface diffusion. The horizontal pass reads the lit HDR image and
+// the vertical pass reads its result, so the kernel is separable and costs 2N
+// taps instead of N squared. The composite writes back over Hdr masked by the
+// scattering model, and it reads Hdr through FogSceneTex's sibling copy pattern:
+// the lit image is copied into SssTmp first, so no target is bound twice.
+void Renderer::draw_sss(const GraphicsSettings& settings, const FrameView& view) {
+    if (settings.skin.ssss_quality <= 0 || !has_sss_item(view)) {
+        return;
+    }
+    const Target* hdr = targets_.get("Hdr");
+    const Target* temp = targets_.get("SssTmp");
+    const Target* out = targets_.get("SssOut");
+    const DepthTarget* depth = targets_.get_depth("Depth");
+    if (hdr == nullptr || temp == nullptr || out == nullptr || depth == nullptr) {
+        return;
+    }
+    std::vector<ShaderDefine> defines = surface_defines(settings);
+    defines.push_back({"SSSS_DIR", "0"});
+    const ShaderProgram& horizontal =
+        shaders_.get("sss_x", kShaderSource, "FullscreenVS", "SssDiffusionPS", defines, nullptr);
+    defines.back().value = "1";
+    const ShaderProgram& vertical =
+        shaders_.get("sss_y", kShaderSource, "FullscreenVS", "SssDiffusionPS", defines, nullptr);
+    const ShaderProgram& composite =
+        shaders_.get("sss_composite", kShaderSource, "FullscreenVS", "SssCompositePS", defines,
+                     nullptr);
+
+    context_.set_viewport(static_cast<float>(width_), static_cast<float>(height_));
+    bind_frame_constants();
+    bind_surface_constants();
+    auto* linear = context_.state_manager->get_sampler(core::SamplerPreset::LinearClamp);
+    context_.context->PSSetSamplers(0, 1, &linear);
+    auto* point = context_.state_manager->get_sampler(core::SamplerPreset::PointClamp);
+    context_.context->PSSetSamplers(1, 1, &point);
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+    context_.context->OMSetDepthStencilState(
+        context_.state_manager->get_depth(core::DepthPreset::Disabled), 0);
+
+    // GB1, GB4, and depth drive the mask, the diffusion axis, and the depth gate.
+    ID3D11ShaderResourceView* gbuffer[2] = {targets_.get("GB1")->srv.Get(),
+                                            targets_.get("GB4")->srv.Get()};
+    context_.context->PSSetShaderResources(1, 1, &gbuffer[0]);
+    context_.context->PSSetShaderResources(4, 1, &gbuffer[1]);
+    ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+    context_.context->PSSetShaderResources(5, 1, &depth_srv);
+
+    ID3D11RenderTargetView* temp_view[] = {temp->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, temp_view, nullptr);
+    ID3D11ShaderResourceView* source = hdr->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &source);
+    draw_fullscreen(horizontal);
+
+    ID3D11RenderTargetView* out_view[] = {out->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, out_view, nullptr);
+    source = temp->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &source);
+    draw_fullscreen(vertical);
+
+    ID3D11RenderTargetView* hdr_view[] = {hdr->rtv.Get()};
+    context_.context->OMSetRenderTargets(1, hdr_view, nullptr);
+    source = out->srv.Get();
+    context_.context->PSSetShaderResources(24, 1, &source);
+    // The composite blends over the lit image, so Hdr is never read as a source
+    // in the same pass that writes it.
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    context_.context->OMSetBlendState(
+        context_.state_manager->get_blend(core::BlendPreset::AlphaBlend), blend_factor,
+        0xFFFFFFFF);
+    draw_fullscreen(composite);
+    context_.context->OMSetBlendState(context_.state_manager->get_blend(core::BlendPreset::Opaque),
+                                      nullptr, 0xFFFFFFFF);
+
+    ID3D11ShaderResourceView* null_srv = nullptr;
+    context_.context->PSSetShaderResources(24, 1, &null_srv);
+    context_.context->PSSetShaderResources(5, 1, &null_srv);
+    context_.context->PSSetShaderResources(1, 1, &null_srv);
+    context_.context->PSSetShaderResources(4, 1, &null_srv);
 }
 
 void Renderer::draw_tonemap(const GraphicsSettings& settings, const FrameView& view,
@@ -1911,6 +2248,52 @@ void Renderer::bind_fog_constants() {
     context_.context->PSSetConstantBuffers(7, 1, buffers);
 }
 
+void Renderer::update_surface_constants(const GraphicsSettings& settings) {
+    if (surface_buffer_ == nullptr) {
+        return;
+    }
+    const SkinSettings& skin = settings.skin;
+    const ToonSettings& toon = settings.toon;
+    SurfaceConstants constants;
+    constants.skin_params0 = {skin.backlit_strength, skin.backlit_g, skin.backlit_ior,
+                              skin.sss_mfp_scale};
+    constants.skin_params1 = {skin.spec_lobe0_scale, skin.spec_lobe0_add,
+                              skin.spec_lobe1_scale, skin.spec_lobe1_add};
+    constants.skin_params2 = {skin.spec_lobe0_mix, skin.spec_lobe1_mix, 0.0f, 0.0f};
+    constants.toon_params0 = {toon.shadow_mul.x, toon.shadow_mul.y, toon.shadow_mul.z,
+                              toon.shadow_hue};
+    constants.toon_params1 = {toon.shadow_add.x, toon.shadow_add.y, toon.shadow_add.z,
+                              toon.autotint_threshold};
+    constants.toon_params2 = {toon.autotint_color.x, toon.autotint_color.y,
+                              toon.autotint_color.z, toon.autotint_strength};
+    constants.toon_params3 = {toon.self_power_shadow, toon.rim_strength, toon.rim_power,
+                              static_cast<float>(std::clamp(toon.enable, 0, 2))};
+    constants.glass_params0 = {settings.ssr.caustics_intensity, settings.ssr.water_surface_y,
+                               settings.glass.ior, settings.outline.width_scale};
+    constants.glass_params1 = {settings.glass.absorption.x, settings.glass.absorption.y,
+                               settings.glass.absorption.z, settings.glass.dispersion};
+    constants.outline_color = {settings.outline.color.x, settings.outline.color.y,
+                               settings.outline.color.z, 1.0f};
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_.context->Map(surface_buffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                     &mapped))) {
+        throw std::runtime_error("Map surface constants failed");
+    }
+    std::memcpy(mapped.pData, &constants, sizeof(constants));
+    context_.context->Unmap(surface_buffer_.Get(), 0);
+}
+
+void Renderer::bind_surface_constants() {
+    if (surface_buffer_ == nullptr) {
+        return;
+    }
+    ID3D11Buffer* buffers[] = {surface_buffer_.Get()};
+    context_.context->VSSetConstantBuffers(8, 1, buffers);
+    context_.context->PSSetConstantBuffers(8, 1, buffers);
+    context_.context->CSSetConstantBuffers(8, 1, buffers);
+}
+
 // Fog passes run at render resolution and write a full-screen quad over their
 // own target, so depth testing and blending stay off.
 void Renderer::bind_fog_state() {
@@ -2057,10 +2440,17 @@ void Renderer::draw_fog_scene_copy(const GraphicsSettings& settings) {
     context_.context->OMSetRenderTargets(1, views, nullptr);
     ID3D11ShaderResourceView* hdr_srv = hdr->srv.Get();
     context_.context->PSSetShaderResources(6, 1, &hdr_srv);
+    // The copy stores the scene depth in alpha for the glass refraction.
+    bind_frame_constants();
+    if (const DepthTarget* depth = targets_.get_depth("Depth")) {
+        ID3D11ShaderResourceView* depth_srv = depth->srv.Get();
+        context_.context->PSSetShaderResources(5, 1, &depth_srv);
+    }
     bind_fog_state();
     draw_fullscreen(program);
     ID3D11ShaderResourceView* null_srv = nullptr;
     context_.context->PSSetShaderResources(6, 1, &null_srv);
+    context_.context->PSSetShaderResources(5, 1, &null_srv);
 }
 
 void Renderer::draw_fog_composite(const GraphicsSettings& settings, const FrameView& view) {
@@ -2962,7 +3352,7 @@ void Renderer::draw_shadow_cascades(const GraphicsSettings& settings, const Fram
 
             if (item.materials != nullptr && subset.material_index < item.materials->size()) {
                 const auto& mat = (*item.materials)[subset.material_index];
-                constants = material_from_gpu(mat.constants);
+                constants = material_from_gpu(mat);
                 if (item.textures != nullptr && mat.texture_index >= 0 &&
                     static_cast<std::size_t>(mat.texture_index) < item.textures->size() &&
                     (*item.textures)[static_cast<std::size_t>(mat.texture_index)]) {
@@ -3071,7 +3461,7 @@ void Renderer::draw_sky_visibility(const GraphicsSettings& settings, const Frame
 
         if (item.materials != nullptr && subset.material_index < item.materials->size()) {
             const auto& mat = (*item.materials)[subset.material_index];
-            constants = material_from_gpu(mat.constants);
+            constants = material_from_gpu(mat);
             if (item.textures != nullptr && mat.texture_index >= 0 &&
                 static_cast<std::size_t>(mat.texture_index) < item.textures->size() &&
                 (*item.textures)[static_cast<std::size_t>(mat.texture_index)]) {

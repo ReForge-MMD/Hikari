@@ -191,6 +191,29 @@ struct SsrSettings {
     float caustics_intensity = 1.5f;
 };
 
+// Phase 7 outline. Mode 0 is off, 1 and 2 are inverted hull passes with a
+// screen-space width in pixels, and 3 is a depth and normal edge detector.
+struct OutlineSettings {
+    int mode = 0;
+    float width_pixels = 2.0f;
+    // Multiplier on the PMX per-material edge size, so a scene can thicken every
+    // ink line without editing the model.
+    float width_scale = 1.0f;
+    Vec3 color{0.0f, 0.0f, 0.0f};
+    // Depth and normal thresholds for mode 3.
+    float depth_threshold = 0.02f;
+    float normal_threshold = 0.35f;
+};
+
+struct GlassSettings {
+    // Beer-Lambert absorption per metre; the RGB ratio sets the tint.
+    Vec3 absorption{0.55f, 0.18f, 0.12f};
+    // Index of refraction used by the refraction pass.
+    float ior = 1.5f;
+    // Chromatic spread of the refraction, 0 disables the per-channel shift.
+    float dispersion = 0.0f;
+};
+
 struct GiSettings {
     int enable = 3;
     int quality = 1;
@@ -274,6 +297,8 @@ struct GraphicsSettings {
     ToonSettings toon;
     AoSettings ao;
     SsrSettings ssr;
+    OutlineSettings outline;
+    GlassSettings glass;
     GiSettings gi;
     CameraSettings camera;
     BloomSettings bloom;

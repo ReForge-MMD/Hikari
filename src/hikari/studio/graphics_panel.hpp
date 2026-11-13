@@ -6,12 +6,14 @@
 #include <QWidget>
 
 #include "hikari/studio/app_state.hpp"
+#include "hikari/studio/material_section.hpp"
 
 class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
+class QPushButton;
 class QSlider;
 class QSpinBox;
 class QTimer;
@@ -31,6 +33,10 @@ public:
     // main window installs these providers after construction.
     void set_preview_provider(std::function<QImage(const QSize&)> provider);
     void set_ibl_error_provider(std::function<QString()> provider);
+    // The viewport owns the models, so the Materials section reads and writes
+    // their per-subset responses through these callbacks.
+    void set_material_callbacks(MaterialSectionCallbacks callbacks);
+    void refresh_materials();
 
 private:
     void push_edit();
@@ -39,6 +45,11 @@ private:
     QWidget* make_group(const QString& title, QWidget* body);
     void refresh_preview();
     void choose_environment();
+    void refresh_material_models();
+    void refresh_material_subsets();
+    void refresh_material_entry();
+    void apply_material_shading(int shading_model);
+    void import_ray_mmd_material();
 
     StudioAppState& state_;
     std::function<void()> record_edit_;
@@ -83,6 +94,16 @@ private:
     QCheckBox* gi_specular_ = nullptr;
     QComboBox* debug_view_ = nullptr;
     QCheckBox* wireframe_ = nullptr;
+
+    MaterialSectionCallbacks material_callbacks_;
+    QComboBox* material_model_ = nullptr;
+    QComboBox* material_subset_ = nullptr;
+    QComboBox* material_shading_ = nullptr;
+    QComboBox* material_preset_ = nullptr;
+    QPushButton* material_clear_ = nullptr;
+    QPushButton* material_import_ = nullptr;
+    QLabel* material_status_ = nullptr;
+    QStringList material_model_cache_;
 
     QCheckBox* sky_enabled_ = nullptr;
     QComboBox* sky_quality_ = nullptr;

@@ -272,4 +272,176 @@ if(TARGET hikari_gfx_lab)
     WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
   )
   set_tests_properties(gfx_phase6_gi_shafts PROPERTIES TIMEOUT 120)
+
+  # Phase 7 chart: eleven spheres, one per shading model. The mean band proves
+  # the shared surface library did not collapse every model onto one lobe or
+  # blow the frame out; the per-model goldens land with the feature captures.
+  add_test(NAME gfx_phase7_chart
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_chart.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_chart.json
+      --expect-mean-min 0.07 --expect-mean-max 0.16
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_chart PROPERTIES TIMEOUT 120)
+
+  # Phase 7 feature goldens. Each capture narrows the chart to one sphere at its
+  # chart position, so the frame is the model under test and not the row. The
+  # skin capture back-lights the sphere, because transmission only reads where
+  # the surface faces away from the sun; the caustic capture lifts the water
+  # plane above the subject, because the pattern fades with depth and the chart
+  # floor sits at y = 0.
+  add_test(NAME gfx_phase7_skin_backlit
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 1
+      --skin-backlit 2.0 --sun-elevation 20 --sun-azimuth 0
+      --ambient 0.60 --exposure 1.0
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_skin_backlit.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_skin_backlit.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_skin_backlit.bmp
+      --expect-mean-min 0.083 --expect-mean-max 0.098
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_skin_backlit PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase7_anisotropy
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 3
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_anisotropy.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_anisotropy.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_anisotropy.bmp
+      --expect-mean-min 0.163 --expect-mean-max 0.188
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_anisotropy PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase7_cloth
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 5
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_cloth.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_cloth.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_cloth.bmp
+      --expect-mean-min 0.161 --expect-mean-max 0.186
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_cloth PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase7_clearcoat
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 6
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_clearcoat.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_clearcoat.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_clearcoat.bmp
+      --expect-mean-min 0.137 --expect-mean-max 0.159
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_clearcoat PROPERTIES TIMEOUT 120)
+
+  # Refraction mode 2 solves the screen-space displacement against the scene
+  # copy, so the checker behind the sphere is magnified and bent by the sheet.
+  add_test(NAME gfx_phase7_glass
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 4
+      --glass-refraction 2
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_glass.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_glass.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_glass.bmp
+      --expect-mean-min 0.157 --expect-mean-max 0.182
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_glass PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase7_cel
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 8 --toon 2
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_cel.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_cel.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_cel.bmp
+      --expect-mean-min 0.111 --expect-mean-max 0.131
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_cel PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase7_tone
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 9 --toon 1
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_tone.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_tone.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_tone.bmp
+      --expect-mean-min 0.100 --expect-mean-max 0.119
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_tone PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase7_eye
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 10
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_eye.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_eye.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_eye.bmp
+      --expect-mean-min 0.104 --expect-mean-max 0.124
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_eye PROPERTIES TIMEOUT 120)
+
+  # Mode 1 is the authored PMX hull: the chart material carries an edge size and
+  # an ink colour, so the capture proves the material's own outline reaches the
+  # frame instead of only the uniform setting.
+  add_test(NAME gfx_phase7_outline
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 0
+      --outline 1 --outline-width 2.0
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_outline.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_outline.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_outline.bmp
+      --expect-mean-min 0.107 --expect-mean-max 0.128
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_outline PROPERTIES TIMEOUT 120)
+
+  add_test(NAME gfx_phase7_caustics
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --shading-model 0
+      --water-caustics 1 --water-surface-y 1.2
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_caustics.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_caustics.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_caustics.bmp
+      --expect-mean-min 0.098 --expect-mean-max 0.118
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_caustics PROPERTIES TIMEOUT 120)
+
+  # Stage check for the PMX texture slots. The chart's Default, ClearCoat, Cel,
+  # and ToneBased spheres take a synthesised matcap through SphereMapTex (t28)
+  # in modes 1, 2, 0, and 0, and the two toon models read slices 1 and 2 of the
+  # 64-slice ToonRampTex array (t29). The floor becomes a checker sampled through
+  # UvTransform, which is the only surface in the chart that reads a texture by
+  # UV, so an identity transform would read as one flat tile.
+  add_test(NAME gfx_phase7_pmx_maps
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --pmx-maps
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_pmx_maps.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_pmx_maps.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_pmx_maps.bmp
+      --expect-mean-min 0.146 --expect-mean-max 0.168
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_pmx_maps PROPERTIES TIMEOUT 120)
+
+  # 1080p guard: SSS scales its radius in pixels, refraction offsets are in
+  # screen space, and the GI and AO targets follow the output size, so the whole
+  # chart is captured once at the delivery resolution. It is also the registered
+  # coverage for --width/--height.
+  add_test(NAME gfx_phase7_1080p
+    COMMAND hikari_gfx_lab
+      --phase 7 --scene phase7 --frames 2 --gi 3 --gi-quality 2
+      --width 1920 --height 1080
+      --capture ${CMAKE_CURRENT_BINARY_DIR}/phase7_1080p.bmp
+      --probe ${CMAKE_CURRENT_BINARY_DIR}/phase7_1080p.json
+      --compare ${CMAKE_SOURCE_DIR}/tests/gfx/golden/phase7_1080p.bmp
+      --expect-mean-min 0.118 --expect-mean-max 0.139
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:hikari_gfx_lab>
+  )
+  set_tests_properties(gfx_phase7_1080p PROPERTIES TIMEOUT 300)
 endif()

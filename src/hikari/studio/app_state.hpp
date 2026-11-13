@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "hikari/formats/vmd.hpp"
+#include "hikari/gfx/material.hpp"
 #include "hikari/gfx/settings.hpp"
 #include "hikari/math.hpp"
 
@@ -89,12 +90,14 @@ struct MotionKeyRef {
     std::size_t index = 0;
 };
 
-// Position, rotation, scale and visibility of one model at snapshot time.
+// Position, rotation, scale, visibility and per-subset material responses of
+// one model at snapshot time.
 struct ModelTransformState {
     Vec3 offset{0.0f, 0.0f, 0.0f};
     Quat rotation{0.0f, 0.0f, 0.0f, 1.0f};
     float scale = 1.0f;
     bool visible = true;
+    std::vector<std::optional<gfx::MaterialResponse>> material_overrides;
 };
 
 // One undo entry for the whole scene. The motion copy is present only when a

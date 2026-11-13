@@ -39,6 +39,13 @@ struct LabScene {
     // sun enters only through the openings, so the volumetric fog shows the
     // shafts and the pillar shadow.
     static LabScene phase6_room(hikari::core::D3D11Context& context);
+    // Row of eleven spheres against a dark backdrop, one per shading model, so
+    // the shared surface library can be compared side by side. `pmx_maps` adds
+    // a matcap sphere map and PMX toon ramps to the entries that show them.
+    // shading_model filters the chart to one sphere, which is what a per-model
+    // golden captures; -1 keeps the whole row.
+    static LabScene phase7_chart(hikari::core::D3D11Context& context, bool pmx_maps = false,
+                                 int shading_model = -1);
 
     hikari::Vec3 center() const { return (bounds_min + bounds_max) * 0.5f; }
     float radius() const { return (bounds_max - bounds_min).length() * 0.5f; }

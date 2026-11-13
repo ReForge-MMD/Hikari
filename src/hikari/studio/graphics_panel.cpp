@@ -20,7 +20,10 @@
 #include <algorithm>
 #include <array>
 #include <string>
+#include <string_view>
 
+#include "hikari/gfx/material.hpp"
+#include "hikari/gfx/material_presets.hpp"
 #include "hikari/gfx/settings.hpp"
 
 namespace hikari::studio {
@@ -28,6 +31,10 @@ namespace {
 
 constexpr int kPreviewIntervalMs = 500;
 constexpr char kTooltipProperty[] = "hikari_original_tooltip";
+
+QString from_view(std::string_view text) {
+    return QString::fromUtf8(text.data(), static_cast<int>(text.size()));
+}
 
 // Disables a dependency-gated control and explains why, restoring the original
 // tooltip when the control becomes editable again.
@@ -92,6 +99,143 @@ void GraphicsPanel::set_ibl_error_provider(std::function<QString()> provider) {
     refresh_preview();
 }
 
+void GraphicsPanel::set_material_callbacks(MaterialSectionCallbacks callbacks) {
+    material_callbacks_ = std::move(callbacks);
+    refresh_materials();
+}
+
+void GraphicsPanel::refresh_materials() {
+    refresh_material_models();
+}
+
+void GraphicsPanel::refresh_material_models() {
+    QStringList models;
+    if (material_callbacks_.model_names != nullptr) {
+        models = material_callbacks_.model_names();
+    }
+    // Follow the active model when the list itself changed, and keep the user's
+    // own pick otherwise so editing does not fight the scene selection.
+    const bool list_changed = models != material_model_cache_;
+    material_model_cache_ = models;
+    const QString previous = material_model_->currentText();
+    int index = list_changed ? state_.selected_model_idx : models.indexOf(previous);
+    if (models.isEmpty()) {
+        index = -1;
+    } else if (index < 0 || index >= models.size()) {
+        index = 0;
+    }
+    {
+        const QSignalBlocker block(material_model_);
+        material_model_->clear();
+        material_model_->addItems(models);
+        material_model_->setCurrentIndex(index);
+    }
+    refresh_material_subsets();
+}
+
+void GraphicsPanel::refresh_material_subsets() {
+    const int model = material_model_->currentIndex();
+    std::vector<MaterialSubsetEntry> subsets;
+    if (model >= 0 && material_callbacks_.subsets != nullptr) {
+        subsets = material_callbacks_.subsets(model);
+    }
+    const int previous = material_subset_->currentIndex();
+    {
+        const QSignalBlocker block(material_subset_);
+        material_subset_->clear();
+        for (std::size_t i = 0; i < subsets.size(); ++i) {
+            material_subset_->addItem(QStringLiteral("%1  %2")
+                                          .arg(static_cast<int>(i))
+                                          .arg(subsets[i].name));
+        }
+        if (previous >= 0 && static_cast<std::size_t>(previous) < subsets.size()) {
+            material_subset_->setCurrentIndex(previous);
+        }
+    }
+    refresh_material_entry();
+}
+
+void GraphicsPanel::refresh_material_entry() {
+    const int model = material_model_->currentIndex();
+    const int subset = material_subset_->currentIndex();
+    std::vector<MaterialSubsetEntry> subsets;
+    if (model >= 0 && material_callbacks_.subsets != nullptr) {
+        subsets = material_callbacks_.subsets(model);
+    }
+    const bool valid = subset >= 0 && static_cast<std::size_t>(subset) < subsets.size();
+    const bool overridden = valid && subsets[static_cast<std::size_t>(subset)].overridden;
+    const bool assignable = valid && material_callbacks_.set_shading_model != nullptr;
+    gate_control(material_shading_, assignable,
+                 QStringLiteral("Load a model to assign a shading model."));
+    gate_control(material_preset_,
+                 assignable && material_callbacks_.apply_preset != nullptr,
+                 QStringLiteral("Load a model to apply a material preset."));
+    gate_control(material_clear_, overridden && material_callbacks_.clear_override != nullptr,
+                 QStringLiteral("This subset has no override to clear."));
+    gate_control(material_import_,
+                 assignable && material_callbacks_.import_ray_mmd != nullptr,
+                 QStringLiteral("Load a model to import a Ray-MMD material."));
+    if (!valid) {
+        material_status_->setText(QStringLiteral("No model loaded"));
+        return;
+    }
+    const int shading = subsets[static_cast<std::size_t>(subset)].shading_model;
+    {
+        const QSignalBlocker block(material_shading_);
+        const int index = material_shading_->findData(overridden ? shading : -1);
+        material_shading_->setCurrentIndex(index >= 0 ? index : 0);
+    }
+    material_status_->setText(
+        overridden ? QStringLiteral("Override: %1").arg(from_view(gfx::shading_model_label(shading)))
+                   : QStringLiteral("Override: none, the authored PMX material"));
+}
+
+void GraphicsPanel::apply_material_shading(int shading_model) {
+    const int model = material_model_->currentIndex();
+    const int subset = material_subset_->currentIndex();
+    if (model < 0 || subset < 0) {
+        return;
+    }
+    if (shading_model < 0) {
+        if (material_callbacks_.clear_override != nullptr) {
+            material_callbacks_.clear_override(model, subset);
+        }
+        return;
+    }
+    if (material_callbacks_.set_shading_model != nullptr) {
+        material_callbacks_.set_shading_model(model, subset, shading_model);
+    }
+}
+
+void GraphicsPanel::import_ray_mmd_material() {
+    const int model = material_model_->currentIndex();
+    const int subset = material_subset_->currentIndex();
+    if (model < 0 || subset < 0 || material_callbacks_.import_ray_mmd == nullptr) {
+        return;
+    }
+    const QString path = QFileDialog::getOpenFileName(
+        this, QStringLiteral("Import Ray-MMD material"), QString(),
+        QStringLiteral("MME effect (*.fx);;All files (*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    push_edit();
+    const gfx::ImportReport report = material_callbacks_.import_ray_mmd(model, subset, path);
+    if (!report.ok) {
+        material_status_->setText(QStringLiteral("Import failed: %1")
+                                      .arg(from_view(report.error)));
+        return;
+    }
+    // The entry refresh rewrites the status label, so the report goes after it.
+    refresh_material_entry();
+    material_status_->setText(
+        QStringLiteral("Imported %1: %2 applied, %3 approximate, %4 unsupported")
+            .arg(QFileInfo(path).fileName())
+            .arg(report.applied)
+            .arg(report.approximate)
+            .arg(report.unsupported));
+}
+
 QWidget* GraphicsPanel::make_group(const QString& title, QWidget* body) {
     auto* group = new QGroupBox(title);
     auto* layout = new QVBoxLayout(group);
@@ -119,6 +263,49 @@ void GraphicsPanel::build_controls() {
     backend_form->addRow(QStringLiteral("Renderer"), renderer_);
     backend_form->addRow(QStringLiteral("Preset"), preset_);
     layout->addWidget(make_group(QStringLiteral("Backend"), backend));
+
+    material_model_ = new QComboBox();
+    material_model_->setToolTip(QStringLiteral("Loaded model whose material subsets are edited."));
+    material_subset_ = new QComboBox();
+    material_subset_->setToolTip(QStringLiteral(
+        "PMX material subset. An override replaces its shading model and PBR "
+        "response; the authored colour, edge ink and texture slots stay."));
+    material_shading_ = new QComboBox();
+    material_shading_->addItem(QStringLiteral("Authored PMX material"), -1);
+    for (int i = 0; i <= static_cast<int>(gfx::ShadingModel::Eye); ++i) {
+        material_shading_->addItem(from_view(gfx::shading_model_label(i)), i);
+    }
+    material_shading_->setToolTip(QStringLiteral(
+        "Surface model the deferred lighting pass runs for this subset."));
+    material_preset_ = new QComboBox();
+    material_preset_->addItem(QStringLiteral("Apply preset..."), -1);
+    for (std::size_t i = 0; i < gfx::material_presets().size(); ++i) {
+        material_preset_->addItem(from_view(gfx::material_presets()[i].name),
+                                  static_cast<int>(i));
+    }
+    material_preset_->setToolTip(QStringLiteral(
+        "Native preset: sets the shading model and the PBR response of the "
+        "selected subset while the authored colour stays."));
+    material_clear_ = new QPushButton(QStringLiteral("Clear override"));
+    material_import_ = new QPushButton(QStringLiteral("Import Ray-MMD material..."));
+    material_import_->setToolTip(QStringLiteral(
+        "Converts a Ray-MMD material .fx into this subset's response and reports "
+        "every parameter it could not represent. The file is parsed as data and "
+        "its shader code never runs."));
+    material_status_ = new QLabel(QStringLiteral("No model loaded"));
+    material_status_->setWordWrap(true);
+
+    auto* materials = new QWidget();
+    auto* material_form = new QFormLayout(materials);
+    material_form->setContentsMargins(0, 0, 0, 0);
+    material_form->addRow(QStringLiteral("Model"), material_model_);
+    material_form->addRow(QStringLiteral("Subset"), material_subset_);
+    material_form->addRow(QStringLiteral("Shading"), material_shading_);
+    material_form->addRow(QStringLiteral("Preset"), material_preset_);
+    material_form->addRow(material_import_);
+    material_form->addRow(material_clear_);
+    material_form->addRow(material_status_);
+    layout->addWidget(make_group(QStringLiteral("Materials"), materials));
 
     sun_size_ = make_spin(0.1, 10.0, 0.1, 1);
     sun_size_->setToolTip(QStringLiteral("Visual size scaling of the sun disk in the sky."));
@@ -645,6 +832,49 @@ void GraphicsPanel::build_controls() {
     });
     connect(preset_, &QComboBox::currentIndexChanged, this,
             [this](int index) { apply_preset(index); });
+    connect(material_model_, &QComboBox::currentIndexChanged, this,
+            [this](int) { refresh_material_subsets(); });
+    connect(material_subset_, &QComboBox::currentIndexChanged, this,
+            [this](int) { refresh_material_entry(); });
+    connect(material_shading_, &QComboBox::currentIndexChanged, this, [this](int index) {
+        const int shading = material_shading_->itemData(index).toInt();
+        if (material_model_->currentIndex() < 0 || material_subset_->currentIndex() < 0) {
+            return;
+        }
+        push_edit();
+        apply_material_shading(shading);
+        refresh_material_entry();
+    });
+    connect(material_preset_, &QComboBox::activated, this, [this](int index) {
+        const int preset = material_preset_->itemData(index).toInt();
+        const int model = material_model_->currentIndex();
+        const int subset = material_subset_->currentIndex();
+        if (preset >= 0 && model >= 0 && subset >= 0 &&
+            material_callbacks_.apply_preset != nullptr) {
+            push_edit();
+            material_callbacks_.apply_preset(model, subset, preset);
+            refresh_material_entry();
+        }
+        const QSignalBlocker block(material_preset_);
+        material_preset_->setCurrentIndex(0);
+    });
+    connect(material_clear_, &QPushButton::clicked, this, [this] {
+        const int model = material_model_->currentIndex();
+        const int subset = material_subset_->currentIndex();
+        if (model < 0 || subset < 0 || material_callbacks_.clear_override == nullptr) {
+            return;
+        }
+        push_edit();
+        material_callbacks_.clear_override(model, subset);
+        refresh_material_entry();
+    });
+    connect(material_import_, &QPushButton::clicked, this, [this] {
+        if (material_model_->currentIndex() < 0 || material_subset_->currentIndex() < 0 ||
+            material_callbacks_.import_ray_mmd == nullptr) {
+            return;
+        }
+        import_ray_mmd_material();
+    });
     connect(sun_size_, &QDoubleSpinBox::valueChanged, this, [this](double value) {
         push_edit();
         state_.graphics.sky.sun_radius = static_cast<float>(value);

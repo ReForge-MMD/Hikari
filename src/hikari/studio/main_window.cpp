@@ -321,6 +321,9 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
         refresh_model_list();
         refresh_targets();
         refresh_morph_combos();
+        if (graphics_panel_ != nullptr) {
+            graphics_panel_->refresh_materials();
+        }
     });
     connect(viewport_, &D3DViewport::activeModelChanged, this, [this] {
         refresh_model_list();
@@ -331,6 +334,9 @@ MainWindow::MainWindow(QString model_path, QString motion_path, QString audio_pa
         update_viewport_title();
         timeline_->refresh_layout();
         timeline_->update();
+        if (graphics_panel_ != nullptr) {
+            graphics_panel_->refresh_materials();
+        }
     });
     connect(timeline_, &TimelineWidget::boneSelected, this, [this](int index) {
         state_.selected_bone_idx = index;
@@ -614,6 +620,9 @@ void MainWindow::build_menus() {
         timeline_->refresh_layout();
         timeline_->update();
         update_edit_actions();
+        if (graphics_panel_ != nullptr) {
+            graphics_panel_->refresh_materials();
+        }
     });
     redo_action_ = edit_menu->addAction(QStringLiteral("Redo"));
     redo_action_->setShortcuts(
@@ -624,6 +633,9 @@ void MainWindow::build_menus() {
         timeline_->refresh_layout();
         timeline_->update();
         update_edit_actions();
+        if (graphics_panel_ != nullptr) {
+            graphics_panel_->refresh_materials();
+        }
     });
     edit_menu->addSeparator();
     edit_menu->addAction(QStringLiteral("Reset Bone Transform (Z)"), this, [this] {
@@ -2105,6 +2117,33 @@ QWidget* MainWindow::build_graphics_tab() {
     });
     graphics_panel_->set_ibl_error_provider([this]() -> QString {
         return viewport_ != nullptr ? viewport_->ibl_error() : QString();
+    });
+    graphics_panel_->set_material_callbacks({
+        [this] { return viewport_ != nullptr ? viewport_->model_names() : QStringList{}; },
+        [this](int model) {
+            return viewport_ != nullptr ? viewport_->material_subsets(model)
+                                        : std::vector<MaterialSubsetEntry>{};
+        },
+        [this](int model, int subset, int shading_model) {
+            if (viewport_ != nullptr) {
+                viewport_->set_material_shading_model(model, subset, shading_model);
+            }
+        },
+        [this](int model, int subset, int preset) {
+            if (viewport_ != nullptr) {
+                viewport_->apply_material_preset(model, subset, preset);
+            }
+        },
+        [this](int model, int subset) {
+            if (viewport_ != nullptr) {
+                viewport_->clear_material_override(model, subset);
+            }
+        },
+        [this](int model, int subset, const QString& path) {
+            return viewport_ != nullptr
+                       ? viewport_->import_ray_mmd(model, subset, path)
+                       : gfx::ImportReport{};
+        },
     });
     return graphics_panel_;
 }

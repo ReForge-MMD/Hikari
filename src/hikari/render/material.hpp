@@ -27,6 +27,15 @@ public:
     MaterialConstants constants;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constant_buffer;
     std::int32_t texture_index = -1;
+    // PMX sphere map: the texture table index and the 0..3 blend mode. The
+    // native G-buffer samples it with the view-space normal as UV.
+    std::int32_t sphere_texture_index = -1;
+    std::uint8_t sphere_mode = 0;
+    // Built-in PMX toon index, resolved to a ramp slice by material_from_gpu.
+    // An external toon texture has no built-in index, so it keeps the model's
+    // procedural terminator until the Materials section registers the texture.
+    std::uint8_t toon_flag = 0;
+    std::int32_t toon_index = -1;
 
     static GpuMaterial from_pmx_material(core::D3D11Context& context,
                                          const formats::PmxMaterial& material);

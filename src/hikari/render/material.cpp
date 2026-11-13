@@ -39,7 +39,12 @@ GpuMaterial GpuMaterial::from_pmx_material(core::D3D11Context& context,
     constants.ambient = material.ambient;
     constants.edge_size = material.edge_size;
     constants.edge_color = material.edge_color;
-    return create(context, material.name_local, constants, material.texture_index);
+    GpuMaterial result = create(context, material.name_local, constants, material.texture_index);
+    result.sphere_texture_index = material.sphere_texture_index;
+    result.sphere_mode = material.sphere_mode;
+    result.toon_flag = material.toon_flag;
+    result.toon_index = material.toon_index;
+    return result;
 }
 
 GpuMaterial GpuMaterial::fallback(core::D3D11Context& context, const std::string& name,

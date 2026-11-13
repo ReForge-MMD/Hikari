@@ -16,6 +16,7 @@
 #include "hikari/gfx/settings.hpp"
 #include "hikari/gfx/shader_library.hpp"
 #include "hikari/gfx/target_pool.hpp"
+#include "hikari/gfx/toon_ramp.hpp"
 #include "hikari/math.hpp"
 #include "hikari/render/mesh.hpp"
 #include "hikari/render/skinning.hpp"
@@ -150,6 +151,22 @@ struct ShadowDrawConstants {
     std::array<float, 4> params{};
 };
 
+// Must match SurfaceParams in shaders/gfx_core.hlsl. Phase 7 per-feature
+// material globals; the shading model itself is a material property and does
+// not appear here.
+struct SurfaceConstants {
+    std::array<float, 4> skin_params0{};  // backlit strength, g, ior, sss mfp scale
+    std::array<float, 4> skin_params1{};  // lobe0 scale, lobe0 add, lobe1 scale, lobe1 add
+    std::array<float, 4> skin_params2{};  // lobe0 mix, lobe1 mix, unused, unused
+    std::array<float, 4> toon_params0{};  // shadow mul rgb, shadow hue degrees
+    std::array<float, 4> toon_params1{};  // shadow add rgb, autotint threshold
+    std::array<float, 4> toon_params2{};  // autotint colour rgb, autotint strength
+    std::array<float, 4> toon_params3{};  // self shadow power, rim strength, rim power, enable
+    std::array<float, 4> glass_params0{}; // caustics intensity, water y, ior, outline width
+    std::array<float, 4> glass_params1{}; // absorption rgb per metre, dispersion
+    std::array<float, 4> outline_color{}; // rgb ink colour for the edge detector
+};
+
 class Renderer {
 public:
     explicit Renderer(core::D3D11Context& context);
@@ -225,12 +242,30 @@ private:
     void bind_fog_constants();
     void bind_fog_state();
     void bind_fog_environment(const GraphicsSettings& settings);
-    void draw_transparent(const FrameView& view);
+    // Phase 7 material globals, one cbuffer shared by every shading model.
+    void update_surface_constants(const GraphicsSettings& settings);
+    void bind_surface_constants();
+    std::vector<ShaderDefine> surface_defines(const GraphicsSettings& settings) const;
+    void draw_outline(const GraphicsSettings& settings, const FrameView& view);
+    void draw_transparent(const GraphicsSettings& settings, const FrameView& view);
+    // Screen-space separable subsurface diffusion, gated by skin.ssss_quality.
+    void draw_sss(const GraphicsSettings& settings, const FrameView& view);
+    // True when any item resolves to a model the diffusion pass scatters. A
+    // frame without one would run two full-resolution passes to blend zero.
+    bool has_sss_item(const FrameView& view) const;
+    // True when any transparent item resolves to the Glass shading model, which
+    // is the only consumer of the scene copy outside the fog composite.
+    bool has_glass_item(const FrameView& view) const;
     void draw_tonemap(const GraphicsSettings& settings, const FrameView& view,
                       ID3D11RenderTargetView* final_rtv, bool linear);
     void draw_grid(const FrameView& view, ID3D11RenderTargetView* final_rtv);
     void draw_fullscreen(const ShaderProgram& program);
     void draw_item(const DrawItem& item, bool transparent);
+    // Resolves the constants and the texture slots of one draw item. Returns
+    // false when the item is incomplete, so callers can skip it.
+    bool resolve_item_material(const DrawItem& item, MaterialConstants& constants,
+                               ID3D11ShaderResourceView*& srv,
+                               ID3D11ShaderResourceView*& sphere_srv) const;
     std::vector<ShaderDefine> lighting_defines(const GraphicsSettings& settings,
                                                bool linear_tonemap) const;
     std::vector<ShaderDefine> ao_ssr_gi_defines(const GraphicsSettings& settings) const;
@@ -293,6 +328,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> ibl_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> ao_ssr_gi_buffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> fog_buffer_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> surface_buffer_;
     // Nine diffuse irradiance coefficients, three floats each, written by the
     // sky SH compute pass and read by the lighting pass.
     Microsoft::WRL::ComPtr<ID3D11Buffer> sky_sh_buffer_;
@@ -303,6 +339,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> sky_sh_partial_uav_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> sky_sh_partial_srv_;
     std::uint32_t grid_vertex_count_ = 0;
+    ToonRampAtlas toon_ramps_;
     render::GpuTexture white_texture_;
     render::GpuTexture cloud_texture_;
     render::GpuTexture cloud_cover_texture_;
